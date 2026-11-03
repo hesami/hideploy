@@ -1,117 +1,135 @@
 # HiDeploy
 
-**Deploy any Dockerized project to your own server — one command, one panel, unlimited projects.**
+**Deploy GitLab-hosted Laravel projects to your own server, one command and one menu, as many projects as you like.**
 
-HiDeploy is a self-hosted deployment tool that turns any Dockerized repository into a running service on your own server. It prepares the host once, then lets you deploy, update and manage projects from a single CLI.
+HiDeploy prepares a fresh Ubuntu server once, then deploys and manages Laravel projects from a single interactive menu. After the first deployment, every `git push` to your branch redeploys automatically through GitLab CI.
 
 ```
-git push  →  build  →  migrate  →  live
+git push  →  GitLab pipeline  →  build  →  migrate  →  live
 ```
+
+> **Scope:** HiDeploy targets **Laravel (PHP)** projects hosted on **GitLab** (it uses GitLab Runner for CI/CD). The tool itself is hosted on GitHub.
 
 ---
 
 ## Why HiDeploy?
 
-- **Self-hosted.** No Vercel, no Railway, no vendor lock-in. Your code, your server, your rules.
-- **One tool for many projects.** A single shared nginx and MariaDB serve all your deployments, keeping RAM and disk usage low.
-- **Zero CI variables.** Server-specific settings live in `.deploy.env` on the server, outside git.
-- **Batteries included.** Docker, GitLab Runner, SSL, backups, logs and migrations — all wired together.
-- **No `chmod 777`.** Files are owned by the same UID/GID as the runner, so permissions just work.
+- **Self-hosted.** No vendor lock-in. Your code, your server.
+- **Light on resources.** One shared nginx and one shared MariaDB serve every project; each project is a single container (php-fpm + queue worker + scheduler).
+- **No CI variables.** Server-specific settings live in `.deploy.env` on the server, outside git.
+- **No `chmod 777`.** Containers run with the same UID/GID as the runner user, so permissions just work.
+- **Guided.** Every step explains what it does and suggests what to do next.
 
 ---
 
 ## Quick install
 
-On a fresh Ubuntu or Debian server, run as root:
+On an Ubuntu server, as root:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/hesami/hideploy/main/install.sh | sudo bash
 ```
 
-This will:
-
-1. Download the latest `hideploy.sh` from the repository
-2. Install it to `/usr/local/bin/hideploy`
-3. Make it executable and globally available
-
-After that, you can run it from any directory:
+Then start it:
 
 ```bash
 sudo hideploy
 ```
 
----
-
-## Manual install
-
-If you prefer to install it yourself:
+Prefer to read the code first? Download, inspect, then run:
 
 ```bash
-# 1. Clone the repository (or download just the script)
-git clone https://github.com/hesami/hideploy.git
-cd hideploy
-
-# 2. Make it executable
-chmod +x hideploy.sh
-
-# 3. Run it
-sudo ./hideploy.sh
+curl -fsSL https://raw.githubusercontent.com/hesami/hideploy/main/install.sh -o install.sh
+less install.sh
+sudo bash install.sh
 ```
 
-To make it available system-wide as `hideploy`:
+To install a specific release instead of the latest `main`:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/hesami/hideploy/main/install.sh | sudo HIDEPLOY_REF=v1.0.0 bash
+```
+
+### Commands
+
+```bash
+sudo hideploy            # interactive menu
+hideploy --version       # show the installed version
+hideploy --help          # show help
+sudo hideploy update     # install the latest version (your projects are not touched)
+```
+
+### Manual install
+
+```bash
+git clone https://github.com/hesami/hideploy.git
+cd hideploy
 sudo install -m 755 hideploy.sh /usr/local/bin/hideploy
 ```
 
 ---
 
-## First run
+## Requirements
 
-On a **fresh server**, run HiDeploy and walk through the menu in order:
+- An **Ubuntu** server with root access (tested on Ubuntu; Debian should work but is untested)
+- A **domain** whose A record points to the server
+- A **GitLab** repository (SSH URL) containing a Laravel project
+- A GitLab runner token (created in GitLab: *Settings → CI/CD → Runners → New project runner*)
 
-```bash
-sudo hideploy
-```
-
-```
-1) Prepare Server              →  Docker, GitLab Runner, shared network
-2) Shared Services             →  nginx + MariaDB + SSL auto-renew
-3) Generate Project Files      →  Dockerfile, compose, CI for your repo
-4) Deploy New Laravel Project  →  the deployment wizard
-5) Manage Projects             →  deploy, logs, backup, SSL, remove
-```
-
-If you are on a brand-new server, choose **`1` → `A` (Run all)** to prepare everything at once. Then choose **`2` → `A`** to install the shared services.
+HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 
 ---
 
-## Deploying your first project
+## First run
 
-Once the server is prepared and shared services are running:
-
-```bash
-sudo hideploy
-# choose 4) Deploy New Laravel Project
+```
+1) Prepare Server              →  Docker, GitLab Runner, shared network
+2) Shared Services             →  nginx + MariaDB + SSL auto-renew (+ optional phpMyAdmin)
+3) Generate Project Files      →  Dockerfile, compose, CI for your repository
+4) Deploy New Laravel Project  →  the deployment wizard
+5) Manage Projects             →  deploy, logs, backups, restore, SSL, remove
 ```
 
-The wizard guides you through:
+On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**. Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status and the recommended next step.
 
-1. **Domain** — e.g. `api.example.com`
-2. **DNS check** — verifies the A record points to this server
-3. **Repository** — SSH URL and branch
-4. **Clone** — the project is cloned to `/var/www/projects/<domain>`
-5. **Server settings** — written to `.deploy.env` (not in git)
-6. **Project files** — `Dockerfile`, `docker-compose.prod.yml`, `.dockerignore`, `.gitlab-ci.yml`
-7. **Database** — provisioned in the shared MariaDB container
-8. **`.env`** — configured with production-safe defaults
-9. **Laravel Passport** — optional, keys generated if needed
-10. **Build** — image built, container started, migrations run
-11. **nginx + SSL** — vhost created and a Let's Encrypt certificate issued
+---
 
-When it finishes, the site is live at `https://<your-domain>`.
+## Deploying a project
 
-From then on, every `git push` to the configured branch triggers a full deployment through GitLab CI.
+Choose **3) Generate Project Files**, copy the four generated files into your Laravel project, commit and push them. Then choose **4) Deploy New Laravel Project**. The wizard handles:
+
+1. Domain and DNS check
+2. Repository access (read-only deploy key)
+3. Clone to `/var/www/projects/<domain>`
+4. Server settings in `.deploy.env` (memory limit, frontend build, database yes/no)
+5. Project files check
+6. Database and user in the shared MariaDB (suggested values, or your own; optional)
+7. `.env` with production defaults
+8. Laravel Passport keys (if the project uses it)
+9. Build, Composer, migrations, caches
+10. nginx virtual host and a Let's Encrypt certificate
+
+After that, `git push` to the configured branch deploys automatically.
+
+### Deploy key for several projects
+
+The server uses **one SSH key** for all projects. Add it as a read-only *Deploy key* to the **first** project. For the next projects GitLab says *"Fingerprint has already been taken"*; do not add it again. Open *Settings → Repository → Deploy keys → Privately accessible deploy keys* and click **Enable**.
+
+---
+
+## Features
+
+| Feature | Where |
+|---|---|
+| Shared nginx + MariaDB, one container per project | Shared Services |
+| Automatic SSL issuance and daily renewal | Shared Services / SSL Management |
+| SSL overview: expiry dates, days left, file paths, forced renewal | Manage Projects → SSL management |
+| Frontend (Vite) build in a temporary Node container; npm, pnpm or yarn detected from the lock file | Project menu → Frontend assets |
+| Projects without a database; add one later | Wizard / Project menu → Add a database |
+| Database backup (`.sql.gz`) | Project menu → Backup |
+| Database restore from `.sql` / `.sql.gz` (replace or add; MySQL 8 dumps converted automatically) | Project menu → Restore |
+| phpMyAdmin on its own domain: HTTPS, Basic Auth, optional IP allow-list, start/stop on demand | Shared Services → phpMyAdmin |
+| Logs, shell, artisan, `.env` editing, manual deploy | Project menu |
 
 ---
 
@@ -120,93 +138,78 @@ From then on, every `git push` to the configured branch triggers a full deployme
 ```
                 Internet
                    │
-                   ▼
-        ┌─────────────────────┐
-        │   global-nginx      │  ← one container, ports 80 + 443
+        ┌──────────▼──────────┐
+        │    global-nginx     │   ports 80 + 443
         └──────────┬──────────┘
                    │  web_network (Docker bridge)
-       ┌───────────┼───────────────┐
-       ▼           ▼               ▼
-  ┌─────────┐ ┌─────────┐     ┌─────────┐
-  │project 1│ │project 2│ ... │project N│  ← php-fpm + queue + scheduler
-  └────┬────┘ └────┬────┘     └────┬────┘
-       └───────────┴───────────────┘
+       ┌───────────┼────────────────┐
+       ▼           ▼                ▼
+  ┌─────────┐ ┌─────────┐      ┌─────────┐
+  │project 1│ │project 2│ ...  │project N│   php-fpm + queue + scheduler
+  └────┬────┘ └────┬────┘      └────┬────┘
+       └───────────┴────────────────┘
                    ▼
-         ┌─────────────────────┐
-         │  global-mariadb     │  ← one container, shared by all projects
-         └─────────────────────┘
+        ┌─────────────────────┐
+        │   global-mariadb    │   shared, not exposed to the internet
+        └─────────────────────┘
 ```
 
-- Project code lives on the server disk at `/var/www/projects/<domain>`
-- A bind mount puts it inside each project's container
-- Shared infrastructure lives in `/var/www/infrastructure`
-- Every project joins the `web_network` bridge, so nginx can reach each one by container name
+| What | Where |
+|---|---|
+| Project code | `/var/www/projects/<domain>` |
+| Shared infrastructure | `/var/www/infrastructure` |
+| SSL certificates | `/var/www/infrastructure/nginx/letsencrypt` |
+| Database backups | `/var/backups/hideploy` |
+| Generated project files | `/root/hideploy-templates/<domain>` |
+| SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 
----
-
-## Requirements
-
-- A fresh **Ubuntu 22.04+** or **Debian 12+** server (root access)
-- A domain whose A record points to the server
-- A GitLab repository (SSH URL) for the project you want to deploy
-- The server's public SSH key added to the project as a **read-only Deploy Key**
-
-HiDeploy installs Docker, GitLab Runner, nginx and MariaDB automatically. Nothing else needs to be installed beforehand.
-
----
-
-## Common commands
-
-Once installed, everything is available through the menu:
-
-```bash
-sudo hideploy
-```
-
-If you prefer to reach specific menu entries faster, you can call the script directly:
-
-```bash
-sudo /usr/local/bin/hideploy     # same as 'sudo hideploy'
-```
-
-Project actions (deploy, logs, backup, SSL, remove) are available from the **Manage Projects** menu.
+Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
 
 ---
 
 ## Security notes
 
-- HiDeploy must run as **root**. Only install it on servers you trust.
-- The nginx and MariaDB containers are on an internal Docker network. MariaDB is **not** exposed to the internet.
-- SSL certificates are issued and renewed through Let's Encrypt. Renewal runs daily at 03:17 via cron.
-- Deploy keys used by the runner are **read-only**. Do not grant write access unless you have a specific reason.
+- HiDeploy must run as **root**. Install it only on servers you control, and read `install.sh` and `hideploy.sh` before piping anything into `sudo bash`.
+- The `gitlab-runner` user is added to the `docker` group, which is **equivalent to root access** on that server. Only run pipelines you trust.
+- MariaDB is not published to the internet; only containers on `web_network` can reach it.
+- Each project gets its **own database user** with access to its own database only.
+- phpMyAdmin is optional and **off by default**. When enabled it is protected by HTTPS and Basic Auth (plus an optional IP allow-list). Stop it when you are done: the domain then stops answering completely.
+- Deploy keys are read-only.
 
-A web panel is planned for the next milestone. When it lands, it will sit behind basic auth and HTTPS on a dedicated subdomain.
+---
+
+## Updating and removing
+
+```bash
+sudo hideploy update          # update HiDeploy itself
+```
+
+Updating replaces only the `hideploy` command. Containers, databases, certificates and projects are untouched.
+
+To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep working; use `docker`, or reinstall HiDeploy, to manage them.
 
 ---
 
 ## Roadmap
 
-- [x] CLI server manager
+- [x] Interactive server manager
 - [x] Shared nginx + MariaDB
 - [x] Automatic SSL issuance and renewal
 - [x] GitLab CI pipeline generation
-- [ ] **Web panel** (coming next) — a Persian-friendly dashboard for the same actions
-- [ ] Support for custom build steps via `.deploy.env`
-- [ ] Per-project resource limits and alerts
+- [x] Frontend (Vite) builds, optional databases, backup/restore, phpMyAdmin
+- [ ] Web panel (Persian-friendly dashboard for the same actions)
+- [ ] Per-project resource alerts
+- [ ] Debian testing
 
 ---
 
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue first for large changes so we can align on the approach.
-
----
+Issues and pull requests are welcome. For large changes, please open an issue first.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
-
----
+MIT, see [LICENSE](LICENSE).
 
 ## Author
 
