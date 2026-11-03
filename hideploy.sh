@@ -38,10 +38,14 @@ BACKUP_DIR="/var/backups/hifactory"
 
 NGINX_CONTAINER="global-nginx"
 DB_CONTAINER="global-mariadb"
+PMA_CONTAINER="global-phpmyadmin"
+PMA_DIR="$INFRA_DIR/phpmyadmin"
+PMA_HTPASSWD="$NGINX_DIR/conf.d/pma.htpasswd"
 RUNNER_USER="gitlab-runner"
 
 NGINX_IMAGE="nginx:stable-alpine"
 MARIADB_IMAGE="mariadb:10.11"
+PMA_IMAGE="phpmyadmin:5-apache"
 CERTBOT_IMAGE="certbot/certbot"
 DEFAULT_NODE_IMAGE="node:22-alpine"   # used only for temporary frontend-build containers
 
@@ -163,6 +167,13 @@ cfg_set() {
     cat "$tmp" > "$CONFIG_FILE"; rm -f "$tmp"
 }
 
+cfg_unset() {
+    [ -f "$CONFIG_FILE" ] || return 0
+    local tmp; tmp="$(mktemp)"
+    grep -v "^$1=" "$CONFIG_FILE" > "$tmp" || true
+    cat "$tmp" > "$CONFIG_FILE"; rm -f "$tmp"
+}
+
 # Escape a value for use inside a single-quoted SQL string
 sql_escape() {
     local s="$1"
@@ -222,11 +233,22 @@ container_state() {
 # badge KIND TEXT -> colored "[ TEXT ]"   (KIND: good | warn | bad)
 badge() {
     local color
-    case "$1" in good) color="$C_GREEN" ;; warn) color="$C_YELLOW" ;; *) color="$C_RED" ;; esac
+    case "$1" in good) color="$C_GREEN" ;; warn) color="$C_YELLOW" ;; dim) color="$C_DIM" ;; *) color="$C_RED" ;; esac
     printf '%s[ %-14s ]%s' "$color" "$2" "$C_RESET"
 }
 
 status_row() { printf '  %-20s %s  %s%s%s\n' "$1" "$(badge "$2" "$3")" "$C_DIM" "${4:-}" "$C_RESET"; }
+
+pma_status_row() {
+    local d; d="$(cfg_get PMA_DOMAIN || true)"
+    if [ -z "$d" ]; then
+        status_row "phpMyAdmin" dim "NOT SET UP" "optional: Shared Services -> phpMyAdmin"
+    elif container_running "$PMA_CONTAINER"; then
+        status_row "phpMyAdmin" warn "OPEN" "public at https://$d - stop it when you are done"
+    else
+        status_row "phpMyAdmin" good "CLOSED" "https://$d (stopped, not reachable)"
+    fi
+}
 
 container_row() {
     case "$(container_state "$2")" in
@@ -280,6 +302,7 @@ show_status() {
     container_row "nginx container" "$NGINX_CONTAINER"
     container_row "MariaDB container" "$DB_CONTAINER"
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
+    pma_status_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
     printf '\n%sRecommended next step:%s %s\n' "$C_YELLOW" "$C_RESET" "$(suggest_next)"
 }
@@ -986,6 +1009,7 @@ EOF
 # write_vhost DOMAIN CONTAINER MODE(http|https)
 write_vhost() {
     local domain="$1" container="$2" mode="$3" out="$NGINX_DIR/conf.d/$1.conf" root
+    if [ "${4:-laravel}" = "pma" ]; then write_pma_vhost "$domain" "$mode"; return; fi
     root="$PROJECTS_DIR/$domain/public"
     {
         if [ "$mode" = "http" ]; then
@@ -1030,7 +1054,7 @@ nginx_test_reload() {
 apply_vhost() {
     local domain="$1" container="$2" mode="$3" conf="$NGINX_DIR/conf.d/$1.conf" backup=""
     if [ -f "$conf" ]; then backup="$(mktemp)"; cp "$conf" "$backup"; fi
-    write_vhost "$domain" "$container" "$mode"
+    write_vhost "$domain" "$container" "$mode" "${4:-laravel}"
     if nginx_test_reload; then
         [ -n "$backup" ] && rm -f "$backup"
         return 0
@@ -1067,13 +1091,13 @@ cert_days() {
 
 # ssl_setup DOMAIN CONTAINER — issue a certificate and switch the vhost to HTTPS
 ssl_setup() {
-    local domain="$1" container="$2" email
+    local domain="$1" container="$2" kind="${3:-laravel}" email
     section "SSL certificate for $domain"
     explain \
         "Let's Encrypt will request http://$domain/.well-known/acme-challenge/... (served by nginx)." \
         "nginx stays online the whole time; no ports need to be freed."
     container_running "$NGINX_CONTAINER" || { err "nginx container is not running."; return 1; }
-    [ -f "$NGINX_DIR/conf.d/$domain.conf" ] || apply_vhost "$domain" "$container" http || return 1
+    [ -f "$NGINX_DIR/conf.d/$domain.conf" ] || apply_vhost "$domain" "$container" http "$kind" || return 1
     if ! dns_check "$domain"; then
         warn "DNS does not point to this server. If you use Cloudflare, switch the record to 'DNS only' (grey cloud) while issuing."
         confirm "Try anyway?" n || return 1
@@ -1083,7 +1107,7 @@ ssl_setup() {
     cfg_set ADMIN_EMAIL "$email"
     if certbot_run certonly --webroot -w /var/www/certbot -d "$domain" \
             --email "$email" --agree-tos --no-eff-email --non-interactive; then
-        apply_vhost "$domain" "$container" https || return 1
+        apply_vhost "$domain" "$container" https "$kind" || return 1
         ok "HTTPS enabled for $domain (certificate valid for $(cert_days "$domain") days)."
         renew_enabled || warn "Auto-renew is OFF. Enable it: Shared Services → Enable SSL auto-renew."
         return 0
@@ -1148,6 +1172,288 @@ menu_ssl() {
                    confirm "Enable it now?" y && step_renew_enable
                fi
                pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
+# phpMyAdmin (optional) — served on its own domain, protected, start/stop on demand
+# ============================================================================
+
+# write_pma_vhost DOMAIN MODE   MODE: http (certificate not issued yet) | open | closed | https (= open if running, else closed)
+write_pma_vhost() {
+    local domain="$1" mode="$2" out="$NGINX_DIR/conf.d/$1.conf" ip have_allow=0
+    local -a ips=()
+    if [ "$mode" = "https" ]; then
+        if container_running "$PMA_CONTAINER"; then mode="open"; else mode="closed"; fi
+    fi
+    IFS=',' read -ra ips <<< "$(cfg_get PMA_ALLOW || true)"
+    {
+        if [ "$mode" = "http" ]; then
+            # Never serve phpMyAdmin over plain HTTP (passwords would travel unencrypted).
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            echo "    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }"
+            echo "    location / { return 444; }"
+            echo "}"
+        else
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            echo "    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }"
+            if [ "$mode" = "open" ]; then echo '    location / { return 301 https://$host$request_uri; }'; else echo "    location / { return 444; }"; fi
+            echo "}"
+            echo ""
+            echo "server {"
+            echo "    listen 443 ssl;"
+            echo "    http2 on;"
+            echo "    server_name __DOMAIN__;"
+            echo "    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;"
+            echo "    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;"
+            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "    ssl_session_cache shared:SSL:10m;"
+            if [ "$mode" = "closed" ]; then
+                echo ""
+                echo "    # phpMyAdmin is stopped: this domain is closed completely."
+                echo "    return 444;"
+            else
+                echo "    client_max_body_size 300M;"
+                echo "    resolver 127.0.0.11 valid=10s ipv6=off;"
+                for ip in "${ips[@]}"; do
+                    ip="${ip// /}"
+                    [ -n "$ip" ] && { echo "    allow $ip;"; have_allow=1; }
+                done
+                [ "$have_allow" -eq 1 ] && echo "    deny all;"
+                echo '    auth_basic "Restricted";'
+                echo "    auth_basic_user_file /etc/nginx/conf.d/pma.htpasswd;"
+                echo '    add_header X-Robots-Tag "noindex, nofollow" always;'
+                cat <<'EOF'
+
+    location / {
+        set $pma_upstream "http://__PMA__:80";
+        proxy_pass $pma_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_request_buffering off;
+    }
+EOF
+            fi
+            echo "}"
+        fi
+    } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__PMA__|$PMA_CONTAINER|g" > "$out"
+}
+
+pma_write_compose() {
+    local domain="$1"
+    mkdir -p "$PMA_DIR"
+    cat > "$PMA_DIR/docker-compose.yml" <<EOF
+services:
+  phpmyadmin:
+    image: ${PMA_IMAGE}
+    container_name: ${PMA_CONTAINER}
+    restart: "no"          # does NOT come back after a server reboot: you start it only when you need it
+    environment:
+      PMA_HOST: ${DB_CONTAINER}
+      PMA_ABSOLUTE_URI: https://${domain}/
+      UPLOAD_LIMIT: 256M
+      MEMORY_LIMIT: 256M
+      MAX_EXECUTION_TIME: 600
+    mem_limit: 384m
+    networks:
+      - ${NETWORK}
+
+networks:
+  ${NETWORK}:
+    external: true
+EOF
+}
+
+pma_dc() { docker compose -f "$PMA_DIR/docker-compose.yml" "$@"; }
+
+pma_write_auth() {
+    local user="$1" pass="$2" hash
+    hash="$(printf '%s' "$pass" | openssl passwd -apr1 -stdin)" || return 1
+    printf '%s:%s\n' "$user" "$hash" > "$PMA_HTPASSWD"
+    chmod 644 "$PMA_HTPASSWD"
+}
+
+# Sets PMA_NEW_USER / PMA_NEW_PASS / PMA_PASS_GENERATED
+pma_ask_auth() {
+    local pass pass2 def
+    PMA_NEW_USER=""; PMA_NEW_PASS=""; PMA_PASS_GENERATED="no"
+    explain \
+        "First protection layer: a browser login (HTTP Basic Auth) in front of phpMyAdmin." \
+        "After it you still log in to phpMyAdmin itself with a MariaDB user."
+    while true; do
+        ask "Basic-auth username" "${1:-admin}" PMA_NEW_USER
+        [[ "$PMA_NEW_USER" =~ ^[A-Za-z0-9_.-]{3,32}$ ]] && break
+        err "Use 3-32 characters: letters, digits, dot, dash, underscore."
+    done
+    def="$(gen_password)"
+    while true; do
+        ask_secret "Basic-auth password (Enter = auto-generate a strong one)" pass
+        if [ -z "$pass" ]; then PMA_NEW_PASS="$def"; PMA_PASS_GENERATED="yes"; break; fi
+        [ "${#pass}" -ge 10 ] || { err "Use at least 10 characters."; continue; }
+        ask_secret "Repeat password" pass2
+        [ "$pass" = "$pass2" ] && { PMA_NEW_PASS="$pass"; break; }
+        err "Passwords do not match."
+    done
+}
+
+pma_ask_ips() {
+    local ips ip ok_all=1 mine="${SSH_CLIENT:-}"
+    mine="${mine%% *}"
+    explain \
+        "Second protection layer (optional): only these IP addresses may open phpMyAdmin at all." \
+        "Example: 203.0.113.10,198.51.100.0/24   (Enter = no IP restriction)"
+    [ -n "$mine" ] && explain "Your current IP (from your SSH session) looks like: $mine"
+    while true; do
+        ask "Allowed IPs, comma-separated" "$(cfg_get PMA_ALLOW || true)" ips
+        ips="${ips// /}"; ok_all=1
+        local -a list=(); IFS=',' read -ra list <<< "$ips"
+        for ip in "${list[@]}"; do
+            [[ "$ip" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || ok_all=0
+        done
+        [ "$ok_all" -eq 1 ] && break
+        err "Invalid IP list."
+    done
+    cfg_set PMA_ALLOW "$ips"
+}
+
+pma_configured() { [ -f "$PMA_DIR/docker-compose.yml" ] && [ -n "$(cfg_get PMA_DOMAIN || true)" ]; }
+
+pma_setup() {
+    section "phpMyAdmin setup (optional)"
+    explain \
+        "Creates a phpMyAdmin container on its own domain with HTTPS, a Basic-Auth login and an optional IP list." \
+        "It does NOT start automatically after a reboot. Start it when you need it, stop it when you are done." \
+        "While stopped, the domain is completely closed (no answer from the server)."
+    docker_ready && net_exists && container_running "$NGINX_CONTAINER" && container_running "$DB_CONTAINER" \
+        || { err "Docker, the network, nginx and MariaDB must be ready first (main menu 1 and 2)."; return 1; }
+    local domain
+    while true; do
+        ask "phpMyAdmin domain (e.g. pma.example.com)" "$(cfg_get PMA_DOMAIN || true)" domain
+        domain="${domain,,}"; valid_domain "$domain" && break; err "Invalid domain."
+    done
+    if [ -f "$NGINX_DIR/conf.d/$domain.conf" ] && ! pma_configured; then
+        err "A site configuration for $domain already exists (used by a project). Choose another domain."; return 1
+    fi
+    explain "Create an A record for $domain pointing to this server first."
+    if ! dns_check "$domain"; then
+        warn "DNS does not point to this server yet."
+        confirm "Continue anyway? (the certificate will fail until DNS is correct)" n || return 1
+    fi
+    pma_ask_auth "admin"
+    pma_ask_ips
+    pma_write_compose "$domain"
+    pma_write_auth "$PMA_NEW_USER" "$PMA_NEW_PASS" || { err "Could not create the password file."; return 1; }
+    cfg_set PMA_DOMAIN "$domain"
+    info "Starting the phpMyAdmin container (first start downloads the image)..."
+    pma_dc up -d || { err "Could not start phpMyAdmin."; return 1; }
+    apply_vhost "$domain" "$PMA_CONTAINER" http pma || return 1
+    if ssl_setup "$domain" "$PMA_CONTAINER" pma; then
+        echo ""; banner "phpMyAdmin is ready" "$C_BLUE"
+        printf '  URL:             https://%s\n  Basic-auth user: %s\n' "$domain" "$PMA_NEW_USER"
+        if [ "$PMA_PASS_GENERATED" = "yes" ]; then printf '  Basic-auth pass: %s   (shown only now, save it)\n' "$PMA_NEW_PASS"; else printf '  Basic-auth pass: the one you typed\n'; fi
+        explain "" \
+            "Then phpMyAdmin asks for a MariaDB login:" \
+            "  • a project's DB user (see its .env: DB_USERNAME / DB_PASSWORD) — sees only that project's database (recommended)" \
+            "  • or root, with the password stored in $DB_DIR/.env (sees everything)"
+        warn "While it is running, anyone with the Basic-Auth password can reach the login page. Stop it when you finish."
+        confirm "Leave phpMyAdmin OPEN right now?" y || pma_stop
+        next_steps "Stop it any time: Shared Services → phpMyAdmin → Stop." "Start it again: Shared Services → phpMyAdmin → Start."
+    else
+        warn "SSL failed, so for safety phpMyAdmin stays closed. Fix DNS and run this setup again."
+        pma_dc stop >/dev/null 2>&1
+        return 1
+    fi
+}
+
+pma_start() {
+    pma_configured || { err "phpMyAdmin is not set up yet (option 1)."; return 1; }
+    local domain; domain="$(cfg_get PMA_DOMAIN)"
+    container_running "$DB_CONTAINER" || { err "MariaDB is not running."; return 1; }
+    pma_dc up -d || { err "Could not start phpMyAdmin."; return 1; }
+    apply_vhost "$domain" "$PMA_CONTAINER" open pma || return 1
+    ok "phpMyAdmin is OPEN: https://$domain"
+    warn "Remember to stop it when you are done: Shared Services → phpMyAdmin → Stop."
+}
+
+pma_stop() {
+    pma_configured || { err "phpMyAdmin is not set up."; return 1; }
+    local domain; domain="$(cfg_get PMA_DOMAIN)"
+    apply_vhost "$domain" "$PMA_CONTAINER" closed pma || return 1
+    pma_dc stop >/dev/null 2>&1
+    ok "phpMyAdmin is CLOSED: the domain no longer answers and the container is stopped."
+}
+
+pma_status() {
+    section "phpMyAdmin status"
+    if ! pma_configured; then info "Not set up. Use option 1."; return 0; fi
+    local d days allow user
+    d="$(cfg_get PMA_DOMAIN)"; days="$(cert_days "$d")"; allow="$(cfg_get PMA_ALLOW || true)"
+    user="$(cut -d: -f1 "$PMA_HTPASSWD" 2>/dev/null)"
+    printf '  Domain:          https://%s\n' "$d"
+    printf '  State:           %s\n' "$(container_running "$PMA_CONTAINER" && echo "OPEN (running)" || echo "CLOSED (stopped)")"
+    printf '  SSL days left:   %s\n' "${days:--}"
+    printf '  Basic-auth user: %s\n' "${user:--}"
+    printf '  Allowed IPs:     %s\n' "${allow:-anyone with the password}"
+}
+
+pma_remove() {
+    pma_configured || { err "phpMyAdmin is not set up."; return 1; }
+    local domain; domain="$(cfg_get PMA_DOMAIN)"
+    warn "This removes the phpMyAdmin container, its nginx configuration and its password file (your databases are NOT touched)."
+    confirm "Remove phpMyAdmin?" n || return 0
+    pma_dc down >/dev/null 2>&1
+    rm -f "$NGINX_DIR/conf.d/$domain.conf" "$PMA_HTPASSWD"
+    nginx_test_reload >/dev/null 2>&1
+    if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ] && confirm "Delete the SSL certificate for $domain too?" y; then
+        certbot_run delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 && ok "Certificate deleted."
+    fi
+    rm -rf "$PMA_DIR"; cfg_unset PMA_DOMAIN; cfg_unset PMA_ALLOW
+    ok "phpMyAdmin removed."
+}
+
+menu_phpmyadmin() {
+    local c domain
+    while true; do
+        clear; banner "phpMyAdmin (optional)" "$C_BLUE"
+        pma_status_row; echo ""
+        echo " 1) Set up phpMyAdmin (domain + HTTPS + password + optional IP list)"
+        echo " 2) Start  (open it to the internet)"
+        echo " 3) Stop   (close it completely)"
+        echo " 4) Show status"
+        echo " 5) Change the Basic-Auth username/password"
+        echo " 6) Change the allowed IP list"
+        echo " 7) Remove phpMyAdmin"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item pma_setup ;;
+            2) run_item pma_start ;;
+            3) run_item pma_stop ;;
+            4) run_item pma_status ;;
+            5) if pma_configured; then
+                   pma_ask_auth "$(cut -d: -f1 "$PMA_HTPASSWD" 2>/dev/null)"
+                   pma_write_auth "$PMA_NEW_USER" "$PMA_NEW_PASS" && ok "Credentials updated (effective immediately)."
+                   [ "$PMA_PASS_GENERATED" = "yes" ] && warn "New generated password: $PMA_NEW_PASS   (shown only now)"
+               else err "phpMyAdmin is not set up."; fi
+               pause ;;
+            6) if pma_configured; then
+                   pma_ask_ips
+                   domain="$(cfg_get PMA_DOMAIN)"
+                   apply_vhost "$domain" "$PMA_CONTAINER" https pma && ok "IP list applied."
+               else err "phpMyAdmin is not set up."; fi
+               pause ;;
+            7) run_item pma_remove ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -1314,6 +1620,117 @@ project_frontend_menu() {
     done
 }
 
+# pick_sql_file VARNAME — choose a .sql / .sql.gz file; returns 1 if cancelled
+pick_sql_file() {
+    local __var="$1" f i=1 choice
+    local -a files=()
+    mapfile -t files < <(ls -t "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz /root/*.sql /root/*.sql.gz 2>/dev/null | head -n 15)
+    echo ""
+    if [ "${#files[@]}" -gt 0 ]; then
+        echo "  SQL files found:"
+        for f in "${files[@]}"; do
+            printf '   %2d) %s  (%s, %s)\n' "$i" "$f" "$(du -h "$f" | cut -f1)" "$(date -r "$f" '+%F %H:%M')"
+            i=$((i+1))
+        done
+    else
+        info "No .sql / .sql.gz files found in $BACKUP_DIR or /root."
+        explain "Upload your file first, e.g. from your computer:   scp backup.sql root@SERVER_IP:/root/"
+    fi
+    echo "    m) Type a full path manually"
+    echo "    0) Cancel"
+    while true; do
+        read -r -p "${C_YELLOW}Select: ${C_RESET}" choice
+        case "$choice" in
+            0) return 1 ;;
+            m|M) read -r -p "Full path: " f
+                 if [ -f "$f" ] && [ -s "$f" ]; then printf -v "$__var" '%s' "$f"; return 0; fi
+                 err "File not found or empty." ;;
+            *) if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ]; then
+                   printf -v "$__var" '%s' "${files[$((choice-1))]}"; return 0
+               fi
+               err "Invalid selection." ;;
+        esac
+    done
+}
+
+# db_import_file DBNAME FILE — import a dump into an existing database
+db_import_file() {
+    local db="$1" file="$2" fix=0 rc
+    local -a reader
+    valid_ident "$db" || { err "Invalid database name."; return 1; }
+    [ -f "$file" ] && [ -s "$file" ] || { err "File not found or empty: $file"; return 1; }
+    case "$file" in
+        *.gz) gzip -t "$file" 2>/dev/null || { err "This is not a valid .gz file."; return 1; }
+              reader=(gzip -dc -- "$file") ;;
+        *)    reader=(cat -- "$file") ;;
+    esac
+    info "Checking the dump..."
+    if "${reader[@]}" 2>/dev/null | grep -q -m1 'utf8mb4_0900_ai_ci'; then
+        warn "This dump comes from MySQL 8 (collation utf8mb4_0900_ai_ci), which MariaDB does not support."
+        confirm "Convert it automatically to utf8mb4_unicode_ci while importing?" y && fix=1
+    fi
+    info "Importing $(du -h "$file" | cut -f1) into '$db' — large files can take several minutes..."
+    {
+        echo 'SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0;'
+        # Drop CREATE DATABASE / USE lines so the data always lands in THIS project's database
+        "${reader[@]}" | sed -E '/^CREATE DATABASE/d; /^USE `/d' \
+            | { if [ "$fix" -eq 1 ]; then sed 's/utf8mb4_0900_ai_ci/utf8mb4_unicode_ci/g'; else cat; fi; }
+        echo 'SET FOREIGN_KEY_CHECKS=1; SET UNIQUE_CHECKS=1;'
+    } | docker exec -i "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot "$1"' _ "$db"
+    rc="${PIPESTATUS[-1]}"
+    if [ "$rc" -eq 0 ]; then ok "Import finished."; return 0; fi
+    err "Import failed (see the SQL error above). The import stops at the first error."
+    return 1
+}
+
+project_restore_db() {
+    local path="$1" db dbuser file mode typed tables maint="no" rc=0
+    load_project "$path" || return 1
+    section "Restore database — $(basename "$path")"
+    [ "$USE_DATABASE" = "yes" ] || { err "This project has no database. Use 'Add a database' first."; return 1; }
+    container_running "$DB_CONTAINER" || { err "The MariaDB container is not running."; return 1; }
+    db="$(env_get "$path/.env" DB_DATABASE)"; dbuser="$(env_get "$path/.env" DB_USERNAME)"
+    valid_ident "$db" || { err "DB_DATABASE is missing or invalid in $path/.env"; return 1; }
+    explain \
+        "Target database: $db" \
+        "Supports .sql and .sql.gz files. Dumps from MySQL 8 are converted automatically if needed."
+    pick_sql_file file || { info "Cancelled."; return 0; }
+    tables="$(printf "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='%s';\\n" "$db" | db_sql)"
+    echo ""
+    printf 'The database "%s" currently has %s table(s).\n' "$db" "${tables:-0}"
+    echo " 1) REPLACE (recommended): automatic backup, then drop + recreate the database, then import"
+    echo " 2) ADD on top of existing data (fails at the first table that already exists)"
+    echo " 0) Cancel"
+    read -r -p "Select: " mode
+    case "$mode" in
+        1) warn "All current data in '$db' will be replaced (an automatic backup is made first)."
+           read -r -p "${C_RED}Type the database name to confirm ($db): ${C_RESET}" typed
+           [ "$typed" = "$db" ] || { info "Cancelled."; return 0; }
+           project_backup "$path" || { err "The safety backup failed, so nothing was changed."; return 1; } ;;
+        2) [ "${tables:-0}" -gt 0 ] && warn "$tables table(s) already exist; any table with the same name will make the import stop with an error."
+           confirm "Continue?" n || { info "Cancelled."; return 0; } ;;
+        *) info "Cancelled."; return 0 ;;
+    esac
+    if container_running "$CONTAINER_NAME" && confirm "Put the site in maintenance mode during the restore?" y; then
+        artisan down --retry=60 >/dev/null 2>&1 && maint="yes"
+    fi
+    if [ "$mode" = "1" ]; then
+        printf "DROP DATABASE IF EXISTS \\`%s\\`;\\nCREATE DATABASE \\`%s\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\\nGRANT ALL PRIVILEGES ON \\`%s\\`.* TO '%s'@'%%';\\nFLUSH PRIVILEGES;\\n" \
+            "$db" "$db" "$db" "$(sql_escape "$dbuser")" | db_sql || { err "Could not recreate the database."; rc=1; }
+    fi
+    if [ "$rc" -eq 0 ]; then db_import_file "$db" "$file" || rc=1; fi
+    [ "$maint" = "yes" ] && artisan up >/dev/null 2>&1
+    if [ "$rc" -ne 0 ]; then
+        [ "$mode" = "1" ] && warn "The database was replaced before the failure. Your safety backup is in $BACKUP_DIR (restore it with this same menu)."
+        return 1
+    fi
+    if confirm "Run pending migrations now (needed if your code is newer than the backup)?" y; then
+        artisan migrate --force || warn "Migration reported an error."
+    fi
+    artisan optimize:clear >/dev/null 2>&1 && artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    ok "Restore complete. Check the site in your browser."
+}
+
 choose_project() {
     local -a paths=()
     mapfile -t paths < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
@@ -1391,7 +1808,8 @@ menu_project() {
         echo " 9) Setup / re-issue SSL for this domain"
         echo "10) Frontend assets (build now / enable in deployments)"
         echo "11) Add a database to this project"
-        echo "12) Remove this project"
+        echo "12) Restore database from a .sql / .sql.gz file"
+        echo "13) Remove this project"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -1421,7 +1839,8 @@ menu_project() {
                pause ;;
             10) project_frontend_menu "$path" ;;
             11) project_add_database "$path"; pause ;;
-            12) project_remove "$path"; pause; return ;;
+            12) project_restore_db "$path"; pause ;;
+            13) project_remove "$path"; pause; return ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -1520,7 +1939,7 @@ deploy_wizard() {
     echo ""
     require_stack || { pause; return; }
 
-    local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok
+    local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok sqlfile
     PROV_DB=""; PROV_USER=""; PROV_PASS=""
 
     # ---- 1. Domain ------------------------------------------------------
@@ -1649,6 +2068,11 @@ EOF
     if [ "$use_db" = "yes" ]; then
         explain "Press Enter to accept a suggestion, or type your own value."
         db_provision "$domain" || { pause; return; }
+        if confirm "Restore an existing SQL backup into this database now?" n; then
+            if pick_sql_file sqlfile; then
+                db_import_file "$PROV_DB" "$sqlfile" || warn "Import failed. You can retry later: Manage Projects → your project → Restore database."
+            fi
+        fi
     else
         info "No database for this project. Add one later: Manage Projects → your project → Add a database."
     fi
@@ -1799,12 +2223,14 @@ menu_services() {
         echo " 2) Install MariaDB container (stores all databases)"
         echo " 3) Enable SSL auto-renew"
         echo " 4) Show status"
+        echo " 5) phpMyAdmin (optional: web UI for your databases, on its own domain)"
         echo " A) Run ALL of the above in order"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
             1) run_item step_nginx_install ;;   2) run_item step_mariadb_install ;;
             3) run_item step_renew_enable ;;    4) run_item services_status ;;
+            5) menu_phpmyadmin ;;
             [Aa]) run_item run_all_services ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
