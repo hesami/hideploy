@@ -1,0 +1,21 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check
+        run: |
+          bash -n hideploy.sh
+          bash -n install.sh
+      - name: ShellCheck (errors only)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck
+          shellcheck -S error hideploy.sh install.sh
