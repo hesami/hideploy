@@ -58,6 +58,7 @@ hideploy --version       # show the installed version
 hideploy --help          # show help
 sudo hideploy update     # install the latest version (your projects are not touched)
 sudo hideploy backup-run # run one backup now (the nightly job calls this)
+sudo hideploy cleanup-run # run the safe disk cleanup now (the weekly job calls this)
 ```
 
 ### Manual install
@@ -132,6 +133,9 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **Automatic encrypted backups** every night: all databases, project files, SSL certificates and server config; copied to another server (SSH/rsync) and/or an S3 bucket (Arvan Cloud or any S3-compatible); automatic cleanup of old copies | Backups |
 | Database restore from `.sql` / `.sql.gz` (replace or add; MySQL 8 dumps converted automatically) | Project menu → Restore |
 | phpMyAdmin on its own domain: HTTPS, Basic Auth, optional IP allow-list, start/stop on demand | Shared Services → phpMyAdmin |
+| **Deployment history and one-step rollback** to an earlier version of the code | Project menu → Deployments |
+| **Maintenance mode during every deployment**: visitors see a friendly page instead of errors; manual on/off switch | automatic / Project menu → Deployments |
+| **Disk usage warning and safe cleanup** (Docker leftovers, old logs, package cache), optional weekly automatic cleanup | Manage Projects → Disk usage and cleanup |
 | Logs, shell, artisan, `.env` editing, manual deploy | Project menu |
 
 ---
@@ -166,10 +170,39 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Automatic backups (local copies) | `/var/backups/hideploy/auto` |
 | Backup settings, passphrase, destination keys | `/var/www/infrastructure/backup` (root only; never included in a backup) |
 | Backup schedule / log | `/etc/cron.d/hideploy-backup` / `/var/log/hideploy-backup.log` |
+| Deployment history | `/var/www/projects/<domain>/.deploy.history` |
+| Weekly cleanup schedule / log | `/etc/cron.d/hideploy-cleanup` / `/var/log/hideploy-cleanup.log` |
 | Generated project files | `/root/hideploy-templates/<domain>` |
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 
 Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
+
+---
+
+## Deployments, rollback and maintenance mode
+
+**Maintenance mode.** Before the code is replaced, the site is put in Laravel maintenance mode (`artisan down`), so visitors see a friendly "we'll be right back" page that refreshes itself, instead of errors from half-updated code. When the deployment succeeds, the site comes back automatically. If it **fails**, the site is left in maintenance mode on purpose and the log tells you how to continue. While the container restarts, nginx itself shows the same kind of page (`/var/www/infrastructure/nginx/conf.d/hideploy-maintenance.html`; you can edit it, it is never overwritten).
+
+**History.** Every deployment (pipeline or manual) records one line in `/var/www/projects/<domain>/.deploy.history`: time, version, result (`ok`, `failed`, `rollback`) and the commit message. See it in *Project menu → Deployments → Deployment history*.
+
+**Rollback.** *Project menu → Deployments → Roll back* lists the last working versions, offers a database backup first, then switches the code, rebuilds and brings the site back. Things to know:
+
+- It rolls back the **code only**. Database changes are not undone; HiDeploy warns you if migrations were added after the version you pick (restore a backup if the old code cannot live with them).
+- It is **temporary**: the next `git push` deploys the newest code again. To keep the old version, `git revert` the bad commit and push, or fix the bug and push.
+
+**Upgrading existing projects.** After updating HiDeploy: run *Manage Projects → Refresh nginx configuration of ALL projects*, and for the pipeline features regenerate `.gitlab-ci.yml` (main menu 3), copy it into your project and push. Until then, manual deployments from the menu already have maintenance mode and history, and rollback falls back to the git history on the server.
+
+---
+
+## Disk usage and cleanup
+
+The menu shows the disk usage in the status table (yellow from 80%, red from 90%). *Manage Projects → Disk usage and cleanup* offers:
+
+- **Safe cleanup:** unused Docker images, old build cache, system logs above 200 MB, package cache and Laravel logs older than 14 days. It never touches Docker volumes (your databases), running containers, project code or `.env` files.
+- **Deep cleanup:** removes all Docker images no container uses (slower next deploy or backup, because tools are downloaded again).
+- Large log files, old manual database backups, and an optional **weekly automatic safe cleanup** (Sundays 04:10, log in `/var/log/hideploy-cleanup.log`).
+
+Every successful deployment also removes the dangling images it leaves behind.
 
 ---
 
@@ -225,8 +258,10 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [ ] Web panel (Persian-friendly dashboard for the same actions)
 - [x] Automatic encrypted backups (SSH + S3)
 - [ ] Failure notifications (email / Telegram)
-- [ ] Rollback to the previous deployment
-- [ ] Disk cleanup helper
+- [x] Rollback to a previous deployment, maintenance mode during deployments
+- [x] Disk usage warning and cleanup helper
+- [ ] Security hardening (firewall, fail2ban, automatic security updates)
+- [ ] Project management after deployment (change domain, `www`/extra domains, memory, Redis)
 - [ ] Next.js project type
 - [ ] Per-project resource alerts
 - [ ] Debian testing
