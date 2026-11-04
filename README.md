@@ -57,6 +57,7 @@ sudo hideploy            # interactive menu
 hideploy --version       # show the installed version
 hideploy --help          # show help
 sudo hideploy update     # install the latest version (your projects are not touched)
+sudo hideploy backup-run # run one backup now (the nightly job calls this)
 ```
 
 ### Manual install
@@ -88,6 +89,7 @@ HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 3) Generate Project Files      →  Dockerfile, compose, CI for your repository
 4) Deploy New Laravel Project  →  the deployment wizard
 5) Manage Projects             →  deploy, logs, backups, restore, SSL, remove
+6) Backups                     →  automatic, encrypted, copied off the server
 ```
 
 On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**. Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status and the recommended next step.
@@ -126,7 +128,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | SSL overview: expiry dates, days left, file paths, forced renewal | Manage Projects → SSL management |
 | Frontend (Vite) build in a temporary Node container; npm, pnpm or yarn detected from the lock file | Project menu → Frontend assets |
 | Projects without a database; add one later | Wizard / Project menu → Add a database |
-| Database backup (`.sql.gz`) | Project menu → Backup |
+| One-off database backup (`.sql.gz`) | Project menu → Backup |
+| **Automatic encrypted backups** every night: all databases, project files, SSL certificates and server config; copied to another server (SSH/rsync) and/or an S3 bucket (Arvan Cloud or any S3-compatible); automatic cleanup of old copies | Backups |
 | Database restore from `.sql` / `.sql.gz` (replace or add; MySQL 8 dumps converted automatically) | Project menu → Restore |
 | phpMyAdmin on its own domain: HTTPS, Basic Auth, optional IP allow-list, start/stop on demand | Shared Services → phpMyAdmin |
 | Logs, shell, artisan, `.env` editing, manual deploy | Project menu |
@@ -159,11 +162,33 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Project code | `/var/www/projects/<domain>` |
 | Shared infrastructure | `/var/www/infrastructure` |
 | SSL certificates | `/var/www/infrastructure/nginx/letsencrypt` |
-| Database backups | `/var/backups/hideploy` |
+| Database backups (manual) | `/var/backups/hideploy` |
+| Automatic backups (local copies) | `/var/backups/hideploy/auto` |
+| Backup settings, passphrase, destination keys | `/var/www/infrastructure/backup` (root only; never included in a backup) |
+| Backup schedule / log | `/etc/cron.d/hideploy-backup` / `/var/log/hideploy-backup.log` |
 | Generated project files | `/root/hideploy-templates/<domain>` |
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 
 Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
+
+---
+
+## Automatic backups
+
+Open **6) Backups** and follow the recommended order shown at the top of the menu:
+
+1. **Passphrase.** Every backup file is encrypted (AES-256) *before* it leaves the server. HiDeploy shows the passphrase once: **save it outside the server**. Without it nobody can open your backups, and if the server dies the copy stored on it dies too.
+2. **Destinations** (use one or both):
+   - **SSH server:** HiDeploy creates a dedicated key and prints the exact commands to paste on the backup server (a dedicated user, `rsync`, the public key). Uploads go to a temporary name and are renamed when complete.
+   - **S3 bucket:** presets for **Arvan Cloud** (Tehran and Tabriz) or any S3-compatible endpoint. Create a *private* bucket and an access key first. Uploads use `rclone` in a temporary container; the keys are kept in a root-only file.
+3. **Schedule and retention:** time of day, days to keep locally (default 7) and remotely (default 30). The newest 3 backups are never deleted.
+4. **Run one now** to verify everything end to end, then turn the **nightly backup on**.
+
+Each backup contains, per run: one file per project database, the project files (`.env`, `.deploy.env`, `storage/app` uploads, Passport keys), the server configuration (nginx, SSL certificates, runner settings) and a `SHA256SUMS` integrity file.
+
+**Restoring.** *Backups → Restore a database* lists local or remote backups, verifies integrity, decrypts and hands the dump to the normal restore flow (with an automatic safety backup). On a **new server**, install HiDeploy, set up the destination with the same settings, then restore: you are asked for the passphrase. Project files and server configuration can be decrypted with *Backups → Decrypt a backup file*.
+
+> The nightly job calls `hideploy backup-run`, so keep `hideploy` installed. Docker volumes other than the database dump are not copied; uploaded files outside `storage/app` (for example in `public/`) are not included.
 
 ---
 
@@ -198,6 +223,11 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] GitLab CI pipeline generation
 - [x] Frontend (Vite) builds, optional databases, backup/restore, phpMyAdmin
 - [ ] Web panel (Persian-friendly dashboard for the same actions)
+- [x] Automatic encrypted backups (SSH + S3)
+- [ ] Failure notifications (email / Telegram)
+- [ ] Rollback to the previous deployment
+- [ ] Disk cleanup helper
+- [ ] Next.js project type
 - [ ] Per-project resource alerts
 - [ ] Debian testing
 
