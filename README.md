@@ -180,7 +180,7 @@ Open **6) Backups** and follow the recommended order shown at the top of the men
 1. **Passphrase.** Every backup file is encrypted (AES-256) *before* it leaves the server. HiDeploy shows the passphrase once: **save it outside the server**. Without it nobody can open your backups, and if the server dies the copy stored on it dies too.
 2. **Destinations** (use one or both):
    - **SSH server:** HiDeploy creates a dedicated key and prints the exact commands to paste on the backup server (a dedicated user, `rsync`, the public key). Uploads go to a temporary name and are renamed when complete.
-   - **S3 bucket:** presets for **Arvan Cloud** (Tehran and Tabriz) or any S3-compatible endpoint. Create a *private* bucket and an access key first. Uploads use `rclone` in a temporary container; the keys are kept in a root-only file.
+   - **S3 bucket:** presets for **Arvan Cloud** (Iran Central, Iran Central HiOps SSD, Iran North-West, Western Europe) or any S3-compatible endpoint. Create a *private* bucket and an access key first. Uploads use `rclone` in a temporary container; the keys are kept in a root-only file.
 3. **Schedule and retention:** time of day, days to keep locally (default 7) and remotely (default 30). The newest 3 backups are never deleted.
 4. **Run one now** to verify everything end to end, then turn the **nightly backup on**.
 
