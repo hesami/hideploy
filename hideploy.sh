@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.1.2"
+HIDEPLOY_VERSION="1.2.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -68,6 +68,12 @@ BK_LOCAL_DIR="$BACKUP_DIR/auto"            # automatic backups kept on this serv
 BK_CRON="/etc/cron.d/hideploy-backup"
 BK_LOG="/var/log/hideploy-backup.log"
 RCLONE_IMAGE="rclone/rclone"
+
+# Disk cleanup
+CLEANUP_CRON="/etc/cron.d/hideploy-cleanup"
+CLEANUP_LOG="/var/log/hideploy-cleanup.log"
+
+DEPLOY_MAINT_ON="no"                       # set while a deployment keeps the site in maintenance mode
 
 # ----------------------------------------------------------------------------
 # Colors and output helpers
@@ -277,6 +283,7 @@ suggest_next() {
         missing) echo "Choose 1) Prepare Server -> Docker (or option A to do everything)"; return ;;
         stopped) echo "Docker is installed but not running: systemctl start docker"; return ;;
     esac
+    if [ "$(disk_pct || true)" -ge 90 ] 2>/dev/null; then echo "The disk is almost full: choose 5) Manage Projects -> Disk usage and cleanup"; return; fi
     if ! net_exists;            then echo "Choose 1) Prepare Server -> Shared network"; return; fi
     if ! has_cmd gitlab-runner; then echo "Choose 1) Prepare Server -> Install GitLab Runner"; return; fi
     if ! runner_registered;     then echo "Choose 1) Prepare Server -> Register GitLab Runner"; return; fi
@@ -318,6 +325,7 @@ show_status() {
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
     pma_status_row
     bk_status_row
+    disk_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
     printf '\n%sRecommended next step:%s %s\n' "$C_YELLOW" "$C_RESET" "$(suggest_next)"
 }
@@ -870,6 +878,19 @@ deploy_production:
       dc()      { docker compose -p "$CONTAINER_NAME" --env-file .deploy.env -f docker-compose.prod.yml "$@"; }
       dexec()   { docker exec -u "$APP_UID:$APP_GID" -w "$APP_PATH" "$CONTAINER_NAME" "$@"; }
       artisan() { dexec php artisan "$@"; }
+      record()  {
+        echo "$(date -Is) $(git rev-parse --short HEAD 2>/dev/null || echo unknown) $1 $(git log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-80)" >> .deploy.history
+        tail -n 200 .deploy.history > .deploy.history.tmp && mv .deploy.history.tmp .deploy.history
+        grep -qxF ".deploy.history" .git/info/exclude 2>/dev/null || echo ".deploy.history" >> .git/info/exclude
+      }
+
+      MAINT=no
+      trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo; echo "!! Deployment FAILED."; if [ "$MAINT" = yes ]; then echo "!! The site was left in maintenance mode on purpose (half-updated code can break pages or data)."; fi; echo "!! Fix the problem and push again, or roll back: sudo hideploy -> 5) Manage Projects -> this project -> 13) Deployments -> Roll back."; record failed || true; fi' EXIT
+
+      if [ ! -f storage/framework/down ] && docker exec "$CONTAINER_NAME" true 2>/dev/null && [ -f vendor/autoload.php ]; then
+        echo "==> Maintenance mode ON (visitors see a friendly page while the site updates)"
+        if artisan down --retry=60 --refresh=15 >/dev/null 2>&1 || artisan down >/dev/null 2>&1; then MAINT=yes; fi
+      fi
 
       echo "==> Updating code"
       git fetch origin "$CI_COMMIT_BRANCH"
@@ -896,10 +917,18 @@ EOF
       artisan optimize
       artisan queue:restart
 
+      if [ "$MAINT" = yes ]; then
+        artisan up
+        echo "==> Maintenance mode OFF"
+      fi
+      docker image prune -f >/dev/null 2>&1 || true
+
       echo "==> Health check (informational)"
       curl -s -o /dev/null -w "HTTPS status: %{http_code}\n" -k --max-time 15 \
         --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/up" || true
 
+      record ok
+      trap - EXIT
       echo "Deployment finished successfully."
 EOF
 }
@@ -1003,6 +1032,15 @@ tpl_vhost_common() {
         root /var/www/certbot;
     }
 
+    # Shown by nginx itself when the project container is restarting during a deployment
+    error_page 502 504 =503 /hideploy-maintenance.html;
+    location = /hideploy-maintenance.html {
+        internal;
+        root /etc/nginx/conf.d;
+        add_header Retry-After 30 always;
+        add_header Cache-Control "no-store" always;
+    }
+
     location / {
         try_files $uri $uri/ /index.php?$query_string;
     }
@@ -1025,6 +1063,7 @@ EOF
 write_vhost() {
     local domain="$1" container="$2" mode="$3" out="$NGINX_DIR/conf.d/$1.conf" root
     if [ "${4:-laravel}" = "pma" ]; then write_pma_vhost "$domain" "$mode"; return; fi
+    ensure_maintenance_page
     root="$PROJECTS_DIR/$domain/public"
     {
         if [ "$mode" = "http" ]; then
@@ -1502,12 +1541,13 @@ wait_container() {
     return 1
 }
 
-# deploy_project PATH [pull yes|no]  — same steps as the CI pipeline
-deploy_project() {
-    local path="$1" pull="${2:-yes}"
-    load_project "$path" || return 1
-    cd "$path" || return 1
-    if [ "$pull" = "yes" ]; then
+# deploy_project_inner PATH [pull yes|no] [target-commit] — same steps as the CI pipeline
+deploy_project_inner() {
+    local path="$1" pull="${2:-yes}" target="${3:-}"
+    if [ -n "$target" ]; then
+        info "Switching the code to version $target"
+        git_reset_to "$path" "$target" || { err "Could not switch to that version."; return 1; }
+    elif [ "$pull" = "yes" ]; then
         info "Pulling latest code from origin/$BRANCH"
         git_sync "$path" "$BRANCH" || { err "git update failed."; return 1; }
     fi
@@ -1525,17 +1565,43 @@ deploy_project() {
     if [ "$USE_DATABASE" = "yes" ] && [ "${DEPLOY_MIGRATE:-yes}" = "yes" ]; then
         info "Running database migrations"; artisan migrate --force || { err "Migration failed."; return 1; }
     elif [ "$USE_DATABASE" != "yes" ]; then
-        info "This project has no database — skipping migrations."
+        info "This project has no database: skipping migrations."
     fi
     artisan storage:link >/dev/null 2>&1 || true
     info "Refreshing caches and restarting queue workers"
-    artisan optimize:clear >/dev/null && artisan optimize && artisan queue:restart
-    ok "Deployment finished."
+    artisan optimize:clear >/dev/null && artisan optimize && artisan queue:restart \
+        || { err "Cache refresh failed (for example, routes defined with closures cannot be cached)."; return 1; }
 }
 
-# git_sync PATH BRANCH — update the server copy; handles a stale/in-use .git/index.lock safely
-git_sync() {
-    local path="$1" branch="$2" lock="$1/.git/index.lock" i
+# deploy_project PATH [pull yes|no] [target-commit]
+# Keeps the site in maintenance mode while the code is replaced, records the result in .deploy.history
+deploy_project() {
+    local path="$1" pull="${2:-yes}" target="${3:-}" rc status="ok"
+    load_project "$path" || return 1
+    cd "$path" || return 1
+    deploy_maint_on
+    deploy_project_inner "$path" "$pull" "$target"; rc=$?
+    [ -z "$target" ] || status="rollback"
+    if [ "$rc" -eq 0 ]; then
+        if [ "$DEPLOY_MAINT_ON" = "yes" ]; then
+            artisan up >/dev/null 2>&1 && info "Maintenance mode OFF."
+        fi
+        docker image prune -f >/dev/null 2>&1 || true
+        deploy_record "$path" "$status"
+        ok "Deployment finished."
+    else
+        deploy_record "$path" failed
+        if [ "$DEPLOY_MAINT_ON" = "yes" ]; then
+            warn "The site was left in maintenance mode on purpose: half-updated code can break pages or data."
+            explain "Fix the problem and deploy again, or roll back: Manage Projects -> this project -> Deployments -> Roll back."
+        fi
+    fi
+    return "$rc"
+}
+
+# git_wait_lock PATH — wait for / clear a stale .git/index.lock; fails if another git is really running
+git_wait_lock() {
+    local path="$1" lock="$1/.git/index.lock" i
     for i in 1 2 3 4 5 6 7 8 9 10; do [ -f "$lock" ] || break; sleep 1; done
     if [ -f "$lock" ]; then
         if pgrep -u "$RUNNER_USER" -x git >/dev/null 2>&1; then
@@ -1545,7 +1611,18 @@ git_sync() {
         warn "Removing a stale git lock file: $lock"
         rm -f "$lock"
     fi
-    as_runner git -C "$path" fetch origin "$branch" && as_runner git -C "$path" reset --hard "origin/$branch"
+}
+
+# git_sync PATH BRANCH — update the server copy to the latest origin/BRANCH
+git_sync() {
+    git_wait_lock "$1" || return 1
+    as_runner git -C "$1" fetch origin "$2" && as_runner git -C "$1" reset --hard "origin/$2"
+}
+
+# git_reset_to PATH COMMIT — put the server copy on a specific version
+git_reset_to() {
+    git_wait_lock "$1" || return 1
+    as_runner git -C "$1" reset --hard "$2"
 }
 
 # frontend_build — run in a temporary Node container; project must be loaded with load_project
@@ -1746,6 +1823,205 @@ project_restore_db() {
     ok "Restore complete. Check the site in your browser."
 }
 
+# ============================================================================
+# DEPLOYMENTS: history, rollback, maintenance mode
+# ============================================================================
+# Each deployment (pipeline or manual) appends one line to <project>/.deploy.history:
+#   <time> <short commit> <ok|failed|rollback> <commit message>
+# Rollback goes back to an earlier version of the CODE. The database is never rolled back automatically.
+
+tpl_maintenance_page() {
+    cat <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>Back soon</title>
+<style>
+  :root { --bg: #f6f7f9; --fg: #1f2933; --muted: #52606d; --accent: #3b82f6; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #11151a; --fg: #e4e7eb; --muted: #9aa5b1; --accent: #60a5fa; } }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         display: flex; align-items: center; justify-content: center; text-align: center; padding: 24px; box-sizing: border-box; }
+  main { max-width: 460px; }
+  h1 { font-size: 1.6rem; margin: 0 0 12px; }
+  p { color: var(--muted); line-height: 1.6; margin: 0 0 8px; }
+  .bar { width: 120px; height: 4px; margin: 24px auto 0; border-radius: 2px; background: var(--accent); opacity: .5; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: .25; } 50% { opacity: .8; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>We&rsquo;ll be right back</h1>
+  <p>This site is being updated.</p>
+  <p>This page refreshes automatically, no need to do anything.</p>
+  <div class="bar"></div>
+</main>
+</body>
+</html>
+EOF
+}
+
+# The page is written once; you may edit it, it is never overwritten.
+ensure_maintenance_page() {
+    local f="$NGINX_DIR/conf.d/hideploy-maintenance.html"
+    [ -f "$f" ] || tpl_maintenance_page > "$f"
+    chmod 644 "$f"
+}
+
+# deploy_maint_on — turn Laravel maintenance mode on before the code is replaced
+deploy_maint_on() {
+    DEPLOY_MAINT_ON="no"
+    [ "${MAINTENANCE_ON_DEPLOY:-yes}" = "yes" ] || return 0
+    [ -f "$APP_PATH/storage/framework/down" ] && return 0      # already down: leave it alone
+    if container_running "$CONTAINER_NAME" && [ -f "$APP_PATH/vendor/autoload.php" ]; then
+        if artisan down --retry=60 --refresh=15 >/dev/null 2>&1 || artisan down >/dev/null 2>&1; then
+            DEPLOY_MAINT_ON="yes"
+            info "Maintenance mode ON: visitors see a friendly page while the site updates."
+        fi
+    fi
+}
+
+# deploy_record PATH STATUS
+deploy_record() {
+    local path="$1" status="$2" f="$1/.deploy.history" sha msg
+    sha="$(as_runner git -C "$path" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    msg="$(as_runner git -C "$path" log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-80)"
+    printf '%s %s %s %s\n' "$(date -Is)" "$sha" "$status" "$msg" >> "$f"
+    tail -n 200 "$f" > "$f.tmp" && cat "$f.tmp" > "$f"; rm -f "$f.tmp"
+    chown "${APP_UID:-0}:${APP_GID:-0}" "$f" 2>/dev/null || true
+    grep -qxF '.deploy.history' "$path/.git/info/exclude" 2>/dev/null || echo '.deploy.history' >> "$path/.git/info/exclude"
+}
+
+project_deploy_history() {
+    local path="$1" f="$1/.deploy.history" ts sha st msg col
+    section "Deployment history: $(basename "$path")"
+    if [ ! -s "$f" ]; then
+        info "No history yet. It is recorded by every deployment from now on (pipeline or manual)."
+        explain "Projects deployed through the pipeline record history after you regenerate .gitlab-ci.yml (main menu 3) and push it."
+        return 0
+    fi
+    printf '  %-20s %-9s %-10s %s\n' "WHEN" "VERSION" "RESULT" "MESSAGE"
+    tail -n 15 "$f" | tac | while read -r ts sha st msg; do
+        case "$st" in ok) col="$C_GREEN" ;; failed) col="$C_RED" ;; *) col="$C_YELLOW" ;; esac
+        printf '  %-20s %-9s %s%-10s%s %s\n' "${ts:0:19}" "$sha" "$col" "$st" "$C_RESET" "$msg"
+    done
+}
+
+project_rollback() {
+    local path="$1" cur hist i=1 default=0 line ts sha st msg mark choice target n rc
+    local -a rows=() shas=()
+    load_project "$path" || return 1
+    section "Roll back: $(basename "$path")"
+    explain \
+        "Goes back to an EARLIER VERSION OF THE CODE, rebuilds it and brings the site back online." \
+        "The database is NOT rolled back. If the bad version changed the database, use a backup (Restore database)." \
+        "The rollback is temporary: your next git push deploys the newest code again."
+    cur="$(as_runner git -C "$path" rev-parse --short HEAD 2>/dev/null)"
+    hist="$path/.deploy.history"
+    if [ -s "$hist" ]; then
+        mapfile -t rows < <(grep -E '^[^ ]+ [0-9a-f]+ (ok|rollback) ' "$hist" | tac | awk '!seen[$2]++' | head -n 10)
+    fi
+    if [ "${#rows[@]}" -eq 0 ]; then
+        warn "No deployment history yet, so these versions come from git on this server (not verified as working)."
+        mapfile -t rows < <(as_runner git -C "$path" reflog --format='%cI %h reflog %s' 2>/dev/null | awk '!seen[$2]++' | head -n 10)
+    fi
+    echo ""
+    for line in "${rows[@]}"; do
+        read -r ts sha st msg <<< "$line"
+        shas+=("$sha")
+        mark=""; [ "$sha" = "$cur" ] && mark="   <- running now"
+        if [ "$default" -eq 0 ] && [ "$sha" != "$cur" ]; then default="$i"; fi
+        printf '   %2d) %s  %s  %s%s\n' "$i" "$sha" "${ts:0:16}" "$msg" "$mark"
+        i=$((i+1))
+    done
+    [ "$default" -gt 0 ] || { err "There is no earlier version to roll back to."; return 1; }
+    ask "Roll back to which version? (number, 0 = cancel)" "$default" choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#shas[@]}" ] || { info "Cancelled."; return 0; }
+    target="${shas[$((choice-1))]}"
+    as_runner git -C "$path" cat-file -e "${target}^{commit}" 2>/dev/null || { err "Version $target is not available in this server's git history."; return 1; }
+    n="$(as_runner git -C "$path" diff --name-only --diff-filter=A "$target" HEAD -- database/migrations 2>/dev/null | wc -l)"
+    if [ "${n:-0}" -gt 0 ]; then
+        warn "$n database migration(s) were added after version $target and are already applied to the database."
+        explain "Old code usually keeps working with extra tables/columns. If it does not, restore a database backup after the rollback."
+    fi
+    if [ "$USE_DATABASE" = "yes" ] && confirm "Make a database backup first (recommended)?" y; then
+        project_backup "$path" || { err "The backup failed, so the rollback was cancelled."; return 1; }
+    fi
+    confirm "Roll back $(basename "$path") to $target now? The site shows a maintenance page while it rebuilds." n || { info "Cancelled."; return 0; }
+    DEPLOY_MIGRATE="no"
+    deploy_project "$path" no "$target"; rc=$?
+    unset DEPLOY_MIGRATE
+    if [ "$rc" -eq 0 ]; then
+        ok "Rolled back to $target."
+        next_steps \
+            "Check the site in your browser." \
+            "Remember: the next 'git push' to $BRANCH deploys the newest code again." \
+            "To keep the old version, on your computer run:  git revert <bad-commit>  and push, or fix the bug and push."
+    else
+        err "The rollback did not finish. See the messages above."
+        return 1
+    fi
+}
+
+project_maintenance_toggle() {
+    local path="$1"
+    load_project "$path" || return 1
+    container_running "$CONTAINER_NAME" || { err "The project container is not running."; return 1; }
+    if [ -f "$path/storage/framework/down" ]; then
+        warn "The site is in MAINTENANCE mode (visitors cannot use it)."
+        confirm "Bring it back online?" y && artisan up && ok "The site is online."
+    else
+        ok "The site is ONLINE."
+        if confirm "Put it in maintenance mode?" n; then
+            { artisan down --retry=60 --refresh=15 2>/dev/null || artisan down; } && ok "Maintenance mode is ON."
+        fi
+    fi
+}
+
+nginx_refresh_project() {
+    local path="$1" domain mode
+    load_project "$path" || return 1
+    domain="$(basename "$path")"
+    if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ]; then mode="https"; else mode="http"; fi
+    if apply_vhost "$domain" "$CONTAINER_NAME" "$mode"; then ok "$domain: nginx configuration refreshed ($mode)."; else err "$domain: could not refresh nginx."; return 1; fi
+}
+
+nginx_refresh_all() {
+    section "Refresh nginx configuration of all projects"
+    explain "Use this after updating HiDeploy, so existing sites get the newest nginx settings (for example the friendly maintenance page)."
+    local p found=0
+    while IFS= read -r p; do
+        found=1; nginx_refresh_project "$p"
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    [ "$found" -eq 1 ] || info "No projects yet."
+}
+
+project_deploy_menu() {
+    local path="$1" c
+    while true; do
+        load_project "$path" || return
+        clear; banner "Deployments: $(basename "$path")" "$C_MAGENTA"
+        if [ -f "$path/storage/framework/down" ]; then printf '  Site status: %sMAINTENANCE MODE%s\n\n' "$C_YELLOW" "$C_RESET"; else printf '  Site status: %sonline%s\n\n' "$C_GREEN" "$C_RESET"; fi
+        echo " 1) Deployment history"
+        echo " 2) Roll back to an earlier version"
+        echo " 3) Maintenance mode on / off"
+        echo " 4) Refresh this project's nginx configuration"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) project_deploy_history "$path"; pause ;;
+            2) project_rollback "$path"; pause ;;
+            3) project_maintenance_toggle "$path"; pause ;;
+            4) nginx_refresh_project "$path"; pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
 choose_project() {
     local -a paths=()
     mapfile -t paths < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
@@ -1824,7 +2100,8 @@ menu_project() {
         echo "10) Frontend assets (build now / enable in deployments)"
         echo "11) Add a database to this project"
         echo "12) Restore database from a .sql / .sql.gz file"
-        echo "13) Remove this project"
+        echo "13) Deployments: history, rollback, maintenance mode"
+        echo "14) Remove this project"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -1855,7 +2132,8 @@ menu_project() {
             10) project_frontend_menu "$path" ;;
             11) project_add_database "$path"; pause ;;
             12) project_restore_db "$path"; pause ;;
-            13) project_remove "$path"; pause; return ;;
+            13) project_deploy_menu "$path" ;;
+            14) project_remove "$path"; pause; return ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -1869,6 +2147,8 @@ menu_manage() {
         echo " 1) Projects (list, deploy, logs, backup, SSL, remove)"
         echo " 2) SSL management (all certificates)"
         echo " 3) Shared services (status / restart / logs)"
+        echo " 4) Disk usage and cleanup"
+        echo " 5) Refresh nginx configuration of ALL projects (after updating HiDeploy)"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -1885,6 +2165,8 @@ menu_manage() {
                    e) docker logs --tail 80 "$DB_CONTAINER" ;;
                esac
                pause ;;
+            4) menu_disk ;;
+            5) nginx_refresh_all; pause ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -2622,15 +2904,7 @@ bk_write_cron() {
     printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n%s %s * * * root %s backup-run >> %s 2>&1\n' \
         "$mm" "$hh" "$self" "$BK_LOG" > "$BK_CRON"
     chmod 644 "$BK_CRON"
-    cat > /etc/logrotate.d/hideploy <<EOF
-$BK_LOG $RENEW_LOG {
-    weekly
-    rotate 8
-    compress
-    missingok
-    notifempty
-}
-EOF
+    write_logrotate
 }
 
 bk_cfg_schedule() {
@@ -2886,6 +3160,154 @@ menu_backups() {
 }
 
 # ============================================================================
+# DISK: usage warning and safe cleanup
+# ============================================================================
+# Cleanup NEVER touches Docker volumes (your databases live there), running containers, project code or .env files.
+
+disk_pct() { df --output=pcent / 2>/dev/null | tail -n1 | tr -dc '0-9'; }
+
+disk_row() {
+    local p; p="$(disk_pct)"
+    [ -n "$p" ] || return 0
+    if   [ "$p" -ge 90 ]; then status_row "Disk space" bad  "${p}% USED" "almost full: Manage Projects -> Disk usage and cleanup"
+    elif [ "$p" -ge 80 ]; then status_row "Disk space" warn "${p}% USED" "getting full: consider a cleanup"
+    else status_row "Disk space" good "${p}% USED" "$(df -h --output=avail / | tail -n1 | tr -d ' ') free"; fi
+}
+
+hideploy_self() { local s; s="$(command -v hideploy 2>/dev/null || true)"; printf '%s' "${s:-/usr/local/bin/hideploy}"; }
+
+write_logrotate() {
+    cat > /etc/logrotate.d/hideploy <<EOF
+$BK_LOG $RENEW_LOG $CLEANUP_LOG {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+}
+EOF
+}
+
+cleanup_enabled() { [ -f "$CLEANUP_CRON" ]; }
+
+cleanup_used_bytes() { df --output=used -B1 / | tail -n1 | tr -dc '0-9'; }
+
+# The safe cleanup (also what the weekly job runs)
+cleanup_safe() {
+    local before after freed p
+    before="$(cleanup_used_bytes)"
+    echo "[$(date -Is)] Safe cleanup started (disk $(disk_pct)% used)"
+    if docker_ready; then
+        info "Docker: removing unused (dangling) images..."
+        docker image prune -f 2>&1 | tail -n 1
+        info "Docker: removing build cache older than 7 days..."
+        docker builder prune -f --filter "until=168h" 2>&1 | tail -n 1
+    fi
+    if has_cmd journalctl; then
+        info "System logs: keeping at most 200 MB..."
+        journalctl --vacuum-size=200M 2>&1 | tail -n 1
+    fi
+    info "Package download cache..."
+    apt-get clean
+    info "Laravel log files older than 14 days..."
+    while IFS= read -r p; do
+        find "$p/storage/logs" -type f -name '*.log' -mtime +14 -print -delete 2>/dev/null | sed 's/^/  deleted /'
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null)
+    after="$(cleanup_used_bytes)"
+    freed=$(( (${before:-0} - ${after:-0}) / 1024 / 1024 ))
+    [ "$freed" -ge 0 ] || freed=0
+    ok "Cleanup finished: freed about ${freed} MB. Disk is now $(disk_pct)% used."
+}
+
+cleanup_deep() {
+    warn "Deep cleanup removes ALL Docker images that no container uses, and the whole build cache."
+    explain \
+        "Running and stopped containers keep their images. Volumes (databases) are never touched." \
+        "Cost: the next deploy or backup may be slower, because tools (Node, rclone) are downloaded again."
+    confirm "Continue with the deep cleanup?" n || { info "Cancelled."; return 0; }
+    local before after
+    before="$(cleanup_used_bytes)"
+    docker image prune -a -f 2>&1 | tail -n 1
+    docker builder prune -a -f 2>&1 | tail -n 1
+    after="$(cleanup_used_bytes)"
+    ok "Freed about $(( (${before:-0} - ${after:-0}) / 1024 / 1024 )) MB."
+}
+
+cleanup_big_logs() {
+    section "Large log files"
+    local f size found=0
+    while IFS= read -r f; do
+        found=1
+        size="$(du -h "$f" | cut -f1)"
+        if confirm "Empty $f ($size)?" n; then : > "$f" && ok "Emptied."; fi
+    done < <(find "$PROJECTS_DIR"/*/storage/logs /var/log -type f -name '*.log' -size +100M 2>/dev/null)
+    [ "$found" -eq 1 ] || info "No log file is larger than 100 MB."
+}
+
+cleanup_old_manual_backups() {
+    section "Old manual database backups"
+    local f found=0
+    local -a list=()
+    mapfile -t list < <(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.sql.gz' \) -mtime +30 2>/dev/null)
+    if [ "${#list[@]}" -eq 0 ]; then info "No manual backups older than 30 days in $BACKUP_DIR."; return 0; fi
+    for f in "${list[@]}"; do printf '   %s (%s)\n' "$f" "$(du -h "$f" | cut -f1)"; found=1; done
+    explain "These are the one-off backups made from the project menu. Automatic backups are cleaned by their own schedule."
+    if confirm "Delete these ${#list[@]} file(s)?" n; then rm -f -- "${list[@]}" && ok "Deleted."; fi
+}
+
+cleanup_toggle() {
+    local self
+    if cleanup_enabled; then
+        ok "Weekly automatic safe cleanup is ON (Sundays 04:10)."
+        confirm "Turn it OFF?" n && { rm -f "$CLEANUP_CRON"; ok "Turned off."; }
+        return 0
+    fi
+    explain "Runs the SAFE cleanup (option 1) every Sunday at 04:10 and writes a log to $CLEANUP_LOG."
+    confirm "Turn on the weekly automatic cleanup?" y || return 0
+    self="$(hideploy_self)"
+    [ -x "$self" ] || { err "hideploy is not installed at $self. Install it first with install.sh."; return 1; }
+    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n10 4 * * 0 root %s cleanup-run >> %s 2>&1\n' "$self" "$CLEANUP_LOG" > "$CLEANUP_CRON"
+    chmod 644 "$CLEANUP_CRON"
+    write_logrotate
+    ok "Weekly automatic cleanup is ON."
+}
+
+disk_overview() {
+    section "Disk usage"
+    df -h / | sed 's/^/  /'
+    echo ""
+    if docker_ready; then docker system df 2>/dev/null | sed 's/^/  /'; echo ""; fi
+    printf '  Automatic backups on this server: %s\n' "$(du -sh "$BK_LOCAL_DIR" 2>/dev/null | cut -f1)"
+    printf '  Manual backups:                   %s\n' "$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)"
+    printf '  System logs (/var/log):           %s\n' "$(du -sh /var/log 2>/dev/null | cut -f1)"
+}
+
+menu_disk() {
+    local c
+    while true; do
+        clear; banner "Disk usage and cleanup" "$C_GREEN"
+        disk_row; echo ""
+        disk_overview; echo ""
+        echo " 1) Safe cleanup now (recommended)"
+        echo " 2) Deep cleanup: remove ALL unused Docker images and build cache"
+        echo " 3) Find large log files and empty them"
+        echo " 4) Delete manual database backups older than 30 days"
+        echo " 5) Weekly automatic safe cleanup: on / off"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) cleanup_safe; pause ;;
+            2) cleanup_deep; pause ;;
+            3) cleanup_big_logs; pause ;;
+            4) cleanup_old_manual_backups; pause ;;
+            5) cleanup_toggle; pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -2953,6 +3375,7 @@ Usage:
   hideploy --help          show this help
   sudo hideploy update     install the latest version from GitHub (${HIDEPLOY_REPO})
   sudo hideploy backup-run run one backup now (this is what the nightly job calls)
+  sudo hideploy cleanup-run run the safe disk cleanup now (the weekly job calls this)
 EOF
 }
 
@@ -2968,6 +3391,10 @@ main() {
             [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy backup-run" >&2; exit 1; }
             backup_run
             exit $? ;;
+        cleanup-run)
+            [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy cleanup-run" >&2; exit 1; }
+            cleanup_safe
+            exit 0 ;;
         "") ;;
         *) err "Unknown command: $1"; usage; exit 1 ;;
     esac
