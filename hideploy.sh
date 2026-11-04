@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.0.0"
+HIDEPLOY_VERSION="1.1.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -56,6 +56,18 @@ DEFAULT_NODE_IMAGE="node:22-alpine"   # used only for temporary frontend-build c
 RENEW_SCRIPT="/usr/local/bin/hideploy-renew-ssl"
 RENEW_CRON="/etc/cron.d/hideploy-ssl-renew"
 RENEW_LOG="/var/log/hideploy-ssl-renew.log"
+
+# Backups
+BK_DIR="$INFRA_DIR/backup"                 # settings, passphrase, destination keys (root only; never inside a backup)
+BK_CONF="$BK_DIR/backup.env"
+BK_PASS="$BK_DIR/passphrase"
+BK_SSH_KEY="$BK_DIR/id_ed25519"
+BK_KNOWN="$BK_DIR/known_hosts"
+BK_RCLONE_ENV="$BK_DIR/rclone.env"
+BK_LOCAL_DIR="$BACKUP_DIR/auto"            # automatic backups kept on this server
+BK_CRON="/etc/cron.d/hideploy-backup"
+BK_LOG="/var/log/hideploy-backup.log"
+RCLONE_IMAGE="rclone/rclone"
 
 # ----------------------------------------------------------------------------
 # Colors and output helpers
@@ -278,6 +290,7 @@ suggest_next() {
     esac
     if ! renew_enabled;                  then echo "Choose 2) Shared Services -> Enable SSL auto-renew"; return; fi
     if [ "$(project_count)" -eq 0 ];     then echo "Choose 3) Generate Project Files, then 4) Deploy New Laravel Project"; return; fi
+    if ! bk_enabled;                     then echo "Choose 6) Backups -> set up automatic, encrypted backups"; return; fi
     echo "Choose 4) to deploy another project, or 5) to manage existing ones"
 }
 
@@ -304,6 +317,7 @@ show_status() {
     container_row "MariaDB container" "$DB_CONTAINER"
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
     pma_status_row
+    bk_status_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
     printf '\n%sRecommended next step:%s %s\n' "$C_YELLOW" "$C_RESET" "$(suggest_next)"
 }
@@ -1685,7 +1699,7 @@ db_import_file() {
 }
 
 project_restore_db() {
-    local path="$1" db dbuser file mode typed tables maint="no" rc=0
+    local path="$1" preset="${2:-}" db dbuser file mode typed tables maint="no" rc=0
     load_project "$path" || return 1
     section "Restore database — $(basename "$path")"
     [ "$USE_DATABASE" = "yes" ] || { err "This project has no database. Use 'Add a database' first."; return 1; }
@@ -1695,7 +1709,7 @@ project_restore_db() {
     explain \
         "Target database: $db" \
         "Supports .sql and .sql.gz files. Dumps from MySQL 8 are converted automatically if needed."
-    pick_sql_file file || { info "Cancelled."; return 0; }
+    if [ -n "$preset" ]; then file="$preset"; else pick_sql_file file || { info "Cancelled."; return 0; }; fi
     tables="$(printf "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='%s';\n" "$db" | db_sql)"
     echo ""
     printf 'The database "%s" currently has %s table(s).\n' "$db" "${tables:-0}"
@@ -2182,6 +2196,688 @@ EOF
 }
 
 # ============================================================================
+# BACKUPS — automatic, encrypted, copied to an SSH server and/or an S3 bucket
+# ============================================================================
+# Every night (cron) "hideploy backup-run" creates one encrypted "run" folder:
+#   db-<database>.sql.gz.gpg      one per project database
+#   files-<domain>.tar.gz.gpg     .env, .deploy.env, storage/app, Passport keys
+#   server-config.tar.gz.gpg      nginx config, SSL certificates, runner config, hideploy settings
+#   SHA256SUMS                    integrity check of the files above
+# and sends it to every configured destination. Old runs are pruned automatically.
+
+kv_get() { [ -f "$1" ] || return 0; grep -E "^$2=" "$1" | tail -n1 | cut -d= -f2-; }
+kv_set() {
+    local f="$1" tmp
+    mkdir -p "$(dirname "$f")"; touch "$f"; chmod 600 "$f"
+    tmp="$(mktemp)"
+    grep -v "^$2=" "$f" > "$tmp" || true
+    printf '%s=%s\n' "$2" "$3" >> "$tmp"
+    cat "$tmp" > "$f"; rm -f "$tmp"
+}
+bk_get() { kv_get "$BK_CONF" "$1"; }
+bk_set() { kv_set "$BK_CONF" "$1" "$2"; }
+bk_val() { local v; v="$(bk_get "$1")"; printf '%s' "${v:-$2}"; }
+bk_enabled()  { [ -f "$BK_CRON" ]; }
+bk_has_pass() { [ -s "$BK_PASS" ]; }
+bk_dest_ssh() { [ "$(bk_get SSH_ENABLED)" = "yes" ]; }
+bk_dest_s3()  { [ "$(bk_get S3_ENABLED)" = "yes" ]; }
+bk_host()     { printf '%s' "${BK_HOST_OVERRIDE:-$(hostname -s)}"; }
+
+bk_status_row() {
+    if ! bk_enabled; then
+        if [ "$(project_count)" -gt 0 ]; then
+            status_row "Backups" warn "DISABLED" "no automatic backups yet: main menu 6"
+        else
+            status_row "Backups" dim "NOT SET UP" "main menu 6"
+        fi
+        return 0
+    fi
+    local res when
+    res="$(kv_get "$BK_DIR/last_run.txt" RESULT)"; when="$(kv_get "$BK_DIR/last_run.txt" TIME)"
+    case "$res" in
+        ok)     status_row "Backups" good "ENABLED" "last run: ${when:-?} (ok)" ;;
+        failed) status_row "Backups" bad  "LAST FAILED" "last run: ${when:-?} - see $BK_LOG" ;;
+        *)      status_row "Backups" good "ENABLED" "no run yet (first run at $(bk_val TIME 02:30))" ;;
+    esac
+}
+
+# ---------- encryption ----------------------------------------------------
+
+bk_setup_passphrase() {
+    section "Backup encryption passphrase"
+    explain \
+        "Backups contain your databases, .env files and certificates, so every backup file is encrypted (AES-256)" \
+        "BEFORE it leaves this server. Without the passphrase nobody can open a backup, including you." \
+        "" \
+        "IMPORTANT: if this server dies, the passphrase stored on it dies too. Keep a copy somewhere else" \
+        "(a password manager, or a note on your own computer)."
+    mkdir -p "$BK_DIR"; chmod 700 "$BK_DIR"
+    if bk_has_pass; then
+        ok "A passphrase is already set."
+        if confirm "Show it again so you can copy it?" n; then printf '\n  %s%s%s\n\n' "$C_GREEN" "$(cat "$BK_PASS")" "$C_RESET"; fi
+        return 0
+    fi
+    has_cmd gpg || { info "Installing gnupg..."; apt-get install -y gnupg >/dev/null 2>&1 || { err "Could not install gnupg."; return 1; }; }
+    local pass typed typed2
+    pass="$(openssl rand -base64 33 | tr -d '\n')"
+    ask_secret "Passphrase (Enter = use a strong generated one; if you type your own, min 16 characters)" typed
+    if [ -n "$typed" ]; then
+        [ "${#typed}" -ge 16 ] || { err "Too short (minimum 16 characters)."; return 1; }
+        ask_secret "Repeat passphrase" typed2
+        [ "$typed" = "$typed2" ] || { err "Passphrases do not match."; return 1; }
+        pass="$typed"
+    fi
+    printf '%s' "$pass" > "$BK_PASS"; chmod 600 "$BK_PASS"
+    echo ""; banner "YOUR BACKUP PASSPHRASE" "$C_YELLOW"
+    printf '  %s%s%s\n\n' "$C_GREEN" "$pass" "$C_RESET"
+    warn "Save it NOW outside this server. If you lose it, your backups can never be opened."
+    while ! confirm "I have saved the passphrase in a safe place" n; do warn "Please save it first."; done
+    ok "Passphrase set."
+    next_steps "Add a destination: option 3 (SSH server) and/or option 4 (S3 bucket)."
+}
+
+# stdin -> encrypted file ($1)
+bk_encrypt() {
+    gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$BK_PASS" \
+        --symmetric --cipher-algo AES256 -z 0 -o "$1"
+}
+
+# bk_decrypt IN OUT  (asks for the passphrase if this server does not have it, e.g. a new server)
+bk_decrypt() {
+    local pf="$BK_PASS" tmp_pf="" rc pass
+    if [ ! -s "$pf" ]; then
+        ask_secret "Backup passphrase" pass
+        tmp_pf="$(mktemp)"; printf '%s' "$pass" > "$tmp_pf"; pf="$tmp_pf"
+    fi
+    ( umask 077; gpg --batch --yes --quiet --pinentry-mode loopback --passphrase-file "$pf" --decrypt -o "$2" "$1" )
+    rc=$?
+    [ -z "$tmp_pf" ] || rm -f "$tmp_pf"
+    return "$rc"
+}
+
+# ---------- SSH destination ----------------------------------------------
+
+bk_ssh() {
+    ssh -i "$BK_SSH_KEY" -p "$(bk_get SSH_PORT)" -o BatchMode=yes -o ConnectTimeout=15 \
+        -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$BK_KNOWN" \
+        "$(bk_get SSH_USER)@$(bk_get SSH_HOST)" "$@"
+}
+bk_ssh_e() {
+    printf 'ssh -i %s -p %s -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=%s' \
+        "$BK_SSH_KEY" "$(bk_get SSH_PORT)" "$BK_KNOWN"
+}
+bk_ssh_parent() { printf '%s' "$(bk_get SSH_PATH)"; }
+bk_ssh_base()   { printf '%s/%s' "$(bk_get SSH_PATH)" "$(bk_host)"; }
+
+bk_test_ssh() {
+    local out base
+    base="$(bk_ssh_base)"
+    out="$(bk_ssh "mkdir -p '$base' && command -v rsync >/dev/null && echo hideploy-ok" 2>&1)"
+    if printf '%s' "$out" | grep -q 'hideploy-ok'; then return 0; fi
+    printf '%s\n' "$out"
+    return 1
+}
+
+bk_upload_ssh() {
+    local dir="$1" run="$2" base target
+    base="$(bk_ssh_base)"
+    target="$(bk_get SSH_USER)@$(bk_get SSH_HOST)"
+    bk_ssh "mkdir -p '$base'" || return 1
+    # upload under a temporary name, then rename: a half-uploaded run never looks complete
+    rsync -a --partial -e "$(bk_ssh_e)" "$dir/" "$target:$base/.partial-$run/" || return 1
+    bk_ssh "rm -rf '$base/$run' && mv '$base/.partial-$run' '$base/$run'"
+}
+
+bk_list_ssh() { bk_ssh "ls -1 '$(bk_ssh_base)' 2>/dev/null" </dev/null; }
+
+bk_download_ssh() {
+    local run="$1" dest="$BK_LOCAL_DIR/$1"
+    mkdir -p "$dest"; chmod 700 "$dest"
+    rsync -a -e "$(bk_ssh_e)" "$(bk_get SSH_USER)@$(bk_get SSH_HOST):$(bk_ssh_base)/$run/" "$dest/"
+}
+
+bk_prune_ssh() {
+    local days n base
+    days="$(bk_val REMOTE_KEEP_DAYS 30)"; base="$(bk_ssh_base)"
+    bk_list_ssh | bk_prune_candidates "$days" | while IFS= read -r n; do
+        bk_ssh "rm -rf -- '$base/$n'" </dev/null && echo "  pruned on SSH server: $n"
+    done
+}
+
+bk_cfg_ssh() {
+    section "Backup destination: another server over SSH"
+    explain \
+        "Backups are copied with rsync over SSH to a second server (ideally in another data center)." \
+        "HiDeploy creates a dedicated SSH key; you only paste its public part on the backup server." \
+        "The backup server needs: SSH access, the 'rsync' package, and free disk space."
+    local host port user path pub
+    while true; do ask "Backup server address (IP or domain)" "$(bk_get SSH_HOST)" host; [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] && break; err "Invalid address."; done
+    while true; do ask "SSH port" "$(bk_val SSH_PORT 22)" port; [[ "$port" =~ ^[0-9]{1,5}$ ]] && break; err "Invalid port."; done
+    while true; do ask "SSH user on the backup server (a dedicated user is recommended)" "$(bk_val SSH_USER backup)" user; [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] && break; err "Invalid user name."; done
+    while true; do ask "Folder on the backup server (relative to its home, or absolute)" "$(bk_val SSH_PATH hideploy-backups)" path; [[ "$path" =~ ^[A-Za-z0-9._/~-]+$ ]] && break; err "Use only letters, digits and . _ / ~ -"; done
+    has_cmd rsync || { info "Installing rsync..."; apt-get install -y rsync >/dev/null 2>&1 || { err "Could not install rsync."; return 1; }; }
+    mkdir -p "$BK_DIR"; chmod 700 "$BK_DIR"
+    [ -f "$BK_SSH_KEY" ] || ssh-keygen -t ed25519 -N "" -C "hideploy-backup@$(hostname -s)" -f "$BK_SSH_KEY" >/dev/null
+    [ -s "$BK_SSH_KEY.pub" ] || { err "Could not create the SSH key (is openssh-client installed?)."; return 1; }
+    pub="$(cat "$BK_SSH_KEY.pub")"
+    bk_set SSH_HOST "$host"; bk_set SSH_PORT "$port"; bk_set SSH_USER "$user"; bk_set SSH_PATH "$path"
+    echo ""
+    info "Run these commands ON THE BACKUP SERVER as root (copy and paste them as a block):"
+    printf '%s\n' "$C_GREEN"
+    cat <<EOF
+id -u ${user} >/dev/null 2>&1 || adduser --disabled-password --gecos '' ${user}
+apt-get install -y rsync
+install -d -m 700 -o ${user} -g ${user} /home/${user}/.ssh
+echo '${pub}' >> /home/${user}/.ssh/authorized_keys
+chown ${user}:${user} /home/${user}/.ssh/authorized_keys && chmod 600 /home/${user}/.ssh/authorized_keys
+EOF
+    printf '%s\n' "$C_RESET"
+    while true; do
+        confirm "Done? Test the connection now" y || { bk_set SSH_ENABLED no; warn "Saved but NOT enabled. Run option 3 again when ready."; return 0; }
+        if bk_test_ssh; then
+            bk_set SSH_ENABLED yes
+            ok "Connection works. Backups will be copied to ${user}@${host}:${path}/$(bk_host)/"
+            next_steps "Set the schedule (option 5), run a test backup (option 6), then turn the nightly backup on (option 7)."
+            return 0
+        fi
+        err "Could not connect or rsync is missing on the backup server (see the message above)."
+    done
+}
+
+# ---------- S3 destination (rclone in a temporary container) --------------
+
+bk_rc() { docker run --rm --env-file "$BK_RCLONE_ENV" "$@"; }
+
+bk_write_rclone_env() {
+    ( umask 077
+      {
+        echo "RCLONE_CONFIG_HD_TYPE=s3"
+        echo "RCLONE_CONFIG_HD_PROVIDER=$(bk_val S3_PROVIDER Other)"
+        echo "RCLONE_CONFIG_HD_ACCESS_KEY_ID=$(bk_get S3_ACCESS_KEY)"
+        echo "RCLONE_CONFIG_HD_SECRET_ACCESS_KEY=$(bk_get S3_SECRET_KEY)"
+        echo "RCLONE_CONFIG_HD_ENDPOINT=$(bk_get S3_ENDPOINT)"
+        [ -z "$(bk_get S3_REGION)" ] || echo "RCLONE_CONFIG_HD_REGION=$(bk_get S3_REGION)"
+        echo "RCLONE_CONFIG_HD_ACL=private"
+        echo "RCLONE_CONFIG_HD_NO_CHECK_BUCKET=true"
+      } > "$BK_RCLONE_ENV" )
+    chmod 600 "$BK_RCLONE_ENV"
+}
+
+bk_s3_parent() {
+    local pre; pre="$(bk_get S3_PREFIX)"
+    printf 'hd:%s%s' "$(bk_get S3_BUCKET)" "${pre:+/$pre}"
+}
+bk_s3_base() { printf '%s/%s' "$(bk_s3_parent)" "$(bk_host)"; }
+
+bk_test_s3() {
+    local t base rc
+    bk_write_rclone_env
+    t="$(mktemp)"; echo "hideploy test $(date -Is)" > "$t"
+    base="$(bk_s3_base)"
+    bk_rc -v "$t:/test.txt:ro" "$RCLONE_IMAGE" copyto /test.txt "$base/.hideploy-test.txt" \
+        && bk_rc "$RCLONE_IMAGE" deletefile "$base/.hideploy-test.txt"
+    rc=$?
+    rm -f "$t"
+    return "$rc"
+}
+
+bk_upload_s3() {
+    local dir="$1" run="$2" base
+    bk_write_rclone_env
+    base="$(bk_s3_base)/$run"
+    bk_rc -v "$dir:/src:ro" "$RCLONE_IMAGE" copy /src "$base" --exclude SHA256SUMS --retries 3 --low-level-retries 5 || return 1
+    # the checksum file goes last: it acts as the "this run is complete" marker
+    bk_rc -v "$dir:/src:ro" "$RCLONE_IMAGE" copyto /src/SHA256SUMS "$base/SHA256SUMS" --retries 3
+}
+
+bk_list_s3() {
+    bk_write_rclone_env
+    bk_rc "$RCLONE_IMAGE" lsf --dirs-only "$(bk_s3_base)/" 2>/dev/null </dev/null | sed 's#/$##'
+}
+
+bk_download_s3() {
+    local run="$1" dest="$BK_LOCAL_DIR/$1"
+    bk_write_rclone_env
+    mkdir -p "$dest"; chmod 700 "$dest"
+    bk_rc -v "$dest:/dst" "$RCLONE_IMAGE" copy "$(bk_s3_base)/$run" /dst
+}
+
+bk_prune_s3() {
+    local days n
+    days="$(bk_val REMOTE_KEEP_DAYS 30)"
+    bk_list_s3 | bk_prune_candidates "$days" | while IFS= read -r n; do
+        bk_rc "$RCLONE_IMAGE" purge "$(bk_s3_base)/$n" </dev/null && echo "  pruned in S3: $n"
+    done
+}
+
+bk_cfg_s3() {
+    section "Backup destination: S3 bucket"
+    explain \
+        "Works with Arvan Cloud Object Storage and any S3-compatible service." \
+        "In the Arvan panel: Object Storage -> create a PRIVATE bucket, then create an access key (Access Key + Secret Key)." \
+        "Use a bucket only for backups. Files are already encrypted before upload."
+    local choice provider endpoint region bucket prefix ak sk
+    echo " 1) Arvan Cloud - Tehran   (s3.ir-thr-at1.arvanstorage.ir)"
+    echo " 2) Arvan Cloud - Tabriz   (s3.ir-tbz-sh1.arvanstorage.ir)"
+    echo " 3) Other S3-compatible service (custom endpoint)"
+    read -r -p "Select: " choice
+    case "$choice" in
+        1) provider="ArvanCloud"; endpoint="https://s3.ir-thr-at1.arvanstorage.ir"; region="" ;;
+        2) provider="ArvanCloud"; endpoint="https://s3.ir-tbz-sh1.arvanstorage.ir"; region="" ;;
+        3) provider="Other"
+           while true; do ask "Endpoint URL (e.g. https://s3.example.com)" "$(bk_get S3_ENDPOINT)" endpoint; [[ "$endpoint" =~ ^https?://[A-Za-z0-9._:-]+$ ]] && break; err "Invalid endpoint."; done
+           ask "Region (Enter = none)" "$(bk_get S3_REGION)" region ;;
+        *) info "Cancelled."; return 0 ;;
+    esac
+    while true; do ask "Bucket name" "$(bk_get S3_BUCKET)" bucket; [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] && break; err "Invalid bucket name (lowercase letters, digits, dot, dash)."; done
+    while true; do ask "Folder inside the bucket (Enter = none)" "$(bk_val S3_PREFIX hideploy)" prefix; [ -z "$prefix" ] || [[ "$prefix" =~ ^[A-Za-z0-9._/-]+$ ]] && break; err "Invalid folder."; done
+    ask "Access key" "$(bk_get S3_ACCESS_KEY)" ak
+    ask_secret "Secret key (hidden)" sk
+    [ -n "$sk" ] || sk="$(bk_get S3_SECRET_KEY)"
+    [ -n "$ak" ] && [ -n "$sk" ] || { err "Access key and secret key are required."; return 1; }
+    [[ "$ak$sk" =~ ^[A-Za-z0-9+/=._-]+$ ]] || { err "Keys contain unexpected characters."; return 1; }
+    mkdir -p "$BK_DIR"; chmod 700 "$BK_DIR"
+    bk_set S3_PROVIDER "$provider"; bk_set S3_ENDPOINT "$endpoint"; bk_set S3_REGION "$region"
+    bk_set S3_BUCKET "$bucket"; bk_set S3_PREFIX "$prefix"; bk_set S3_ACCESS_KEY "$ak"; bk_set S3_SECRET_KEY "$sk"
+    docker_ready || { err "Docker is not ready."; return 1; }
+    info "Preparing the upload tool (rclone, downloaded once)..."
+    docker pull "$RCLONE_IMAGE" >/dev/null 2>&1 || warn "Could not pre-download rclone; the test below will try again."
+    info "Testing: writing and deleting a small test file in the bucket..."
+    if bk_test_s3; then
+        bk_set S3_ENABLED yes
+        ok "S3 works. Backups will go to: $bucket/${prefix:+$prefix/}$(bk_host)/"
+        next_steps "Set the schedule (option 5), run a test backup (option 6), then turn the nightly backup on (option 7)."
+    else
+        bk_set S3_ENABLED no
+        err "The test failed. Check: bucket exists, keys are correct, the endpoint matches the bucket's region, the key may write to the bucket."
+        return 1
+    fi
+}
+
+# ---------- retention ----------------------------------------------------
+
+# stdin: run names; prints the ones older than N days. The newest 3 runs are never listed.
+bk_prune_candidates() {
+    local days="$1" cutoff
+    cutoff="$(date -d "-${days} days" +%F_%H%M%S)"
+    grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' | sort | head -n -3 | awk -v c="$cutoff" '$0 < c'
+}
+
+bk_prune_local() {
+    local days n
+    days="$(bk_val LOCAL_KEEP_DAYS 7)"
+    ls -1 "$BK_LOCAL_DIR" 2>/dev/null | bk_prune_candidates "$days" | while IFS= read -r n; do
+        rm -rf -- "${BK_LOCAL_DIR:?}/$n" && echo "  pruned local copy: $n"
+    done
+}
+
+# ---------- the backup itself --------------------------------------------
+
+bk_run_inner() {
+    local run dir fail=0 p dom db use_db f rh size ssh_state="off" s3_state="off"
+    local -a items extras
+    run="$(date +%F_%H%M%S)"; dir="$BK_LOCAL_DIR/$run"
+    mkdir -p "$dir"; chmod 700 "$dir"
+    echo "[$(date -Is)] Backup $run started (HiDeploy $HIDEPLOY_VERSION)"
+
+    # 1) every project: database dump + files
+    while IFS= read -r p; do
+        dom="$(basename "$p")"
+        use_db="$( . "$p/.deploy.env" 2>/dev/null; echo "${USE_DATABASE:-yes}" )"
+        db="$(env_get "$p/.env" DB_DATABASE)"
+        if [ "$use_db" = "yes" ] && valid_ident "$db"; then
+            if docker exec "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb-dump -uroot --single-transaction --routines --events --databases "$1"' _ "$db" \
+                    | gzip -c | bk_encrypt "$dir/db-$db.sql.gz.gpg"; then
+                echo "  database $db: ok"
+            else
+                echo "  database $db: FAILED"; fail=$((fail+1)); rm -f "$dir/db-$db.sql.gz.gpg"
+            fi
+        fi
+        if [ "$(bk_val INCLUDE_FILES yes)" = "yes" ]; then
+            items=()
+            for f in .env .deploy.env storage/app; do [ -e "$p/$f" ] && items+=("$f"); done
+            for f in "$p"/storage/oauth-*.key; do [ -e "$f" ] && items+=("storage/$(basename "$f")"); done
+            if [ "${#items[@]}" -gt 0 ]; then
+                if { tar -C "$p" -czf - "${items[@]}" 2>/dev/null || [ $? -eq 1 ]; } | bk_encrypt "$dir/files-$dom.tar.gz.gpg"; then
+                    echo "  files $dom: ok"
+                else
+                    echo "  files $dom: FAILED"; fail=$((fail+1)); rm -f "$dir/files-$dom.tar.gz.gpg"
+                fi
+            fi
+        fi
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+
+    # 2) server configuration (the passphrase and destination keys are deliberately NOT included)
+    extras=()
+    rh="$(runner_home 2>/dev/null || true)"; rh="${rh#/}"
+    for f in etc/gitlab-runner "${rh:+$rh/.ssh}" usr/local/bin/hideploy-renew-ssl etc/cron.d/hideploy-ssl-renew etc/cron.d/hideploy-backup etc/logrotate.d/hideploy; do
+        [ -n "$f" ] && [ -e "/$f" ] && extras+=("$f")
+    done
+    if [ -d "$INFRA_DIR" ]; then
+        if { tar -C / --exclude="${INFRA_DIR#/}/backup" -czf - "${INFRA_DIR#/}" "${extras[@]}" 2>/dev/null || [ $? -eq 1 ]; } \
+                | bk_encrypt "$dir/server-config.tar.gz.gpg"; then
+            echo "  server configuration: ok"
+        else
+            echo "  server configuration: FAILED"; fail=$((fail+1)); rm -f "$dir/server-config.tar.gz.gpg"
+        fi
+    fi
+
+    if ! ls "$dir"/*.gpg >/dev/null 2>&1; then
+        echo "  nothing was backed up"; fail=$((fail+1))
+    else
+        ( cd "$dir" && sha256sum -- *.gpg > SHA256SUMS )
+    fi
+    size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+
+    # 3) copy to the destinations
+    if bk_dest_ssh; then
+        if bk_upload_ssh "$dir" "$run"; then ssh_state="ok"; echo "  SSH server upload: ok"
+        else ssh_state="FAILED"; fail=$((fail+1)); echo "  SSH server upload: FAILED"; fi
+    fi
+    if bk_dest_s3; then
+        if bk_upload_s3 "$dir" "$run"; then s3_state="ok"; echo "  S3 upload: ok"
+        else s3_state="FAILED"; fail=$((fail+1)); echo "  S3 upload: FAILED"; fi
+    fi
+    if [ "$ssh_state" = "off" ] && [ "$s3_state" = "off" ]; then
+        echo "  NOTE: no remote destination is configured, so this backup exists only on this server."
+    fi
+
+    # 4) retention
+    bk_prune_local
+    if [ "$ssh_state" = "ok" ]; then bk_prune_ssh; fi
+    if [ "$s3_state" = "ok" ]; then bk_prune_s3; fi
+
+    {
+        echo "TIME=$(date '+%F %H:%M')"; echo "RUN=$run"
+        if [ "$fail" -eq 0 ]; then echo "RESULT=ok"; else echo "RESULT=failed"; fi
+        echo "SIZE=$size"; echo "SSH=$ssh_state"; echo "S3=$s3_state"
+    } > "$BK_DIR/last_run.txt"
+    chmod 600 "$BK_DIR/last_run.txt"
+    echo "[$(date -Is)] Backup $run finished: $([ "$fail" -eq 0 ] && echo SUCCESS || echo "FAILED ($fail problem(s))") - $size"
+    [ "$fail" -eq 0 ]
+}
+
+# Non-interactive entry point (cron calls:  hideploy backup-run)
+backup_run() {
+    [ -s "$BK_PASS" ] || { echo "[backup] No passphrase yet. Open: sudo hideploy -> 6) Backups -> 2"; return 1; }
+    has_cmd gpg      || { echo "[backup] gpg is missing: apt-get install -y gnupg"; return 1; }
+    docker_ready     || { echo "[backup] Docker is not running."; return 1; }
+    mkdir -p "$BK_LOCAL_DIR" "$BK_DIR"; chmod 700 "$BACKUP_DIR" "$BK_LOCAL_DIR" 2>/dev/null
+    ( flock -n 9 || { echo "[backup] Another backup is already running."; exit 1; }; bk_run_inner ) 9>"$BK_DIR/.lock"
+}
+
+# ---------- schedule, status, on/off --------------------------------------
+
+bk_write_cron() {
+    local t hh mm self
+    t="$(bk_val TIME 02:30)"; hh="${t%%:*}"; mm="${t##*:}"
+    hh=$((10#$hh)); mm=$((10#$mm))
+    self="$(command -v hideploy 2>/dev/null || true)"; [ -n "$self" ] || self="/usr/local/bin/hideploy"
+    [ -x "$self" ] || { err "hideploy is not installed at $self. Install it first with install.sh."; return 1; }
+    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n%s %s * * * root %s backup-run >> %s 2>&1\n' \
+        "$mm" "$hh" "$self" "$BK_LOG" > "$BK_CRON"
+    chmod 644 "$BK_CRON"
+    cat > /etc/logrotate.d/hideploy <<EOF
+$BK_LOG $RENEW_LOG {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+}
+EOF
+}
+
+bk_cfg_schedule() {
+    section "Schedule and retention"
+    local t lk rk inc incdef
+    while true; do ask "Daily backup time (24h HH:MM, server time)" "$(bk_val TIME 02:30)" t; [[ "$t" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break; err "Use HH:MM, for example 02:30."; done
+    while true; do ask "Keep copies ON THIS SERVER for how many days" "$(bk_val LOCAL_KEEP_DAYS 7)" lk; [[ "$lk" =~ ^[0-9]+$ ]] && [ "$lk" -ge 1 ] && break; err "Enter a number of days (1 or more)."; done
+    while true; do ask "Keep copies on the REMOTE destinations for how many days" "$(bk_val REMOTE_KEEP_DAYS 30)" rk; [[ "$rk" =~ ^[0-9]+$ ]] && [ "$rk" -ge 1 ] && break; err "Enter a number of days (1 or more)."; done
+    if [ "$(bk_val INCLUDE_FILES yes)" = "yes" ]; then incdef="y"; else incdef="n"; fi
+    explain "Databases, SSL certificates and server settings are always included. The newest 3 backups are never deleted."
+    if confirm "Also back up project files (.env, uploaded files in storage/app, Passport keys)?" "$incdef"; then inc="yes"; else inc="no"; fi
+    bk_set TIME "$t"; bk_set LOCAL_KEEP_DAYS "$lk"; bk_set REMOTE_KEEP_DAYS "$rk"; bk_set INCLUDE_FILES "$inc"
+    if bk_enabled; then bk_write_cron && ok "Schedule updated."; else ok "Saved."; fi
+}
+
+bk_toggle() {
+    section "Nightly backup on/off"
+    if bk_enabled; then
+        ok "The nightly backup is ON (every day at $(bk_val TIME 02:30))."
+        if confirm "Turn it OFF?" n; then rm -f "$BK_CRON"; warn "Nightly backup is OFF. Your data is no longer being backed up automatically."; fi
+        return 0
+    fi
+    bk_has_pass || { err "Set the encryption passphrase first (option 2)."; return 1; }
+    if ! bk_dest_ssh && ! bk_dest_s3; then
+        warn "No remote destination is configured. Backups would stay on THIS server only, so a server failure would lose everything."
+        confirm "Turn it on anyway?" n || return 0
+    fi
+    bk_write_cron || return 1
+    ok "The nightly backup is ON: every day at $(bk_val TIME 02:30). Log: $BK_LOG"
+    next_steps "Run option 6 once now to confirm everything works end to end."
+}
+
+bk_status() {
+    section "Backup status"
+    local n size pre
+    n="$(ls -1 "$BK_LOCAL_DIR" 2>/dev/null | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$')"
+    size="$(du -sh "$BK_LOCAL_DIR" 2>/dev/null | cut -f1)"
+    printf '  Nightly backup:      %s\n' "$(bk_enabled && echo "ON, every day at $(bk_val TIME 02:30)" || echo OFF)"
+    printf '  Encryption:          %s\n' "$(bk_has_pass && echo "passphrase is set" || echo "NOT SET (option 2)")"
+    printf '  Local copies:        %s backup(s), %s, kept %s days (%s)\n' "${n:-0}" "${size:-0}" "$(bk_val LOCAL_KEEP_DAYS 7)" "$BK_LOCAL_DIR"
+    if bk_dest_ssh; then printf '  SSH server:          %s@%s:%s/%s/  (kept %s days)\n' "$(bk_get SSH_USER)" "$(bk_get SSH_HOST)" "$(bk_get SSH_PATH)" "$(bk_host)" "$(bk_val REMOTE_KEEP_DAYS 30)"
+    else printf '  SSH server:          not configured\n'; fi
+    if bk_dest_s3; then
+        pre="$(bk_get S3_PREFIX)"
+        printf '  S3 bucket:           %s/%s%s/  (kept %s days)\n' "$(bk_get S3_BUCKET)" "${pre:+$pre/}" "$(bk_host)" "$(bk_val REMOTE_KEEP_DAYS 30)"
+    else printf '  S3 bucket:           not configured\n'; fi
+    printf '  Project files:       %s\n' "$([ "$(bk_val INCLUDE_FILES yes)" = yes ] && echo "included" || echo "not included")"
+    if [ -f "$BK_DIR/last_run.txt" ]; then
+        printf '  Last run:            %s - %s (%s, SSH: %s, S3: %s)\n' "$(kv_get "$BK_DIR/last_run.txt" TIME)" \
+            "$(kv_get "$BK_DIR/last_run.txt" RESULT)" "$(kv_get "$BK_DIR/last_run.txt" SIZE)" \
+            "$(kv_get "$BK_DIR/last_run.txt" SSH)" "$(kv_get "$BK_DIR/last_run.txt" S3)"
+    else
+        printf '  Last run:            never\n'
+    fi
+    [ -f "$BK_LOG" ] && { echo ""; echo "  Last log lines ($BK_LOG):"; tail -n 6 "$BK_LOG" | sed 's/^/    /'; }
+    return 0
+}
+
+# ---------- restore -------------------------------------------------------
+
+# bk_pick_from_list VARNAME "NAMES (one per line)" — choose one backup run
+bk_pick_from_list() {
+    local __var="$1" choice i=1 n
+    local -a names=()
+    mapfile -t names < <(printf '%s\n' "$2" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' | sort -r)
+    if [ "${#names[@]}" -eq 0 ]; then err "No backups found here."; return 1; fi
+    echo ""
+    for n in "${names[@]}"; do printf '   %2d) %s\n' "$i" "$n"; i=$((i+1)); done
+    echo "    0) Cancel"
+    while true; do
+        read -r -p "${C_YELLOW}Select a backup: ${C_RESET}" choice
+        [ "$choice" = "0" ] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
+            printf -v "$__var" '%s' "${names[$((choice-1))]}"; return 0
+        fi
+        err "Invalid selection."
+    done
+}
+
+# Let the user choose which server's backup folder to read (needed on a NEW server)
+bk_choose_source_host() {
+    local kind="$1" hosts
+    if [ "$kind" = "ssh" ]; then
+        hosts="$(bk_ssh "ls -1 '$(bk_ssh_parent)' 2>/dev/null" </dev/null | tr '\n' ' ')"
+    else
+        bk_write_rclone_env
+        hosts="$(bk_rc "$RCLONE_IMAGE" lsf --dirs-only "$(bk_s3_parent)/" 2>/dev/null </dev/null | sed 's#/$##' | tr '\n' ' ')"
+    fi
+    explain "Backup folders found at the destination: ${hosts:-<none>}" \
+            "Each server stores its backups in a folder named after its hostname."
+    ask "Which folder do you want to restore from" "$(hostname -s)" BK_HOST_OVERRIDE
+}
+
+bk_restore_from_run() {
+    local run="$1" dir="$BK_LOCAL_DIR/$1" f dbname proj p tmp choice i=1
+    local -a dbs=() projs=()
+    if [ -f "$dir/SHA256SUMS" ]; then
+        if ( cd "$dir" && sha256sum -c SHA256SUMS --quiet ); then ok "Integrity check passed."; else err "Integrity check FAILED: this backup is damaged."; return 1; fi
+    else
+        warn "No SHA256SUMS file: cannot verify integrity."
+    fi
+    mapfile -t dbs < <(cd "$dir" && ls -1 db-*.sql.gz.gpg 2>/dev/null)
+    if [ "${#dbs[@]}" -eq 0 ]; then warn "This backup contains no database."; return 0; fi
+    echo ""; echo "  Databases in this backup:"
+    for f in "${dbs[@]}"; do printf '   %2d) %s\n' "$i" "$f"; i=$((i+1)); done
+    echo "    0) Cancel"
+    read -r -p "${C_YELLOW}Select a database to restore: ${C_RESET}" choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#dbs[@]}" ] || { info "Cancelled."; return 0; }
+    f="${dbs[$((choice-1))]}"; dbname="${f#db-}"; dbname="${dbname%.sql.gz.gpg}"
+    proj=""
+    mapfile -t projs < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    for p in "${projs[@]}"; do
+        if [ "$(env_get "$p/.env" DB_DATABASE)" = "$dbname" ]; then proj="$p"; break; fi
+    done
+    if [ -z "$proj" ]; then
+        warn "No project on this server uses the database '$dbname'."
+        explain "Deploy the project first (main menu 4, choose 'restore a backup' when asked), or decrypt the file with option 9."
+        return 0
+    fi
+    info "This database belongs to project: $(basename "$proj")"
+    tmp="$(mktemp -d -p "$BACKUP_DIR")"; chmod 700 "$tmp"
+    info "Decrypting..."
+    if ! bk_decrypt "$dir/$f" "$tmp/restore.sql.gz"; then
+        err "Decryption failed (wrong passphrase, or the file is damaged)."; rm -rf "$tmp"; return 1
+    fi
+    project_restore_db "$proj" "$tmp/restore.sql.gz"
+    rm -rf "$tmp"
+}
+
+bk_restore_menu() {
+    section "Restore from a backup"
+    explain \
+        "Restoring a DATABASE is guided here. Project files and server config can be decrypted with option 9." \
+        "On a brand-new server: set up Docker/nginx/MariaDB first, then add the SSH or S3 destination (same settings," \
+        "same bucket), then come back here and choose that destination."
+    echo " 1) A backup stored on THIS server"
+    echo " 2) Download from the SSH server"
+    echo " 3) Download from the S3 bucket"
+    echo " 0) Cancel"
+    local c run
+    read -r -p "Select: " c
+    case "$c" in
+        1) bk_pick_from_list run "$(ls -1 "$BK_LOCAL_DIR" 2>/dev/null)" || return 0 ;;
+        2) bk_dest_ssh || { err "The SSH destination is not configured (option 3)."; return 1; }
+           bk_choose_source_host ssh
+           bk_pick_from_list run "$(bk_list_ssh)" || { unset BK_HOST_OVERRIDE; return 0; }
+           info "Downloading $run ..."
+           bk_download_ssh "$run" || { err "Download failed."; unset BK_HOST_OVERRIDE; return 1; }
+           unset BK_HOST_OVERRIDE ;;
+        3) bk_dest_s3 || { err "The S3 destination is not configured (option 4)."; return 1; }
+           bk_choose_source_host s3
+           bk_pick_from_list run "$(bk_list_s3)" || { unset BK_HOST_OVERRIDE; return 0; }
+           info "Downloading $run ..."
+           bk_download_s3 "$run" || { err "Download failed."; unset BK_HOST_OVERRIDE; return 1; }
+           unset BK_HOST_OVERRIDE ;;
+        *) info "Cancelled."; return 0 ;;
+    esac
+    bk_restore_from_run "$run"
+}
+
+bk_decrypt_menu() {
+    section "Decrypt a backup file"
+    explain \
+        "Use this to restore project files or the server configuration by hand." \
+        "The decrypted file is placed in /root/hideploy-restore/<backup>/ (readable only by root)." \
+        "Delete it when you are finished: it is NOT encrypted."
+    local run dir f out choice i=1
+    local -a files=()
+    bk_pick_from_list run "$(ls -1 "$BK_LOCAL_DIR" 2>/dev/null)" || return 0
+    dir="$BK_LOCAL_DIR/$run"
+    mapfile -t files < <(cd "$dir" && ls -1 ./*.gpg 2>/dev/null | sed 's#^\./##')
+    [ "${#files[@]}" -gt 0 ] || { err "No encrypted files in this backup."; return 1; }
+    echo ""
+    for f in "${files[@]}"; do printf '   %2d) %s\n' "$i" "$f"; i=$((i+1)); done
+    echo "    0) Cancel"
+    read -r -p "${C_YELLOW}Select a file: ${C_RESET}" choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#files[@]}" ] || { info "Cancelled."; return 0; }
+    f="${files[$((choice-1))]}"
+    out="/root/hideploy-restore/$run"; mkdir -p "$out"; chmod 700 /root/hideploy-restore "$out"
+    if bk_decrypt "$dir/$f" "$out/${f%.gpg}"; then
+        ok "Decrypted to: $out/${f%.gpg}"
+        case "$f" in
+            files-*) explain "To restore the files of a project (this OVERWRITES its .env and uploads):" \
+                             "  tar -xzf $out/${f%.gpg} -C /var/www/projects/<domain>" ;;
+            server-config*) explain "Contents: nginx config, SSL certificates, runner config, hideploy settings (paths start without a leading slash)." \
+                                    "Only on a rebuilt server, to bring everything back:  tar -xzf $out/${f%.gpg} -C /" ;;
+            db-*) explain "A database dump: restore it through the project menu (Manage Projects -> project -> Restore database) or option 8." ;;
+        esac
+        warn "Remember to delete $out when you are done."
+    else
+        err "Decryption failed (wrong passphrase, or the file is damaged)."
+        return 1
+    fi
+}
+
+# ---------- menus ---------------------------------------------------------
+
+bk_menu_dest() {  # ssh | s3
+    local kind="$1" c
+    echo ""
+    echo " 1) Configure / change"
+    echo " 2) Test the connection now"
+    echo " 3) Disable this destination"
+    echo " 0) Back"
+    read -r -p "Select: " c
+    case "$c" in
+        1) if [ "$kind" = "ssh" ]; then bk_cfg_ssh; else bk_cfg_s3; fi ;;
+        2) if [ "$kind" = "ssh" ]; then
+               if bk_dest_ssh || [ -n "$(bk_get SSH_HOST)" ]; then bk_test_ssh && ok "SSH destination works." || err "SSH test failed."; else err "Not configured."; fi
+           else
+               if [ -n "$(bk_get S3_BUCKET)" ]; then bk_test_s3 && ok "S3 destination works." || err "S3 test failed."; else err "Not configured."; fi
+           fi ;;
+        3) if [ "$kind" = "ssh" ]; then bk_set SSH_ENABLED no; else bk_set S3_ENABLED no; fi; ok "Disabled (settings are kept)." ;;
+        *) return 0 ;;
+    esac
+}
+
+menu_backups() {
+    local c
+    while true; do
+        clear; banner "6) Backups (automatic, encrypted, off-server)" "$C_CYAN"
+        bk_status_row; echo ""
+        explain "Recommended order: 2 (passphrase) -> 3 and/or 4 (where to send) -> 5 (schedule) -> 6 (test) -> 7 (turn on)"
+        echo ""
+        echo " 1) Show backup status"
+        echo " 2) Encryption passphrase (do this first)"
+        echo " 3) Destination: another server over SSH"
+        echo " 4) Destination: S3 bucket (Arvan Cloud or any S3-compatible)"
+        echo " 5) Schedule and retention"
+        echo " 6) Run a backup NOW"
+        echo " 7) Turn the nightly backup ON / OFF"
+        echo " 8) Restore a database from a backup"
+        echo " 9) Decrypt a backup file (project files / server config)"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item bk_status ;;
+            2) run_item bk_setup_passphrase ;;
+            3) bk_menu_dest ssh; pause ;;
+            4) bk_menu_dest s3; pause ;;
+            5) run_item bk_cfg_schedule ;;
+            6) if bk_has_pass; then backup_run; else err "Set the encryption passphrase first (option 2)."; fi; pause ;;
+            7) run_item bk_toggle ;;
+            8) run_item bk_restore_menu ;;
+            9) run_item bk_decrypt_menu ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -2248,6 +2944,7 @@ Usage:
   hideploy --version       show the installed version
   hideploy --help          show this help
   sudo hideploy update     install the latest version from GitHub (${HIDEPLOY_REPO})
+  sudo hideploy backup-run run one backup now (this is what the nightly job calls)
 EOF
 }
 
@@ -2258,6 +2955,10 @@ main() {
         update)
             [ "$EUID" -eq 0 ] || { err "Run as root: sudo hideploy update"; exit 1; }
             curl -fsSL "https://raw.githubusercontent.com/${HIDEPLOY_REPO}/main/install.sh" | bash
+            exit $? ;;
+        backup-run)
+            [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy backup-run" >&2; exit 1; }
+            backup_run
             exit $? ;;
         "") ;;
         *) err "Unknown command: $1"; usage; exit 1 ;;
@@ -2275,6 +2976,7 @@ main() {
         echo " 3) Generate Project Files      (Dockerfile, compose, CI for your repository)"
         echo " 4) Deploy New Laravel Project  (for every new site)"
         echo " 5) Manage Projects             (deploy, logs, backup, SSL, remove)"
+        echo " 6) Backups                     (automatic, encrypted, copied off the server)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -2283,6 +2985,7 @@ main() {
             3) menu_generate_files ;;
             4) deploy_wizard ;;
             5) menu_manage ;;
+            6) menu_backups ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
