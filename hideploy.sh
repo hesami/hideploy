@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.1.1"
+HIDEPLOY_VERSION="1.1.2"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -2459,7 +2459,7 @@ bk_cfg_s3() {
     local choice provider endpoint region bucket prefix ak sk
     echo " 1) Arvan Cloud - Iran Central, Standard          (s3.ir-central1.arvanstorage.ir)"
     echo " 2) Arvan Cloud - Iran Central, HiOps (SSD)      (hot.ir-central1.arvanstorage.ir)"
-    echo " 3) Arvan Cloud - Iran North-West, Standard      (s3.ir-tbz-sh1.arvanstorage.ir)"
+    echo " 3) Arvan Cloud - Iran North-West, Standard      (s3.ir-northwest1.arvanstorage.ir)"
     echo " 4) Arvan Cloud - Western Europe, Standard       (s3.eu-west1.arvanstorage.ir)"
     echo " 5) Other S3-compatible service (custom endpoint)"
     explain "The endpoint must match the region where you created the bucket. Standard is the right choice for backups (HiOps SSD costs more)."
@@ -2467,7 +2467,7 @@ bk_cfg_s3() {
     case "$choice" in
         1) provider="ArvanCloud"; endpoint="https://s3.ir-central1.arvanstorage.ir"; region="" ;;
         2) provider="ArvanCloud"; endpoint="https://hot.ir-central1.arvanstorage.ir"; region="" ;;
-        3) provider="ArvanCloud"; endpoint="https://s3.ir-tbz-sh1.arvanstorage.ir"; region="" ;;
+        3) provider="ArvanCloud"; endpoint="https://s3.ir-northwest1.arvanstorage.ir"; region="" ;;
         4) provider="ArvanCloud"; endpoint="https://s3.eu-west1.arvanstorage.ir"; region="" ;;
         5) provider="Other"
            while true; do ask "Endpoint URL (e.g. https://s3.example.com)" "$(bk_get S3_ENDPOINT)" endpoint; [[ "$endpoint" =~ ^https?://[A-Za-z0-9._:-]+$ ]] && break; err "Invalid endpoint."; done
@@ -2673,8 +2673,8 @@ bk_status() {
     printf '  Local copies:        %s backup(s), %s, kept %s days (%s)\n' "${n:-0}" "${size:-0}" "$(bk_val LOCAL_KEEP_DAYS 7)" "$BK_LOCAL_DIR"
     if bk_dest_ssh; then printf '  SSH server:          %s@%s:%s/%s/  (kept %s days)\n' "$(bk_get SSH_USER)" "$(bk_get SSH_HOST)" "$(bk_get SSH_PATH)" "$(bk_host)" "$(bk_val REMOTE_KEEP_DAYS 30)"
     else printf '  SSH server:          not configured\n'; fi
-    if bk_dest_s3 && [[ "$(bk_get S3_ENDPOINT)" == *ir-thr-at1* ]]; then
-        warn "Your S3 endpoint (ir-thr-at1) is being retired by Arvan Cloud. Move to a new region: option 4 in this menu."
+    if bk_dest_s3 && [[ "$(bk_get S3_ENDPOINT)" == *ir-thr-at1* || "$(bk_get S3_ENDPOINT)" == *ir-tbz-sh1* ]]; then
+        warn "Your S3 endpoint ($(bk_get S3_ENDPOINT)) is being retired by Arvan Cloud. Move to a new region: option 4 in this menu."
     fi
     if bk_dest_s3; then
         pre="$(bk_get S3_PREFIX)"
