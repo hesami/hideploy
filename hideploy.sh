@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.2.0"
+HIDEPLOY_VERSION="1.3.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -72,6 +72,10 @@ RCLONE_IMAGE="rclone/rclone"
 # Disk cleanup
 CLEANUP_CRON="/etc/cron.d/hideploy-cleanup"
 CLEANUP_LOG="/var/log/hideploy-cleanup.log"
+
+# Performance tuning
+PERF_CONF="$INFRA_DIR/performance.env"
+PERF_NGINX_CONF="$NGINX_DIR/conf.d/10-hideploy-performance.conf"
 
 DEPLOY_MAINT_ON="no"                       # set while a deployment keeps the site in maintenance mode
 
@@ -296,7 +300,7 @@ suggest_next() {
         missing) echo "Choose 2) Shared Services -> Install MariaDB"; return ;;
     esac
     if ! renew_enabled;                  then echo "Choose 2) Shared Services -> Enable SSL auto-renew"; return; fi
-    if [ "$(project_count)" -eq 0 ];     then echo "Choose 3) Generate Project Files, then 4) Deploy New Laravel Project"; return; fi
+    if [ "$(project_count)" -eq 0 ];     then echo "Choose 3) Generate Project Files, then 4) Deploy New Project"; return; fi
     if ! bk_enabled;                     then echo "Choose 6) Backups -> set up automatic, encrypted backups"; return; fi
     echo "Choose 4) to deploy another project, or 5) to manage existing ones"
 }
@@ -735,15 +739,20 @@ RUN set -eu; \
     addgroup -g "${APP_GID}" app; \
     adduser -D -u "${APP_UID}" -G app app
 
-# PHP-FPM pool (low-memory friendly)
+# PHP-FPM pool. The values come from environment variables: the defaults below are low-memory friendly and the
+# server can change them (main menu 7 -> Performance tuning) through docker-compose.prod.yml and .deploy.env.
+ENV FPM_PM=ondemand FPM_MAX_CHILDREN=5 FPM_START_SERVERS=2 FPM_MIN_SPARE=1 FPM_MAX_SPARE=3 FPM_IDLE_TIMEOUT=10s FPM_MAX_REQUESTS=500
 RUN printf '%s\n' \
       '[www]' \
       'user = app' \
       'group = app' \
-      'pm = ondemand' \
-      'pm.max_children = 5' \
-      'pm.process_idle_timeout = 10s' \
-      'pm.max_requests = 500' \
+      'pm = ${FPM_PM}' \
+      'pm.max_children = ${FPM_MAX_CHILDREN}' \
+      'pm.start_servers = ${FPM_START_SERVERS}' \
+      'pm.min_spare_servers = ${FPM_MIN_SPARE}' \
+      'pm.max_spare_servers = ${FPM_MAX_SPARE}' \
+      'pm.process_idle_timeout = ${FPM_IDLE_TIMEOUT}' \
+      'pm.max_requests = ${FPM_MAX_REQUESTS}' \
       'php_admin_value[memory_limit] = 256M' \
       'php_admin_value[upload_max_filesize] = 50M' \
       'php_admin_value[post_max_size] = 50M' \
@@ -815,6 +824,13 @@ services:
     working_dir: ${APP_PATH:?APP_PATH missing in .deploy.env}
     environment:
       APP_PATH: ${APP_PATH}
+      FPM_PM: ${FPM_PM:-ondemand}
+      FPM_MAX_CHILDREN: ${FPM_MAX_CHILDREN:-5}
+      FPM_START_SERVERS: ${FPM_START_SERVERS:-2}
+      FPM_MIN_SPARE: ${FPM_MIN_SPARE:-1}
+      FPM_MAX_SPARE: ${FPM_MAX_SPARE:-3}
+      FPM_IDLE_TIMEOUT: ${FPM_IDLE_TIMEOUT:-10s}
+      FPM_MAX_REQUESTS: ${FPM_MAX_REQUESTS:-500}
     volumes:
       - ${APP_PATH}:${APP_PATH}
     networks:
@@ -935,13 +951,21 @@ EOF
 
 # generate_project_files DIR DOMAIN BRANCH TAG OVERWRITE(yes|no)
 generate_project_files() {
-    local dir="$1" domain="$2" branch="$3" tag="$4" overwrite="$5" tmp f
+    local dir="$1" domain="$2" branch="$3" tag="$4" overwrite="$5" type="${6:-laravel}" pm="${7:-pnpm}" tmp f
     tmp="$(mktemp -d)"
-    tpl_dockerfile   > "$tmp/Dockerfile"
-    tpl_compose      > "$tmp/docker-compose.prod.yml"
-    tpl_dockerignore > "$tmp/.dockerignore"
-    tpl_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
-                 -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" > "$tmp/.gitlab-ci.yml"
+    if [ "$type" = "nextjs" ]; then
+        tpl_next_dockerfile "$pm" > "$tmp/Dockerfile"
+        tpl_next_compose          > "$tmp/docker-compose.prod.yml"
+        tpl_next_dockerignore     > "$tmp/.dockerignore"
+        tpl_next_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
+                          -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" > "$tmp/.gitlab-ci.yml"
+    else
+        tpl_dockerfile   > "$tmp/Dockerfile"
+        tpl_compose      > "$tmp/docker-compose.prod.yml"
+        tpl_dockerignore > "$tmp/.dockerignore"
+        tpl_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
+                     -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" > "$tmp/.gitlab-ci.yml"
+    fi
     mkdir -p "$dir"
     for f in Dockerfile docker-compose.prod.yml .dockerignore .gitlab-ci.yml; do
         if [ -e "$dir/$f" ] && [ "$overwrite" != "yes" ]; then
@@ -956,6 +980,7 @@ generate_project_files() {
 # validate_project_files DIR DOMAIN  -> prints problems, returns number of problems
 validate_project_files() {
     local dir="$1" domain="$2" problems=0 f
+    if [ "${3:-laravel}" = "nextjs" ]; then validate_next_files "$dir" "$domain"; return $?; fi
     for f in Dockerfile docker-compose.prod.yml .dockerignore .gitlab-ci.yml; do
         if [ ! -f "$dir/$f" ]; then err "Missing file: $f"; problems=$((problems+1)); fi
     done
@@ -988,7 +1013,16 @@ menu_generate_files() {
         "  Dockerfile, docker-compose.prod.yml, .dockerignore, .gitlab-ci.yml" \
         "They are generic: the same files work for every project. Server-specific values are kept in" \
         "'.deploy.env' on the server, so they never change the files in your repository."
-    local domain branch tag outdir
+    local domain branch tag outdir ptype="laravel" pm="pnpm" tchoice
+    echo " Project type:"
+    echo "  1) Laravel (PHP)"
+    echo "  2) Next.js (Node)"
+    read -r -p "Select [1]: " tchoice
+    if [ "$tchoice" = "2" ]; then
+        ptype="nextjs"
+        explain "Next.js files: a multi-stage Dockerfile (standalone output), docker-compose.prod.yml, .dockerignore and .gitlab-ci.yml."
+        while true; do ask "Package manager (pnpm is recommended / npm / yarn)" "pnpm" pm; pm="${pm,,}"; [[ "$pm" =~ ^(pnpm|npm|yarn)$ ]] && break; err "Choose pnpm, npm or yarn."; done
+    fi
     while true; do ask "Project domain (e.g. api.example.com)" "" domain; domain="${domain,,}"; valid_domain "$domain" && break; err "Invalid domain."; done
     ask "Git branch that triggers deployment" "main" branch
     ask "GitLab runner tag" "$(cfg_get RUNNER_TAG || true)" tag
@@ -996,7 +1030,7 @@ menu_generate_files() {
     cfg_set RUNNER_TAG "$tag"
     outdir="$TEMPLATES_DIR/$domain"
     echo ""
-    generate_project_files "$outdir" "$domain" "$branch" "$tag" yes
+    generate_project_files "$outdir" "$domain" "$branch" "$tag" yes "$ptype" "$pm"
     local ip; ip="$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo 'SERVER_IP')"
     echo ""
     ok "Files are in: $outdir"
@@ -1010,7 +1044,7 @@ menu_generate_files() {
     next_steps \
         "On your computer: git add Dockerfile docker-compose.prod.yml .dockerignore .gitlab-ci.yml" \
         "Then: git commit -m 'Add deployment files' && git push origin $branch" \
-        "Then come back and choose 4) Deploy New Laravel Project."
+        "Then come back and choose 4) Deploy New Project."
     pause
 }
 
@@ -1063,6 +1097,7 @@ EOF
 write_vhost() {
     local domain="$1" container="$2" mode="$3" out="$NGINX_DIR/conf.d/$1.conf" root
     if [ "${4:-laravel}" = "pma" ]; then write_pma_vhost "$domain" "$mode"; return; fi
+    if [ "${4:-laravel}" = "nextjs" ]; then write_next_vhost "$domain" "$container" "$mode"; return; fi
     ensure_maintenance_page
     root="$PROJECTS_DIR/$domain/public"
     {
@@ -1070,7 +1105,9 @@ write_vhost() {
             echo "server {"
             echo "    listen 80;"
             echo "    server_name __DOMAIN__;"
+            perf_server_extras http
             tpl_vhost_common
+            perf_laravel_static
             echo "}"
         else
             echo "server {"
@@ -1088,7 +1125,9 @@ write_vhost() {
             echo "    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;"
             echo "    ssl_protocols TLSv1.2 TLSv1.3;"
             echo "    ssl_session_cache shared:SSL:10m;"
+            perf_server_extras https
             tpl_vhost_common
+            perf_laravel_static
             echo "}"
         fi
     } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__ROOT__|$root|g" > "$out"
@@ -1523,7 +1562,7 @@ load_project() {
     local path="$1"
     [ -f "$path/.deploy.env" ] || { err "No .deploy.env in $path"; return 1; }
     # Defaults for optional settings (older projects do not have them), so values never leak between projects
-    FRONTEND_BUILD="no"; USE_DATABASE="yes"; NODE_IMAGE="$DEFAULT_NODE_IMAGE"
+    FRONTEND_BUILD="no"; USE_DATABASE="yes"; NODE_IMAGE="$DEFAULT_NODE_IMAGE"; PROJECT_TYPE="laravel"; APP_PORT="3000"
     set -a; . "$path/.deploy.env"; set +a
 }
 
@@ -1550,6 +1589,12 @@ deploy_project_inner() {
     elif [ "$pull" = "yes" ]; then
         info "Pulling latest code from origin/$BRANCH"
         git_sync "$path" "$BRANCH" || { err "git update failed."; return 1; }
+    fi
+    if is_next; then
+        info "Building the image and starting the container (the current version keeps serving until the new one is ready)"
+        dc up -d --build || { err "Build failed. The previous version is still running."; return 1; }
+        wait_healthy || return 1
+        return 0
     fi
     info "Building and starting the container (first build takes a few minutes)"
     dc up -d --build || { err "Build failed."; return 1; }
@@ -1664,6 +1709,15 @@ project_add_database() {
     fi
     explain "Press Enter to accept a suggestion, or type your own value."
     db_provision "$(basename "$path")" || return 1
+    if is_next; then
+        write_db_env_next "$path"
+        env_set "$path/.deploy.env" USE_DATABASE yes
+        USE_DATABASE="yes"
+        ok ".env updated with the new database settings (DATABASE_URL and DB_*)."
+        info "Recreating the container so it reads the new .env..."
+        dc up -d --force-recreate >/dev/null 2>&1 && wait_healthy
+        return 0
+    fi
     write_db_env "$path"
     env_set "$path/.deploy.env" USE_DATABASE yes
     USE_DATABASE="yes"
@@ -1803,7 +1857,7 @@ project_restore_db() {
            confirm "Continue?" n || { info "Cancelled."; return 0; } ;;
         *) info "Cancelled."; return 0 ;;
     esac
-    if container_running "$CONTAINER_NAME" && confirm "Put the site in maintenance mode during the restore?" y; then
+    if ! is_next && container_running "$CONTAINER_NAME" && confirm "Put the site in maintenance mode during the restore?" y; then
         artisan down --retry=60 >/dev/null 2>&1 && maint="yes"
     fi
     if [ "$mode" = "1" ]; then
@@ -1816,10 +1870,10 @@ project_restore_db() {
         [ "$mode" = "1" ] && warn "The database was replaced before the failure. Your safety backup is in $BACKUP_DIR (restore it with this same menu)."
         return 1
     fi
-    if confirm "Run pending migrations now (needed if your code is newer than the backup)?" y; then
+    if ! is_next && confirm "Run pending migrations now (needed if your code is newer than the backup)?" y; then
         artisan migrate --force || warn "Migration reported an error."
     fi
-    artisan optimize:clear >/dev/null 2>&1 && artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    if ! is_next; then artisan optimize:clear >/dev/null 2>&1 && artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1; fi
     ok "Restore complete. Check the site in your browser."
 }
 
@@ -1874,6 +1928,7 @@ ensure_maintenance_page() {
 # deploy_maint_on — turn Laravel maintenance mode on before the code is replaced
 deploy_maint_on() {
     DEPLOY_MAINT_ON="no"
+    [ "${PROJECT_TYPE:-laravel}" = "laravel" ] || return 0
     [ "${MAINTENANCE_ON_DEPLOY:-yes}" = "yes" ] || return 0
     [ -f "$APP_PATH/storage/framework/down" ] && return 0      # already down: leave it alone
     if container_running "$CONTAINER_NAME" && [ -f "$APP_PATH/vendor/autoload.php" ]; then
@@ -1969,6 +2024,7 @@ project_rollback() {
 project_maintenance_toggle() {
     local path="$1"
     load_project "$path" || return 1
+    is_next && { info "Maintenance mode is a Laravel feature. For Next.js, nginx shows a friendly page automatically while the container restarts."; return 0; }
     container_running "$CONTAINER_NAME" || { err "The project container is not running."; return 1; }
     if [ -f "$path/storage/framework/down" ]; then
         warn "The site is in MAINTENANCE mode (visitors cannot use it)."
@@ -1986,7 +2042,7 @@ nginx_refresh_project() {
     load_project "$path" || return 1
     domain="$(basename "$path")"
     if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ]; then mode="https"; else mode="http"; fi
-    if apply_vhost "$domain" "$CONTAINER_NAME" "$mode"; then ok "$domain: nginx configuration refreshed ($mode)."; else err "$domain: could not refresh nginx."; return 1; fi
+    if apply_vhost "$domain" "$CONTAINER_NAME" "$mode" "${PROJECT_TYPE:-laravel}"; then ok "$domain: nginx configuration refreshed ($mode)."; else err "$domain: could not refresh nginx."; return 1; fi
 }
 
 nginx_refresh_all() {
@@ -2022,17 +2078,619 @@ project_deploy_menu() {
     done
 }
 
+# ============================================================================
+# NEXT.JS PROJECTS
+# ============================================================================
+# A Next.js project is one container running the compiled "standalone" app (node server.js).
+# nginx forwards the domain to it over HTTP (container name + port). The code lives INSIDE the
+# image (built from your repo), so deployments build a new image while the old one keeps serving.
+# Laravel projects are unaffected: PROJECT_TYPE in .deploy.env defaults to "laravel".
+
+is_next() { [ "${PROJECT_TYPE:-laravel}" = "nextjs" ]; }
+
+urlencode() {
+    local s="$1" out="" i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in [A-Za-z0-9._~-]) out+="$c" ;; *) out+="$(printf '%%%02X' "'$c")" ;; esac
+    done
+    printf '%s' "$out"
+}
+
+detect_pm() {
+    local d="$1"
+    if   [ -f "$d/pnpm-lock.yaml" ];    then echo pnpm
+    elif [ -f "$d/yarn.lock" ];         then echo yarn
+    elif [ -f "$d/package-lock.json" ]; then echo npm
+    else echo none; fi
+}
+
+tpl_next_dockerfile() {
+    local pm="${1:-pnpm}" setup lock install build cache
+    case "$pm" in
+        pnpm) setup=$'ENV PNPM_HOME=/pnpm\nENV PATH=$PNPM_HOME:$PATH\nENV npm_config_store_dir=/pnpm/store\nRUN corepack enable'
+              lock="pnpm-lock.yaml* .npmrc*"; install="pnpm install --frozen-lockfile"; build="pnpm run build"; cache="/pnpm/store" ;;
+        yarn) setup="RUN corepack enable"
+              lock="yarn.lock* .yarnrc* .yarnrc.yml*"; install="yarn install --frozen-lockfile"; build="yarn build"; cache="/usr/local/share/.cache/yarn" ;;
+        *)    pm="npm"; setup="# npm comes with the Node image"
+              lock="package-lock.json* .npmrc*"; install="npm ci --no-audit --no-fund"; build="npm run build"; cache="/root/.npm" ;;
+    esac
+    cat <<EOF
+# Generated by HiDeploy (Next.js) — safe to edit, commit it in your repo.
+# Multi-stage build: the final image only holds the compiled app (Next.js "standalone" output).
+# Requires   output: 'standalone'   in next.config.js / next.config.mjs / next.config.ts
+# Package manager: ${pm}
+FROM node:22-alpine AS base
+ENV NEXT_TELEMETRY_DISABLED=1 COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN apk add --no-cache libc6-compat
+WORKDIR /app
+
+# 1) dependencies (cached between builds)
+FROM base AS deps
+${setup}
+COPY package.json ${lock} ./
+RUN --mount=type=cache,id=hideploy-${pm},target=${cache} ${install}
+
+# 2) build. The project's .env is part of the build context, so NEXT_PUBLIC_* values are baked in here.
+FROM base AS build
+${setup}
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN mkdir -p public
+RUN ${build}
+
+# 3) small runtime image
+FROM node:22-alpine AS runner
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0
+RUN apk add --no-cache libc6-compat \\
+    && addgroup -S -g 1001 nodejs && adduser -S -u 1001 -G nodejs nextjs
+WORKDIR /app
+COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=build --chown=nextjs:nodejs /app/public ./public
+USER nextjs
+EXPOSE 3000
+CMD ["node", "server.js"]
+EOF
+}
+
+tpl_next_compose() {
+    cat <<'EOF'
+# Generated by HiDeploy (Next.js) — generic file, identical for every Next.js project.
+# Server-specific values come from ".deploy.env"; runtime secrets come from ".env" (both live on the server, not in git).
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${CONTAINER_NAME:?CONTAINER_NAME missing in .deploy.env}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      PORT: ${APP_PORT:-3000}
+      NODE_OPTIONS: "--max-old-space-size=${NODE_HEAP_MB:-384}"
+    networks:
+      - web_network
+    mem_limit: ${MEM_LIMIT:-512m}
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:' + (process.env.PORT || 3000)).then(r => process.exit(r.status < 500 ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+networks:
+  web_network:
+    external: true
+EOF
+}
+
+tpl_next_dockerignore() {
+    cat <<'EOF'
+# Keeps the Docker build small. NOTE: .env is NOT excluded on purpose (Next.js needs NEXT_PUBLIC_* at build time).
+node_modules
+.next
+.git
+.gitlab-ci.yml
+docker-compose.prod.yml
+Dockerfile
+.dockerignore
+.deploy.env
+.deploy.history
+npm-debug.log*
+*.md
+EOF
+}
+
+tpl_next_ci() {
+    cat <<'EOF'
+# Generated by HiDeploy (Next.js).
+# Runs on the production server through the GitLab Runner (shell executor).
+stages:
+  - deploy
+
+deploy_production:
+  stage: deploy
+  tags:
+    - __TAG__
+  resource_group: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "__BRANCH__"'
+  variables:
+    GIT_STRATEGY: none
+    DEPLOY_PATH: "__DEPLOY_PATH__"
+  script:
+    - |
+      set -euo pipefail
+      cd "$DEPLOY_PATH"
+      set -a; . ./.deploy.env; set +a
+
+      dc()     { docker compose -p "$CONTAINER_NAME" --env-file .deploy.env -f docker-compose.prod.yml "$@"; }
+      record() {
+        echo "$(date -Is) $(git rev-parse --short HEAD 2>/dev/null || echo unknown) $1 $(git log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-80)" >> .deploy.history
+        tail -n 200 .deploy.history > .deploy.history.tmp && mv .deploy.history.tmp .deploy.history
+        grep -qxF ".deploy.history" .git/info/exclude 2>/dev/null || echo ".deploy.history" >> .git/info/exclude
+      }
+      trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo; echo "!! Deployment FAILED. If the build failed, the previous version is still running."; echo "!! Fix the problem and push again, or roll back: sudo hideploy -> 5) Manage Projects -> this project -> Deployments -> Roll back."; record failed || true; fi' EXIT
+
+      echo "==> Updating code"
+      git fetch origin "$CI_COMMIT_BRANCH"
+      git reset --hard "origin/$CI_COMMIT_BRANCH"
+
+      echo "==> Building the image (the current version keeps serving until the new one is ready)"
+      dc up -d --build
+
+      echo "==> Waiting for the new container to become healthy"
+      status=none
+      for i in $(seq 1 60); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo none)"
+        [ "$status" = "healthy" ] && break
+        sleep 2
+      done
+      if [ "$status" != "healthy" ]; then
+        echo "The container did not become healthy (status: $status). Last log lines:"
+        docker logs --tail 40 "$CONTAINER_NAME" || true
+        exit 1
+      fi
+      docker image prune -f >/dev/null 2>&1 || true
+
+      echo "==> Health check (informational)"
+      curl -s -o /dev/null -w "HTTPS status: %{http_code}\n" -k --max-time 15 \
+        --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" || true
+
+      record ok
+      trap - EXIT
+      echo "Deployment finished successfully."
+EOF
+}
+
+# validate_next_files DIR DOMAIN -> prints problems, returns the number of problems
+validate_next_files() {
+    local dir="$1" domain="$2" problems=0 f pm_df pm_lock
+    for f in Dockerfile docker-compose.prod.yml .dockerignore .gitlab-ci.yml; do
+        if [ ! -f "$dir/$f" ]; then err "Missing file: $f"; problems=$((problems+1)); fi
+    done
+    if [ -f "$dir/docker-compose.prod.yml" ]; then
+        grep -qE '^  app:' "$dir/docker-compose.prod.yml"       || { err "docker-compose.prod.yml: the service must be named 'app'."; problems=$((problems+1)); }
+        grep -q 'web_network' "$dir/docker-compose.prod.yml"    || { err "docker-compose.prod.yml: must join the external network 'web_network'."; problems=$((problems+1)); }
+        grep -q 'CONTAINER_NAME' "$dir/docker-compose.prod.yml" || { err "docker-compose.prod.yml: use container_name: \${CONTAINER_NAME}."; problems=$((problems+1)); }
+        grep -q 'env_file' "$dir/docker-compose.prod.yml"       || warn "docker-compose.prod.yml: no env_file: the server's .env will not reach the app at runtime."
+        grep -q 'healthcheck' "$dir/docker-compose.prod.yml"    || warn "docker-compose.prod.yml: no healthcheck: deployments cannot confirm that the new version started."
+    fi
+    if [ -f "$dir/Dockerfile" ]; then
+        grep -q '.next/standalone' "$dir/Dockerfile"            || { err "Dockerfile: it must copy .next/standalone (Next.js standalone output)."; problems=$((problems+1)); }
+        pm_df="npm"
+        grep -q 'pnpm install' "$dir/Dockerfile" && pm_df="pnpm"
+        grep -q 'yarn install' "$dir/Dockerfile" && pm_df="yarn"
+        case "$pm_df" in pnpm) pm_lock="pnpm-lock.yaml" ;; yarn) pm_lock="yarn.lock" ;; *) pm_lock="package-lock.json" ;; esac
+        if [ -f "$dir/package.json" ] && [ ! -f "$dir/$pm_lock" ]; then
+            err "The Dockerfile uses $pm_df but the project has no $pm_lock. Create it locally and commit it (for pnpm: 'pnpm install' or 'pnpm import')."
+            problems=$((problems+1))
+        fi
+    fi
+    if [ -f "$dir/.gitlab-ci.yml" ]; then
+        grep -q '.deploy.env' "$dir/.gitlab-ci.yml"             || { err ".gitlab-ci.yml: should load .deploy.env on the server."; problems=$((problems+1)); }
+        grep -q "$PROJECTS_DIR/$domain" "$dir/.gitlab-ci.yml"   || warn ".gitlab-ci.yml: DEPLOY_PATH is not '$PROJECTS_DIR/$domain'."
+    fi
+    if [ -f "$dir/package.json" ]; then
+        grep -q '"next"' "$dir/package.json" || { err "package.json does not list 'next': is this a Next.js project?"; problems=$((problems+1)); }
+        if ! grep -qs 'standalone' "$dir"/next.config.* 2>/dev/null; then
+            err "next.config.* must contain  output: 'standalone'  (needed for the small production image)."
+            problems=$((problems+1))
+        fi
+    fi
+    return "$problems"
+}
+
+wait_healthy() {
+    local i status="none"
+    info "Waiting for the new container to become healthy..."
+    for i in $(seq 1 60); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo none)"
+        [ "$status" = "healthy" ] && return 0
+        sleep 2
+    done
+    err "The container did not become healthy (status: $status). Last log lines:"
+    docker logs --tail 30 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /'
+    return 1
+}
+
+# write_db_env_next PATH — database settings for a Next.js project (uses PROV_DB / PROV_USER / PROV_PASS)
+write_db_env_next() {
+    local path="$1" pass_enc
+    pass_enc="$(urlencode "$PROV_PASS")"
+    env_set "$path/.env" DB_HOST "$DB_CONTAINER"
+    env_set "$path/.env" DB_PORT 3306
+    env_set "$path/.env" DB_DATABASE "$PROV_DB"
+    env_set "$path/.env" DB_USERNAME "$PROV_USER"
+    if [[ "$PROV_PASS" == *"'"* ]]; then
+        warn "The password contains a quote, so only DATABASE_URL is written (use that in your app)."
+    else
+        env_set "$path/.env" DB_PASSWORD "'$PROV_PASS'"
+    fi
+    env_set "$path/.env" DATABASE_URL "mysql://$PROV_USER:$pass_enc@$DB_CONTAINER:3306/$PROV_DB"
+}
+
+# ---------- nginx vhost for Next.js (reverse proxy over HTTP) ----------------
+
+tpl_next_common() {
+    cat <<'EOF'
+    client_max_body_size 50M;
+
+    # Docker's internal DNS. Using a variable below means nginx still starts
+    # (and other sites keep working) even if this project's container is stopped.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Shown by nginx itself while the container is restarting during a deployment
+    error_page 502 504 =503 /hideploy-maintenance.html;
+    location = /hideploy-maintenance.html {
+        internal;
+        root /etc/nginx/conf.d;
+        add_header Retry-After 30 always;
+        add_header Cache-Control "no-store" always;
+    }
+EOF
+    perf_next_static
+    cat <<'EOF'
+
+    location / {
+        set $next_upstream "http://__CONTAINER__:__PORT__";
+        proxy_pass $next_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 60s;
+    }
+EOF
+}
+
+# write_next_vhost DOMAIN CONTAINER MODE(http|https)
+write_next_vhost() {
+    local domain="$1" container="$2" mode="$3" out="$NGINX_DIR/conf.d/$1.conf" port
+    port="$(kv_get "$PROJECTS_DIR/$domain/.deploy.env" APP_PORT)"; port="${port:-3000}"
+    ensure_maintenance_page
+    {
+        if [ "$mode" = "http" ]; then
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            perf_server_extras http
+            tpl_next_common
+            echo "}"
+        else
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            echo "    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }"
+            echo "    location / { return 301 https://\$host\$request_uri; }"
+            echo "}"
+            echo ""
+            echo "server {"
+            echo "    listen 443 ssl;"
+            echo "    http2 on;"
+            echo "    server_name __DOMAIN__;"
+            echo "    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;"
+            echo "    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;"
+            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "    ssl_session_cache shared:SSL:10m;"
+            perf_server_extras https
+            tpl_next_common
+            echo "}"
+        fi
+    } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__PORT__|$port|g" > "$out"
+}
+
+# ---------- project menu ---------------------------------------------------
+
+menu_project_next() {
+    local path="$1" c cmd domain
+    domain="$(basename "$path")"
+    while true; do
+        load_project "$path" || return
+        clear; banner "Next.js project: $domain" "$C_GREEN"
+        printf '  Container: %s (%s)   Port: %s   Path: %s\n\n' "$CONTAINER_NAME" \
+            "$(container_running "$CONTAINER_NAME" && echo running || echo stopped)" "${APP_PORT:-3000}" "$APP_PATH"
+        echo " 1) Manual deploy (pull + build image + start)"
+        echo " 2) View logs (container / nginx)"
+        echo " 3) Show running processes"
+        echo " 4) Edit .env (then restart the container)"
+        echo " 5) Open a shell inside the container"
+        echo " 6) Restart container"
+        echo " 7) Backup database"
+        echo " 8) Setup / re-issue SSL for this domain"
+        echo " 9) Add a database to this project"
+        echo "10) Restore database from a .sql / .sql.gz file"
+        echo "11) Deployments: history, rollback"
+        echo "12) Remove this project"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) deploy_project "$path" yes; pause ;;
+            2) echo " a) Container log (last 100)   b) nginx error log (last 50)   c) Follow container log"
+               read -r -p "Select: " cmd
+               case "$cmd" in
+                   a) docker logs --tail 100 "$CONTAINER_NAME" ;;
+                   b) docker logs --tail 50 "$NGINX_CONTAINER" 2>&1 | grep -i "$domain\|error" || info "Nothing relevant." ;;
+                   c) info "Press Ctrl-C to stop following."; follow_cmd docker logs -f --tail 20 "$CONTAINER_NAME" ;;
+               esac
+               pause ;;
+            3) docker exec "$CONTAINER_NAME" ps; pause ;;
+            4) nano "$path/.env"
+               explain "Runtime variables are read when the container starts. Variables starting with NEXT_PUBLIC_ are baked in at BUILD time: use 'Manual deploy' for those."
+               if confirm "Recreate the container now so it reads the new .env?" y; then
+                   dc up -d --force-recreate && wait_healthy && ok "Container restarted with the new .env."
+               fi
+               pause ;;
+            5) info "Type 'exit' to leave the container."; docker exec -it "$CONTAINER_NAME" sh ;;
+            6) dc restart && ok "Restarted."; pause ;;
+            7) project_backup "$path"; pause ;;
+            8) ssl_setup "$domain" "$CONTAINER_NAME" nextjs; pause ;;
+            9) project_add_database "$path"; pause ;;
+            10) project_restore_db "$path"; pause ;;
+            11) project_deploy_menu "$path" ;;
+            12) project_remove "$path"; pause; return ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- deployment wizard ----------------------------------------------
+
+deploy_wizard_nextjs() {
+    local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 c
+    local use_db port heap detected pm ip sqlfile db_line scheme dp_ok ram
+    PROV_DB=""; PROV_USER=""; PROV_PASS=""
+    explain \
+        "Next.js wizard: DNS check -> clone -> settings -> project files -> database -> .env -> build -> nginx -> SSL -> CI/CD guide" \
+        "The site is built into a small Docker image (standalone output). pnpm is recommended and used by default."
+    echo ""
+
+    section "Step 1/10 · Domain"
+    while true; do ask "Project domain (e.g. www.example.com)" "" domain; domain="${domain,,}"; valid_domain "$domain" && break; err "Invalid domain."; done
+    path="$PROJECTS_DIR/$domain"
+
+    section "Step 2/10 · DNS check"
+    explain "The domain's A record must point to this server before an SSL certificate can be issued."
+    if dns_check "$domain"; then
+        ok "DNS is correct."
+    else
+        warn "DNS does not point to this server yet."
+        explain "Fix it at your DNS provider (A record -> this server's IP). DNS changes can take a few minutes."
+        if ! confirm "Continue now and set up SSL later?" n; then info "Stopped. Re-run this wizard after DNS is ready."; pause; return; fi
+        skip_ssl=1
+    fi
+
+    section "Step 3/10 · Git repository"
+    ask "Git branch to deploy" "main" branch
+    while true; do
+        ask "Git SSH URL (e.g. git@gitlab.com:group/project.git)" "" repo
+        [[ "$repo" =~ ^(git@|ssh://) ]] && break
+        err "Please use the SSH URL (starts with git@ or ssh://)."
+    done
+    ensure_runner_key
+    trust_git_host "$(repo_host "$repo")"
+    while ! as_runner git ls-remote --exit-code "$repo" HEAD >/dev/null 2>&1; do
+        err "The server cannot read this repository yet."
+        explain \
+            "This server uses ONE SSH key for all projects. Give it read-only access to this repository:" \
+            "" \
+            "  First project that uses this key:" \
+            "    GitLab project -> Settings -> Repository -> Deploy keys -> 'Add new key'," \
+            "    paste the key below and leave 'Grant write permissions' OFF." \
+            "" \
+            "  Next projects (GitLab says 'Fingerprint has already been taken'):" \
+            "    Do NOT add the key again. Open Settings -> Repository -> Deploy keys," \
+            "    switch to the 'Privately accessible deploy keys' tab, find 'gitlab-runner@...' and click 'Enable'."
+        show_runner_pubkey
+        confirm "I added the key: test again?" y || { info "Stopped."; pause; return; }
+    done
+    ok "Repository is reachable."
+
+    section "Step 4/10 · Clone"
+    uid="$(id -u "$RUNNER_USER")"; gid="$(id -g "$RUNNER_USER")"; grp="$(id -gn "$RUNNER_USER")"
+    if [ -d "$path/.git" ]; then
+        ok "Project folder already exists: using it."
+    else
+        install -d -o "$RUNNER_USER" -g "$grp" "$path"
+        as_runner git clone --branch "$branch" "$repo" "$path" || { err "Clone failed."; pause; return; }
+        ok "Cloned into $path"
+    fi
+    as_runner git -C "$path" config core.fileMode false
+    [ -f "$path/package.json" ] && grep -q '"next"' "$path/package.json" \
+        || { err "This does not look like a Next.js project (package.json with 'next' is missing)."; pause; return; }
+
+    section "Step 5/10 · Server settings (.deploy.env)"
+    explain "These values are specific to THIS server, so they are stored outside git, in $path/.deploy.env"
+    ask "Container name" "${domain//./-}" container
+    [[ "$container" =~ ^[a-z0-9][a-z0-9_.-]*$ ]] || { err "Invalid container name."; pause; return; }
+    ram="$(free -m | awk '/^Mem:/{print $2}')"
+    explain "This server has ${ram} MB of RAM. A Next.js app usually needs 256-512 MB at runtime. The BUILD needs about 1 GB (add swap: Prepare Server -> Swap)."
+    while true; do
+        ask "Memory limit for this container (e.g. 512m or 1g)" "512m" mem
+        [[ "$mem" =~ ^[0-9]+$ ]] && info "No unit given: using ${mem}m (m = megabytes)."
+        mem_norm="$(normalize_mem "$mem")" || { err "Invalid value. Use a number with a unit, like 512m or 1g."; continue; }
+        mem="$mem_norm"
+        if [ "$(mem_to_mb "$mem")" -lt 256 ]; then
+            warn "$mem is very low for Next.js."
+            confirm "Use $mem anyway?" n || continue
+        fi
+        break
+    done
+    heap=$(( $(mem_to_mb "$mem") * 70 / 100 ))
+    while true; do ask "Port the app listens on inside the container" "3000" port; [[ "$port" =~ ^[0-9]{2,5}$ ]] && break; err "Invalid port."; done
+    if confirm "Does this project use a MariaDB database right now? (you can add one later)" n; then use_db="yes"; else use_db="no"; fi
+    ask "GitLab runner tag used in .gitlab-ci.yml" "$(cfg_get RUNNER_TAG || true)" tag
+    tag="${tag:-production}"; cfg_set RUNNER_TAG "$tag"
+    cat > "$path/.deploy.env" <<EOF
+# Server-specific settings (not in git). Used by docker-compose.prod.yml and the CI pipeline.
+PROJECT_TYPE=nextjs
+DOMAIN=$domain
+BRANCH=$branch
+CONTAINER_NAME=$container
+APP_PATH=$path
+APP_UID=$uid
+APP_GID=$gid
+APP_PORT=$port
+MEM_LIMIT=$mem
+NODE_HEAP_MB=$heap
+USE_DATABASE=$use_db
+EOF
+    chown "$uid:$gid" "$path/.deploy.env"; chmod 640 "$path/.deploy.env"
+    grep -qxF '.deploy.env' "$path/.git/info/exclude" 2>/dev/null || echo '.deploy.env' >> "$path/.git/info/exclude"
+    ok ".deploy.env written."
+
+    section "Step 6/10 · Project files check"
+    detected="$(detect_pm "$path")"
+    pm="pnpm"; [ "$detected" = "none" ] || pm="$detected"
+    if [ "$detected" = "none" ]; then
+        warn "No lock file found (pnpm-lock.yaml / package-lock.json / yarn.lock). Create one locally and commit it, e.g. 'pnpm install'."
+    elif [ "$detected" != "pnpm" ]; then
+        explain "Your project uses $detected. To switch to pnpm (faster): run 'pnpm import' locally, commit pnpm-lock.yaml and delete the old lock file."
+    fi
+    while true; do ask "Package manager for the build (pnpm / npm / yarn)" "$pm" pm; pm="${pm,,}"; [[ "$pm" =~ ^(pnpm|npm|yarn)$ ]] && break; err "Choose pnpm, npm or yarn."; done
+    while true; do
+        if validate_next_files "$path" "$domain"; then ok "All project files look good."; break; fi
+        echo ""
+        echo " 1) I will add/fix them from my computer (recommended: keeps your repo as the source of truth)"
+        echo " 2) Create the missing files here on the server (they will NOT be in git until you commit them)"
+        echo " 3) Continue anyway"
+        echo " 4) Abort"
+        read -r -p "Select: " c
+        case "$c" in
+            1) generate_project_files "$TEMPLATES_DIR/$domain" "$domain" "$branch" "$tag" yes nextjs "$pm"
+               ip="$(server_ip || echo SERVER_IP)"
+               info "On your computer, inside the project folder, run:"
+               printf '\n   %sscp -r root@%s:%s/. .%s\n   git add . && git commit -m "Add deployment files" && git push origin %s\n\n' "$C_GREEN" "$ip" "$TEMPLATES_DIR/$domain" "$C_RESET" "$branch"
+               explain "Also make sure next.config has  output: 'standalone'  and the lock file is committed."
+               read -r -p "${C_MAGENTA}Press [Enter] after you pushed...${C_RESET}" _
+               git_sync "$path" "$branch" || warn "Could not update the server copy. Fix the problem shown above, then choose option 1 again." ;;
+            2) generate_project_files "$path" "$domain" "$branch" "$tag" no nextjs "$pm"
+               chown "$uid:$gid" "$path"/Dockerfile "$path"/docker-compose.prod.yml "$path"/.dockerignore "$path"/.gitlab-ci.yml 2>/dev/null || true ;;
+            3) warn "Continuing with problems: the build may fail."; break ;;
+            *) info "Aborted."; pause; return ;;
+        esac
+    done
+
+    section "Step 7/10 · Database"
+    if [ "$use_db" = "yes" ]; then
+        explain "Press Enter to accept a suggestion, or type your own value."
+        db_provision "$domain" || { pause; return; }
+        if confirm "Restore an existing SQL backup into this database now?" n; then
+            if pick_sql_file sqlfile; then
+                db_import_file "$PROV_DB" "$sqlfile" || warn "Import failed. You can retry later: Manage Projects -> your project -> Restore database."
+            fi
+        fi
+    else
+        info "No database for this project. Add one later: Manage Projects -> your project -> Add a database."
+    fi
+
+    section "Step 8/10 · Environment variables (.env)"
+    if [ ! -f "$path/.env" ]; then
+        if [ -f "$path/.env.example" ]; then cp "$path/.env.example" "$path/.env"; ok ".env created from .env.example."
+        else : > "$path/.env"; ok "Empty .env created."; fi
+    else
+        ok ".env already exists: keeping it."
+    fi
+    [ "$use_db" = "yes" ] && write_db_env_next "$path"
+    chown "$uid:$gid" "$path/.env"; chmod 640 "$path/.env"
+    explain \
+        "The .env file stays on the server (never in git). The container reads it when it starts." \
+        "Variables starting with NEXT_PUBLIC_ are baked into the JavaScript at BUILD time, so set them BEFORE the build." \
+        "Tip: in values, write a literal dollar sign as \$\$ (Docker Compose treats \$ specially)."
+    if confirm "Open .env in the editor now (set API URLs, secrets, NEXT_PUBLIC_* values)?" "$([ -s "$path/.env" ] && echo y || echo n)"; then nano "$path/.env"; fi
+
+    section "Step 9/10 · Build and start"
+    explain "The first build downloads Node and your dependencies and can take several minutes."
+    dp_ok="yes"
+    deploy_project "$path" no || dp_ok="no"
+    [ "$dp_ok" = "yes" ] || {
+        err "Deployment stopped. Fix the problem, then use: Manage Projects -> your project -> Manual deploy."
+        pause; return
+    }
+
+    section "Step 10/10 · nginx and SSL"
+    if apply_vhost "$domain" "$container" http nextjs; then
+        ok "nginx now serves http://$domain"
+    else
+        err "Could not configure nginx."; pause; return
+    fi
+    if [ "$skip_ssl" -eq 0 ] && confirm "Issue a free Let's Encrypt SSL certificate now?" y; then
+        ssl_setup "$domain" "$container" nextjs && ssl_ok=1
+    else
+        info "SSL skipped. Later: Manage Projects -> your project -> Setup / re-issue SSL."
+    fi
+
+    scheme="http"; [ "$ssl_ok" -eq 1 ] && scheme="https"
+    echo ""; banner "Deployment complete" "$C_GREEN"
+    db_line="none (add one later: Manage Projects -> your project -> Add a database)"
+    [ "$use_db" = "yes" ] && db_line="$PROV_DB (user $PROV_USER)"
+    printf '  Site:        %s://%s\n  Code:        %s\n  Container:   %s (port %s, memory %s)\n  Package mgr: %s\n  Database:    %s\n  Config:      %s/.env  and  %s/.deploy.env\n' \
+        "$scheme" "$domain" "$path" "$container" "$port" "$mem" "$pm" "$db_line" "$path" "$path"
+    echo ""
+    printf '%s━━ AUTOMATIC DEPLOYMENT (CI/CD): what you still need to do ━━%s\n' "$C_BOLD" "$C_RESET"
+    cat <<EOF
+ 1. Runner: in GitLab open  Settings -> CI/CD -> Runners  and make sure a runner with the
+    tag "$tag" is enabled for this project (main menu 1 -> Register GitLab Runner if needed).
+ 2. Deploy key: already working (the server can pull the repo). Keep it read-only.
+ 3. Repository files: Dockerfile, docker-compose.prod.yml, .dockerignore and .gitlab-ci.yml
+    must be committed on branch "$branch". (Template copies: $TEMPLATES_DIR/$domain)
+ 4. No GitLab CI/CD variables are required: server settings live in $path/.deploy.env,
+    runtime secrets in $path/.env.
+ 5. Deploy from your computer, from now on, with just:
+        git add . && git commit -m "Your message" && git push origin $branch
+ 6. The pipeline pulls the code, builds a new image while the current version keeps serving,
+    and switches over when the new container is healthy.
+EOF
+    next_steps \
+        "Open $scheme://$domain and check it loads." \
+        "Do a first test push, then watch the pipeline." \
+        "Faster pages: main menu 7) Performance tuning (nginx static cache and more)."
+    pause
+}
+
 choose_project() {
     local -a paths=()
     mapfile -t paths < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
     if [ "${#paths[@]}" -eq 0 ]; then err "No projects deployed yet."; return 1; fi
-    local i=1 p dom state days
-    printf '\n%-4s %-34s %-12s %-10s\n' "#" "DOMAIN" "CONTAINER" "SSL DAYS"
+    local i=1 p dom state days typ
+    printf '\n%-4s %-34s %-8s %-12s %-10s\n' "#" "DOMAIN" "TYPE" "CONTAINER" "SSL DAYS"
     for p in "${paths[@]}"; do
         dom="$(basename "$p")"
         if ( . "$p/.deploy.env"; container_running "$CONTAINER_NAME" ); then state="${C_GREEN}running${C_RESET}"; else state="${C_RED}stopped${C_RESET}"; fi
         days="$(cert_days "$dom")"
-        printf '%-4s %-34s %-21s %-10s\n' "$i" "$dom" "$state" "${days:--}"
+        typ="$( . "$p/.deploy.env" 2>/dev/null; echo "${PROJECT_TYPE:-laravel}" )"
+        printf '%-4s %-34s %-8s %-21s %-10s\n' "$i" "$dom" "$typ" "$state" "${days:--}"
         i=$((i+1))
     done
     local n; read -r -p "${C_YELLOW}Select project number (0 = back): ${C_RESET}" n
@@ -2086,6 +2744,7 @@ menu_project() {
     domain="$(basename "$path")"
     while true; do
         load_project "$path" || return
+        if is_next; then menu_project_next "$path"; return; fi
         clear; banner "Project: $domain" "$C_GREEN"
         printf '  Container: %s (%s)   Path: %s\n\n' "$CONTAINER_NAME" "$(container_running "$CONTAINER_NAME" && echo running || echo stopped)" "$APP_PATH"
         echo " 1) Manual deploy (pull + build + composer + migrate + cache)"
@@ -2228,13 +2887,20 @@ prepare_storage() {
 }
 
 deploy_wizard() {
-    clear; banner "4) Deploy New Laravel Project" "$C_MAGENTA"
+    clear; banner "4) Deploy New Project" "$C_MAGENTA"
     explain \
         "This wizard does everything for ONE project, step by step:" \
         "  DNS check → clone → settings → project files → database → .env → build → nginx → SSL → CI/CD guide" \
         "You can stop at any prompt with Ctrl-C and re-run it later; finished steps are detected and skipped."
     echo ""
     require_stack || { pause; return; }
+
+    local ptype_choice
+    echo " Project type:"
+    echo "  1) Laravel (PHP)"
+    echo "  2) Next.js (Node; built with pnpm, npm or yarn)"
+    read -r -p "Select [1]: " ptype_choice
+    if [ "$ptype_choice" = "2" ]; then deploy_wizard_nextjs; return; fi
 
     local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok sqlfile
     PROV_DB=""; PROV_USER=""; PROV_PASS=""
@@ -3308,6 +3974,436 @@ menu_disk() {
 }
 
 # ============================================================================
+# PERFORMANCE TUNING (main menu 7)
+# ============================================================================
+# Nothing here is applied automatically. Until you apply a profile, nginx configuration and
+# containers stay exactly as they were. Suggested values come from a scan of this server.
+
+perf_get()     { kv_get "$PERF_CONF" "$1"; }
+perf_set()     { kv_set "$PERF_CONF" "$1" "$2"; }
+perf_val()     { local v; v="$(perf_get "$1")"; printf '%s' "${v:-$2}"; }
+perf_applied() { [ "$(perf_get APPLIED)" = "yes" ]; }
+
+# ---------- hooks used when vhosts are written (silent unless tuning is applied) ----------
+
+perf_server_extras() {   # $1 = http | https
+    perf_applied || return 0
+    echo "    keepalive_timeout $(perf_val KEEPALIVE 30)s;"
+    if [ "$1" = "https" ]; then echo "    ssl_session_timeout 1d;"; fi
+    return 0
+}
+
+perf_laravel_static() {
+    perf_applied || return 0
+    local exp; exp="$(perf_val STATIC_EXPIRES 7d)"
+    [ "$exp" != "off" ] || return 0
+    cat <<'EOF' | sed "s|__EXP__|$exp|g"
+
+    # Browser caching for static files (added by HiDeploy performance tuning)
+    location ^~ /build/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        access_log off;
+    }
+
+    location ~* \.(?:css|js|mjs|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico)$ {
+        try_files $uri /index.php?$query_string;
+        expires __EXP__;
+        access_log off;
+    }
+EOF
+}
+
+perf_next_static() {
+    perf_applied || return 0
+    cat <<'EOF'
+
+    # Cached copy of the hashed, immutable build files: fast, and still served while the container restarts
+    location ^~ /_next/static/ {
+        set $next_static_upstream "http://__CONTAINER__:__PORT__";
+        proxy_pass $next_static_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_cache hd_static;
+        proxy_cache_valid 200 7d;
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        add_header X-Cache-Status $upstream_cache_status;
+    }
+EOF
+}
+
+# ---------- server scan and suggestions ----------
+
+perf_scan() {
+    local src dev rota p t
+    PS_CORES="$(nproc 2>/dev/null || echo 1)"
+    PS_RAM_MB="$(free -m | awk '/^Mem:/{print $2}')"
+    PS_AVAIL_MB="$(free -m | awk '/^Mem:/{print $7}')"
+    PS_SWAP_MB="$(free -m | awk '/^Swap:/{print $2}')"
+    PS_DISK="unknown"
+    src="$(findmnt -no SOURCE / 2>/dev/null)"
+    dev="$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)"
+    [ -n "$dev" ] || dev="$(basename "${src:-x}")"
+    rota="$(cat "/sys/block/$dev/queue/rotational" 2>/dev/null)"
+    case "$rota" in 0) PS_DISK="SSD / NVMe" ;; 1) PS_DISK="HDD (or a virtual disk reported as rotational)" ;; esac
+    PS_LARAVEL=0; PS_NEXT=0; PS_PROJ_MEM_MB=0
+    while IFS= read -r p; do
+        t="$( . "$p/.deploy.env" 2>/dev/null; echo "${PROJECT_TYPE:-laravel} ${MEM_LIMIT:-512m}" )"
+        if [ "${t%% *}" = "nextjs" ]; then PS_NEXT=$((PS_NEXT+1)); else PS_LARAVEL=$((PS_LARAVEL+1)); fi
+        PS_PROJ_MEM_MB=$(( PS_PROJ_MEM_MB + $(mem_to_mb "$(normalize_mem "${t#* }" 2>/dev/null || echo 512m)") ))
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null)
+}
+
+perf_suggest() {
+    local bp
+    if   [ "$PS_RAM_MB" -lt 1500 ]; then PS_TIER="small  (under 1.5 GB RAM)"; SG_KEEPALIVE=20; SG_PCACHE="128m"; SG_BP="128M"; SG_MAXCONN=40
+    elif [ "$PS_RAM_MB" -lt 3500 ]; then PS_TIER="medium (1.5 - 3.5 GB RAM)"; SG_KEEPALIVE=30; SG_PCACHE="256m"; SG_BP="256M"; SG_MAXCONN=80
+    else                                 PS_TIER="large  (3.5 GB RAM or more)"; SG_KEEPALIVE=30; SG_PCACHE="512m"
+        bp=$(( PS_RAM_MB / 4 )); [ "$bp" -gt 1024 ] && bp=1024; bp=$(( bp / 64 * 64 )); SG_BP="${bp}M"; SG_MAXCONN=150
+    fi
+    if   [ "$PS_CORES" -ge 4 ]; then SG_GZIP=6; elif [ "$PS_CORES" -ge 2 ]; then SG_GZIP=5; else SG_GZIP=4; fi
+    SG_STATIC="7d"; SG_OFC="yes"
+}
+
+# perf_fpm_suggest MEM_MB -> SG_FPM_*
+perf_fpm_suggest() {
+    local m="$1" max
+    max=$(( (m - 100) / 50 )); [ "$max" -lt 2 ] && max=2; [ "$max" -gt 30 ] && max=30
+    SG_FPM_MAX="$max"
+    if [ "$m" -ge 384 ] && [ "${PS_RAM_MB:-0}" -ge 1500 ] && [ "$max" -ge 3 ]; then
+        SG_FPM_PM="dynamic"; SG_FPM_START=2; SG_FPM_MIN=1
+        SG_FPM_MAXS=$(( max / 2 )); [ "$SG_FPM_MAXS" -lt 3 ] && SG_FPM_MAXS=3; [ "$SG_FPM_MAXS" -gt "$max" ] && SG_FPM_MAXS="$max"
+    else
+        SG_FPM_PM="ondemand"; SG_FPM_START=2; SG_FPM_MIN=1; SG_FPM_MAXS=3
+    fi
+}
+
+perf_show_scan() {
+    perf_scan; perf_suggest
+    section "This server"
+    printf '  CPU cores:         %s\n' "$PS_CORES"
+    printf '  RAM:               %s MB total, %s MB available now\n' "$PS_RAM_MB" "$PS_AVAIL_MB"
+    printf '  Swap:              %s MB\n' "$PS_SWAP_MB"
+    printf '  Disk type:         %s\n' "$PS_DISK"
+    printf '  Projects:          %s Laravel, %s Next.js (their memory limits add up to %s MB)\n' "$PS_LARAVEL" "$PS_NEXT" "$PS_PROJ_MEM_MB"
+    printf '  Server size:       %s\n' "$PS_TIER"
+    section "Suggested settings for this server"
+    printf '  %-34s %s\n' "Compression level" "$SG_GZIP   (current: $(perf_val GZIP_LEVEL "not applied"))"
+    printf '  %-34s %s\n' "Keep-alive seconds" "$SG_KEEPALIVE   (current: $(perf_val KEEPALIVE "not applied"))"
+    printf '  %-34s %s\n' "Static file browser cache" "$SG_STATIC   (current: $(perf_val STATIC_EXPIRES "not applied"))"
+    printf '  %-34s %s\n' "Next.js static cache size" "$SG_PCACHE   (current: $(perf_val PROXY_CACHE "not applied"))"
+    printf '  %-34s %s\n' "MariaDB buffer pool" "$SG_BP   (current: $(perf_db_current bp))"
+    printf '  %-34s %s\n' "MariaDB max connections" "$SG_MAXCONN   (current: $(perf_db_current mc))"
+    echo ""
+    if [ "$PS_PROJ_MEM_MB" -gt $(( PS_RAM_MB * 80 / 100 )) ]; then
+        warn "The memory limits of all projects (${PS_PROJ_MEM_MB} MB) are more than 80% of the server's RAM (${PS_RAM_MB} MB)."
+        explain "That is fine while the apps use less than their limit, but under heavy load the server may start swapping or killing processes."
+    fi
+    if [ "$PS_SWAP_MB" -eq 0 ] && [ "$PS_RAM_MB" -lt 3000 ]; then
+        warn "No swap file: builds and 'composer install' can be killed on a small server. Add one: Prepare Server -> Swap."
+    fi
+}
+
+# ---------- nginx ----------
+
+perf_write_nginx_conf() {
+    local gz ofc pc
+    gz="$(perf_val GZIP_LEVEL 5)"; ofc="$(perf_val OPEN_FILE_CACHE yes)"; pc="$(perf_val PROXY_CACHE 256m)"
+    {
+        echo "# Managed by HiDeploy (main menu 7: Performance tuning). Change it through the menu, not by hand."
+        echo "tcp_nopush on;"
+        echo "tcp_nodelay on;"
+        echo "keepalive_requests 1000;"
+        echo "server_names_hash_bucket_size 128;"
+        echo "gzip_comp_level $gz;"
+        echo "gzip_min_length 1024;"
+        echo "gzip_vary on;"
+        echo "gzip_proxied any;"
+        echo "gzip_types application/xml application/rss+xml application/atom+xml application/manifest+json font/ttf font/otf application/vnd.ms-fontobject image/x-icon text/javascript;"
+        if [ "$ofc" = "yes" ]; then
+            echo "open_file_cache max=2000 inactive=30s;"
+            echo "open_file_cache_valid 60s;"
+            echo "open_file_cache_min_uses 2;"
+            echo "open_file_cache_errors on;"
+        fi
+        echo "fastcgi_buffers 16 16k;"
+        echo "fastcgi_buffer_size 32k;"
+        echo "proxy_cache_path /var/cache/nginx/hd_static levels=1:2 keys_zone=hd_static:10m max_size=$pc inactive=7d use_temp_path=off;"
+    } > "$PERF_NGINX_CONF"
+}
+
+perf_apply_nginx() {
+    section "Nginx tuning"
+    container_running "$NGINX_CONTAINER" || { err "The nginx container is not running."; return 1; }
+    perf_scan; perf_suggest
+    explain \
+        "Press Enter to accept the value suggested for THIS server, or type your own." \
+        "A wrong value cannot break your sites: nginx tests the new configuration first and keeps the old one if it is rejected."
+    local gz ka ofc exp pc prev_applied backup=""
+    while true; do ask "Compression level 1-9 (higher = smaller files, more CPU; $PS_CORES core(s) here)" "$(perf_val GZIP_LEVEL "$SG_GZIP")" gz; [[ "$gz" =~ ^[1-9]$ ]] && break; err "Enter a number from 1 to 9."; done
+    while true; do ask "Keep-alive seconds (how long a browser may reuse a connection)" "$(perf_val KEEPALIVE "$SG_KEEPALIVE")" ka; [[ "$ka" =~ ^[0-9]+$ ]] && [ "$ka" -ge 5 ] && [ "$ka" -le 300 ] && break; err "Enter a number from 5 to 300."; done
+    if confirm "Cache file information to speed up static files (open_file_cache)?" "$([ "$(perf_val OPEN_FILE_CACHE "$SG_OFC")" = yes ] && echo y || echo n)"; then ofc="yes"; else ofc="no"; fi
+    while true; do ask "Browser cache for Laravel static files (off / 1d / 7d / 30d)" "$(perf_val STATIC_EXPIRES "$SG_STATIC")" exp; exp="${exp,,}"; [[ "$exp" =~ ^(off|1d|7d|30d)$ ]] && break; err "Choose off, 1d, 7d or 30d."; done
+    while true; do ask "Size of the nginx cache for Next.js static files (e.g. 128m, 1g)" "$(perf_val PROXY_CACHE "$SG_PCACHE")" pc; pc="${pc,,}"; [[ "$pc" =~ ^[1-9][0-9]*[mg]$ ]] && break; err "Use a number with m or g."; done
+    echo ""
+    printf '  Compression %s · keep-alive %ss · open_file_cache %s · static cache %s · Next.js cache %s\n\n' "$gz" "$ka" "$ofc" "$exp" "$pc"
+    confirm "Apply these settings now? (sites keep running, nginx is reloaded)" y || { info "Cancelled."; return 0; }
+    prev_applied="$(perf_get APPLIED)"
+    if [ -f "$PERF_NGINX_CONF" ]; then backup="$(mktemp)"; cp "$PERF_NGINX_CONF" "$backup"; fi
+    perf_set GZIP_LEVEL "$gz"; perf_set KEEPALIVE "$ka"; perf_set OPEN_FILE_CACHE "$ofc"; perf_set STATIC_EXPIRES "$exp"; perf_set PROXY_CACHE "$pc"
+    perf_write_nginx_conf
+    if ! nginx_test_reload; then
+        err "nginx rejected the new settings; the previous state was restored."
+        if [ -n "$backup" ]; then cp "$backup" "$PERF_NGINX_CONF"; else rm -f "$PERF_NGINX_CONF"; fi
+        rm -f "$backup"; nginx_test_reload >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$backup"
+    perf_set APPLIED yes
+    info "Updating every project's nginx configuration..."
+    nginx_refresh_all
+    ok "Nginx tuning applied."
+    next_steps \
+        "Open a site and check it loads normally (press Ctrl+F5 once to bypass the old browser cache)." \
+        "If a site shows old images or files after you replace them, use a different file name or set the static cache to 1d/off here." \
+        "To undo everything: Performance tuning -> option 6."
+}
+
+perf_disable_nginx() {
+    section "Turn Nginx tuning off"
+    perf_applied || [ -f "$PERF_NGINX_CONF" ] || { info "Nginx tuning is not applied."; return 0; }
+    confirm "Remove the tuning and go back to the original nginx settings?" n || return 0
+    perf_set APPLIED no
+    nginx_refresh_all
+    rm -f "$PERF_NGINX_CONF"
+    nginx_test_reload && ok "Nginx tuning is off."
+}
+
+# ---------- MariaDB ----------
+
+perf_db_current() {   # bp | mc | skip
+    local f="$DB_DIR/docker-compose.yml"
+    [ -f "$f" ] || { printf 'n/a'; return 0; }
+    case "$1" in
+        bp)   sed -n 's/.*--innodb-buffer-pool-size=\(.*\)$/\1/p' "$f" | head -n1 ;;
+        mc)   sed -n 's/.*--max-connections=\(.*\)$/\1/p' "$f" | head -n1 ;;
+        skip) grep -q -- '--skip-name-resolve' "$f" && echo yes || echo no ;;
+    esac
+}
+
+mariadb_write_compose() {   # BUFFER_POOL MAX_CONNECTIONS SKIP_NAME_RESOLVE(yes|no)
+    local bp="$1" mc="$2" skip="$3" skip_line=""
+    [ "$skip" = "yes" ] && skip_line="      - --skip-name-resolve"
+    cat > "$DB_DIR/docker-compose.yml" <<EOF
+services:
+  mariadb:
+    image: ${MARIADB_IMAGE}
+    container_name: ${DB_CONTAINER}
+    restart: always
+    environment:
+      MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=${bp}
+      - --max-connections=${mc}
+${skip_line}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ${NETWORK}
+
+networks:
+  ${NETWORK}:
+    external: true
+
+volumes:
+  mariadb_data:
+EOF
+}
+
+perf_wait_db() {
+    local i status=""
+    for i in $(seq 1 40); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "$DB_CONTAINER" 2>/dev/null)"
+        [ "$status" = "healthy" ] && return 0
+        sleep 3
+    done
+    return 1
+}
+
+perf_apply_mariadb() {
+    section "MariaDB tuning"
+    [ -f "$DB_DIR/docker-compose.yml" ] || { err "MariaDB was not installed by HiDeploy (compose file not found)."; return 1; }
+    container_running "$DB_CONTAINER" || { err "The MariaDB container is not running."; return 1; }
+    perf_scan; perf_suggest
+    explain \
+        "Memory for caching data and the number of simultaneous connections, sized for this server." \
+        "'skip-name-resolve' stops MariaDB from doing a reverse-DNS lookup for every new connection, a classic cause of" \
+        "multi-second delays on the first request. It is safe here: HiDeploy users are created for any host ('%')."
+    local bp mc skip old_bp old_mc old_skip backup
+    old_bp="$(perf_db_current bp)"; old_mc="$(perf_db_current mc)"; old_skip="$(perf_db_current skip)"
+    while true; do ask "InnoDB buffer pool (e.g. 128M, 256M, 1G; about 25% of RAM is typical)" "$SG_BP" bp; bp="${bp^^}"; [[ "$bp" =~ ^[1-9][0-9]*[MG]$ ]] && break; err "Use a number with M or G."; done
+    while true; do ask "Maximum simultaneous connections" "$SG_MAXCONN" mc; [[ "$mc" =~ ^[0-9]+$ ]] && [ "$mc" -ge 20 ] && [ "$mc" -le 1000 ] && break; err "Enter a number from 20 to 1000."; done
+    if confirm "Enable skip-name-resolve (faster connections)?" y; then skip="yes"; else skip="no"; fi
+    echo ""
+    printf '  Buffer pool: %s -> %s   Connections: %s -> %s   skip-name-resolve: %s -> %s\n\n' "$old_bp" "$bp" "$old_mc" "$mc" "$old_skip" "$skip"
+    warn "MariaDB restarts (about 10-30 seconds). During that time all sites that use a database show errors."
+    explain "Your data is not touched. Safest: make a backup first (main menu 6 -> Run a backup NOW)."
+    confirm "Restart MariaDB with these settings now?" n || { info "Cancelled."; return 0; }
+    backup="$DB_DIR/docker-compose.yml.bak-$(date +%F_%H%M%S)"
+    cp "$DB_DIR/docker-compose.yml" "$backup"
+    mariadb_write_compose "$bp" "$mc" "$skip"
+    info "Restarting MariaDB..."
+    docker compose -f "$DB_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+    if perf_wait_db; then
+        perf_set DB_BP "$bp"; perf_set DB_MAXCONN "$mc"; perf_set DB_SKIP_NAME_RESOLVE "$skip"
+        ok "MariaDB is healthy with the new settings."
+    else
+        err "MariaDB did not become healthy. Restoring the previous settings..."
+        cp "$backup" "$DB_DIR/docker-compose.yml"
+        docker compose -f "$DB_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+        perf_wait_db && ok "Previous settings restored; MariaDB is healthy." || err "Check: docker logs $DB_CONTAINER"
+        return 1
+    fi
+}
+
+# ---------- PHP-FPM (Laravel) ----------
+
+perf_apply_fpm() {
+    section "PHP-FPM tuning (Laravel project)"
+    explain \
+        "'ondemand' starts a PHP worker only when a visitor arrives and stops it after 10 idle seconds: very light on RAM," \
+        "but the first visit after a quiet moment must wait for a worker (and Laravel) to start." \
+        "'dynamic' keeps a few workers ready, so the first visit is fast. It uses a bit more RAM."
+    choose_project || { info "Cancelled."; return 0; }
+    local path="$PROJECT_PATH" mem_mb pm max start mins maxs idle cur_pm cur_max
+    load_project "$path" || return 1
+    if is_next; then info "This is a Next.js project: PHP-FPM does not apply."; return 0; fi
+    if ! grep -q 'FPM_PM' "$APP_PATH/docker-compose.prod.yml" 2>/dev/null; then
+        warn "This project uses an older template without PHP-FPM tuning."
+        explain "Regenerate the project files (main menu 3), copy them into your project, commit and push, then come back."
+        return 1
+    fi
+    mem_mb="$(mem_to_mb "$(normalize_mem "${MEM_LIMIT:-512m}" 2>/dev/null || echo 512m)")"
+    perf_scan; perf_fpm_suggest "$mem_mb"
+    cur_pm="$(kv_get "$APP_PATH/.deploy.env" FPM_PM)"; cur_max="$(kv_get "$APP_PATH/.deploy.env" FPM_MAX_CHILDREN)"
+    printf '\n  Project memory limit: %s MB   Current: %s, max workers %s\n' "$mem_mb" "${cur_pm:-ondemand (default)}" "${cur_max:-5 (default)}"
+    while true; do ask "Process manager (ondemand / dynamic / static)" "${cur_pm:-$SG_FPM_PM}" pm; pm="${pm,,}"; [[ "$pm" =~ ^(ondemand|dynamic|static)$ ]] && break; err "Choose ondemand, dynamic or static."; done
+    while true; do ask "Maximum PHP workers (about 50 MB each)" "${cur_max:-$SG_FPM_MAX}" max; [[ "$max" =~ ^[0-9]+$ ]] && [ "$max" -ge 1 ] && [ "$max" -le 100 ] && break; err "Enter a number from 1 to 100."; done
+    start="$SG_FPM_START"; mins="$SG_FPM_MIN"; maxs="$SG_FPM_MAXS"; idle="10s"
+    if [ "$pm" = "dynamic" ]; then
+        [ "$maxs" -gt "$max" ] && maxs="$max"; [ "$start" -gt "$maxs" ] && start="$maxs"; [ "$mins" -gt "$start" ] && mins="$start"
+        while true; do
+            ask "Workers started at boot" "$start" start
+            ask "Minimum idle workers kept ready" "$mins" mins
+            ask "Maximum idle workers" "$maxs" maxs
+            if [[ "$start$mins$maxs" =~ ^[0-9]+$ ]] && [ "$mins" -ge 1 ] && [ "$mins" -le "$start" ] && [ "$start" -le "$maxs" ] && [ "$maxs" -le "$max" ]; then break; fi
+            err "Rule: 1 <= minimum idle <= started <= maximum idle <= maximum workers ($max)."
+        done
+    fi
+    if [ $(( max * 50 + 100 )) -gt "$mem_mb" ]; then
+        warn "$max workers could need about $(( max * 50 + 100 )) MB but the container limit is ${mem_mb} MB. Lower the workers or raise the memory limit."
+        confirm "Apply anyway?" n || { info "Cancelled."; return 0; }
+    fi
+    env_set "$APP_PATH/.deploy.env" FPM_PM "$pm"
+    env_set "$APP_PATH/.deploy.env" FPM_MAX_CHILDREN "$max"
+    env_set "$APP_PATH/.deploy.env" FPM_START_SERVERS "$start"
+    env_set "$APP_PATH/.deploy.env" FPM_MIN_SPARE "$mins"
+    env_set "$APP_PATH/.deploy.env" FPM_MAX_SPARE "$maxs"
+    env_set "$APP_PATH/.deploy.env" FPM_IDLE_TIMEOUT "$idle"
+    info "Recreating the container with the new settings (a few seconds; visitors see the friendly page)..."
+    dc up -d || { err "Could not recreate the container."; return 1; }
+    wait_container && ok "PHP-FPM tuning applied: $pm, up to $max workers."
+}
+
+# ---------- diagnosis ----------
+
+perf_diagnose() {
+    section "Why is the first load slow? (diagnosis)"
+    explain \
+        "For each site: three requests straight to nginx on this server, then one through the public internet." \
+        "Tip: run it after the sites were idle for a minute, so run 1 shows the 'cold' behaviour."
+    local p dom scheme i out dns conn tls ttfb total code t1 t2 t3 pub dbms
+    local found=0
+    while IFS= read -r p; do
+        found=1
+        dom="$(basename "$p")"; load_project "$p" || continue
+        scheme="http"; [ -d "$NGINX_DIR/letsencrypt/live/$dom" ] && scheme="https"
+        printf '\n  %s%s%s (%s)\n' "$C_BOLD" "$dom" "$C_RESET" "${PROJECT_TYPE:-laravel}"
+        t1=0; t2=0; t3=0
+        for i in 1 2 3; do
+            out="$(curl -o /dev/null -s -k --max-time 40 --resolve "$dom:443:127.0.0.1" --resolve "$dom:80:127.0.0.1" \
+                -w '%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code}' "$scheme://$dom/" 2>/dev/null)"
+            read -r dns conn tls ttfb total code <<< "${out:-0 0 0 0 0 000}"
+            printf '    run %s (nginx on this server): first byte %.2fs, total %.2fs, HTTP %s\n' "$i" "$ttfb" "$total" "$code"
+            case "$i" in 1) t1="$ttfb" ;; 2) t2="$ttfb" ;; 3) t3="$ttfb" ;; esac
+        done
+        out="$(curl -o /dev/null -s --max-time 40 -w '%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code}' "$scheme://$dom/" 2>/dev/null)"
+        read -r dns conn tls ttfb total code <<< "${out:-0 0 0 0 0 000}"
+        pub="$ttfb"
+        printf '    public internet:               DNS %.2fs, connect %.2fs, first byte %.2fs, HTTP %s\n' "$dns" "$conn" "$ttfb" "$code"
+        if ! is_next && [ "${USE_DATABASE:-yes}" = "yes" ] && container_running "$CONTAINER_NAME"; then
+            dbms="$(docker exec -u "$APP_UID:$APP_GID" -w "$APP_PATH" "$CONTAINER_NAME" php -r '$e=@parse_ini_file(".env"); if(!$e||empty($e["DB_HOST"])){echo "unknown";exit;} $t=microtime(true); try{ new PDO("mysql:host=".$e["DB_HOST"].";port=".($e["DB_PORT"]??3306).";dbname=".$e["DB_DATABASE"],$e["DB_USERNAME"],$e["DB_PASSWORD"],[PDO::ATTR_TIMEOUT=>10]); echo round((microtime(true)-$t)*1000);}catch(Throwable $x){echo "error";}' 2>/dev/null)"
+            printf '    database connection from the app: %s\n' "$( [[ "$dbms" =~ ^[0-9]+$ ]] && echo "${dbms} ms" || echo "${dbms:-unknown}" )"
+        else
+            dbms=""
+        fi
+        # interpretation
+        if awk -v a="$t1" -v b="$t2" 'BEGIN{exit !(a>1.5 && b<a/2)}'; then
+            echo "    -> COLD START: the first request after a quiet moment is slow, the next ones are fast."
+            if is_next; then echo "       Next.js starts instantly once running; check that the container is not being restarted (docker ps)."
+            else echo "       Laravel: keep PHP workers ready (Performance tuning -> option 4, 'dynamic')."; fi
+        elif awk -v a="$t1" -v b="$t2" -v c="$t3" 'BEGIN{exit !(a>1.5 && b>1.5 && c>1.5)}'; then
+            echo "    -> EVERY request is slow on the server itself: heavy code, slow database, or too little RAM."
+        elif awk -v a="$t2" -v b="$pub" 'BEGIN{exit !(b>1.5 && b>a*3)}'; then
+            echo "    -> The server answers fast, but the public path is slow: DNS, IPv6 (an AAAA record that does not reach this server) or the network."
+        else
+            echo "    -> Response times look healthy."
+        fi
+        if [[ "${dbms:-}" =~ ^[0-9]+$ ]] && [ "$dbms" -gt 1000 ]; then
+            echo "    -> The database connection is slow (${dbms} ms): MariaDB tuning (option 3, skip-name-resolve) usually fixes this."
+        fi
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    [ "$found" -eq 1 ] || info "No projects yet."
+}
+
+menu_perf() {
+    local c
+    while true; do
+        clear; banner "7) Performance tuning" "$C_BLUE"
+        explain "Nothing is changed until you apply it. Suggested values are based on a scan of this server." ""
+        if perf_applied; then printf '  Nginx tuning: %sAPPLIED%s\n\n' "$C_GREEN" "$C_RESET"; else printf '  Nginx tuning: not applied (sites use the original settings)\n\n'; fi
+        echo " 1) Scan this server and show suggested settings"
+        echo " 2) Nginx tuning (compression, keep-alive, static file caching)"
+        echo " 3) MariaDB tuning (memory, connections, faster connections)"
+        echo " 4) PHP-FPM tuning for a Laravel project (keep workers warm)"
+        echo " 5) Find out why a site is slow on first load (diagnosis)"
+        echo " 6) Turn Nginx tuning off (back to the original settings)"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item perf_show_scan ;;
+            2) run_item perf_apply_nginx ;;
+            3) run_item perf_apply_mariadb ;;
+            4) run_item perf_apply_fpm ;;
+            5) run_item perf_diagnose ;;
+            6) run_item perf_disable_nginx ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -3367,7 +4463,7 @@ menu_services() {
 
 usage() {
     cat <<EOF
-HiDeploy $HIDEPLOY_VERSION — deploy Laravel projects from GitLab to your own server
+HiDeploy $HIDEPLOY_VERSION — deploy Laravel and Next.js projects from GitLab to your own server
 
 Usage:
   sudo hideploy            open the interactive menu
@@ -3409,9 +4505,10 @@ main() {
         echo " 1) Prepare Server              (once per server: Docker, runner, network)"
         echo " 2) Shared Services             (once per server: nginx + MariaDB + SSL auto-renew)"
         echo " 3) Generate Project Files      (Dockerfile, compose, CI for your repository)"
-        echo " 4) Deploy New Laravel Project  (for every new site)"
+        echo " 4) Deploy New Project  (for every new site)"
         echo " 5) Manage Projects             (deploy, logs, backup, SSL, remove)"
         echo " 6) Backups                     (automatic, encrypted, copied off the server)"
+        echo " 7) Performance tuning          (nginx, MariaDB, PHP-FPM: faster pages, less cold start)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -3421,6 +4518,7 @@ main() {
             4) deploy_wizard ;;
             5) menu_manage ;;
             6) menu_backups ;;
+            7) menu_perf ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
