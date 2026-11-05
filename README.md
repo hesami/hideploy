@@ -1,14 +1,14 @@
 # HiDeploy
 
-**Deploy GitLab-hosted Laravel projects to your own server, one command and one menu, as many projects as you like.**
+**Deploy GitLab-hosted Laravel and Next.js projects to your own server, one command and one menu, as many projects as you like.**
 
-HiDeploy prepares a fresh Ubuntu server once, then deploys and manages Laravel projects from a single interactive menu. After the first deployment, every `git push` to your branch redeploys automatically through GitLab CI.
+HiDeploy prepares a fresh Ubuntu server once, then deploys and manages Laravel (PHP) and Next.js (Node) projects from a single interactive menu. After the first deployment, every `git push` to your branch redeploys automatically through GitLab CI.
 
 ```
 git push  →  GitLab pipeline  →  build  →  migrate  →  live
 ```
 
-> **Scope:** HiDeploy targets **Laravel (PHP)** projects hosted on **GitLab** (it uses GitLab Runner for CI/CD). The tool itself is hosted on GitHub.
+> **Scope:** HiDeploy targets **Laravel (PHP)** and **Next.js (Node)** projects hosted on **GitLab** (it uses GitLab Runner for CI/CD). The tool itself is hosted on GitHub.
 
 ---
 
@@ -75,7 +75,7 @@ sudo install -m 755 hideploy.sh /usr/local/bin/hideploy
 
 - An **Ubuntu** server with root access (tested on Ubuntu; Debian should work but is untested)
 - A **domain** whose A record points to the server
-- A **GitLab** repository (SSH URL) containing a Laravel project
+- A **GitLab** repository (SSH URL) containing a Laravel or Next.js project
 - A GitLab runner token (created in GitLab: *Settings → CI/CD → Runners → New project runner*)
 
 HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
@@ -88,9 +88,10 @@ HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 1) Prepare Server              →  Docker, GitLab Runner, shared network
 2) Shared Services             →  nginx + MariaDB + SSL auto-renew (+ optional phpMyAdmin)
 3) Generate Project Files      →  Dockerfile, compose, CI for your repository
-4) Deploy New Laravel Project  →  the deployment wizard
+4) Deploy New Project          →  the deployment wizard (Laravel or Next.js)
 5) Manage Projects             →  deploy, logs, backups, restore, SSL, remove
 6) Backups                     →  automatic, encrypted, copied off the server
+7) Performance tuning          →  nginx, MariaDB, PHP-FPM sized for your server, cold-start diagnosis
 ```
 
 On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**. Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status and the recommended next step.
@@ -99,7 +100,7 @@ On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A
 
 ## Deploying a project
 
-Choose **3) Generate Project Files**, copy the four generated files into your Laravel project, commit and push them. Then choose **4) Deploy New Laravel Project**. The wizard handles:
+Choose **3) Generate Project Files** (pick Laravel or Next.js), copy the four generated files into your project, commit and push them. Then choose **4) Deploy New Project**. For Laravel the wizard handles:
 
 1. Domain and DNS check
 2. Repository access (read-only deploy key)
@@ -125,6 +126,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Feature | Where |
 |---|---|
 | Shared nginx + MariaDB, one container per project | Shared Services |
+| **Next.js projects** (standalone build, pnpm / npm / yarn, health-checked deployments) | Deploy New Project → Next.js |
+| **Performance tuning** sized from a scan of your server (nginx, MariaDB, PHP-FPM) and a first-load diagnosis | Performance tuning |
 | Automatic SSL issuance and daily renewal | Shared Services / SSL Management |
 | SSL overview: expiry dates, days left, file paths, forced renewal | Manage Projects → SSL management |
 | Frontend (Vite) build in a temporary Node container; npm, pnpm or yarn detected from the lock file | Project menu → Frontend assets |
@@ -168,6 +171,7 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | SSL certificates | `/var/www/infrastructure/nginx/letsencrypt` |
 | Database backups (manual) | `/var/backups/hideploy` |
 | Automatic backups (local copies) | `/var/backups/hideploy/auto` |
+| Performance settings / nginx tuning file | `/var/www/infrastructure/performance.env` / `.../nginx/conf.d/10-hideploy-performance.conf` |
 | Backup settings, passphrase, destination keys | `/var/www/infrastructure/backup` (root only; never included in a backup) |
 | Backup schedule / log | `/etc/cron.d/hideploy-backup` / `/var/log/hideploy-backup.log` |
 | Deployment history | `/var/www/projects/<domain>/.deploy.history` |
@@ -176,6 +180,37 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 
 Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
+
+---
+
+## Next.js projects
+
+In **Deploy New Project** choose *Next.js*. Each project is one container running the compiled **standalone** app (`node server.js`); nginx forwards the domain to it. Unlike Laravel, the code lives **inside the image**, so a deployment builds a new image while the current version keeps serving, then waits for the new container to be **healthy**.
+
+**Your project needs:**
+- `output: 'standalone'` in `next.config.js` / `.mjs` / `.ts`
+- a committed lock file (`pnpm-lock.yaml`, `package-lock.json` or `yarn.lock`)
+- the four generated files (menu 3 -> *Next.js*): a multi-stage `Dockerfile`, `docker-compose.prod.yml`, `.dockerignore`, `.gitlab-ci.yml`
+
+**pnpm is the default** (fast, with a build cache). To migrate from npm: run `pnpm import` locally, commit `pnpm-lock.yaml`, delete `package-lock.json`. The wizard detects your lock file and warns if it does not match the Dockerfile.
+
+**Environment variables.** The server keeps `/var/www/projects/<domain>/.env` (never in git). The container reads it at start; edit it from the project menu and the container is recreated. Variables starting with `NEXT_PUBLIC_` are baked into the JavaScript at **build** time, so change them and then run *Manual deploy* (or push). Write a literal `$` as `$$`.
+
+**Database (optional).** Same shared MariaDB, own user per project. HiDeploy writes `DATABASE_URL` (password URL-encoded) plus `DB_HOST`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`; backup, restore and the phpMyAdmin tool work as for Laravel.
+
+**Same safety net.** History, one-step rollback, nightly encrypted backups, SSL and disk cleanup all work for Next.js. While the container restarts, nginx shows the friendly maintenance page; a failed build leaves the previous version running. Memory: a Next.js app needs about 256-512 MB at runtime, and the **build needs about 1 GB** (add swap on small servers).
+
+---
+
+## Performance tuning
+
+Open **7) Performance tuning**. **Nothing is applied automatically**: until you apply a profile, your nginx configuration and containers stay exactly as they were. Suggested values come from a scan of the server (CPU cores, RAM, swap, disk type, your projects' memory limits); press Enter to accept a suggestion or type your own.
+
+1. **Scan:** shows what the server has and the suggested settings.
+2. **Nginx tuning:** compression level, keep-alive, `open_file_cache`, browser caching for Laravel static files (`/build/` is immutable), and an nginx cache for Next.js `/_next/static/` files that keeps serving while a container restarts. nginx tests the new configuration first and keeps the old one if it is rejected. *Option 6 removes it again.*
+3. **MariaDB tuning:** buffer pool and connection limits, plus `skip-name-resolve` (avoids a reverse-DNS lookup on every connection, a classic cause of multi-second delays). MariaDB restarts for 10-30 seconds, so HiDeploy asks first and restores the previous settings if it does not come back healthy.
+4. **PHP-FPM tuning (Laravel):** `ondemand` (light on RAM, but the first visit after a quiet moment waits for a worker) or `dynamic` (keeps workers ready). Needs the newest generated Dockerfile and compose file (menu 3); older projects keep working unchanged.
+5. **Diagnosis:** measures each site (DNS, connection, first byte, database connection) and tells you whether you see a *cold start*, a slow database, slow code, or a DNS/IPv6/network problem.
 
 ---
 
@@ -262,7 +297,8 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] Disk usage warning and cleanup helper
 - [ ] Security hardening (firewall, fail2ban, automatic security updates)
 - [ ] Project management after deployment (change domain, `www`/extra domains, memory, Redis)
-- [ ] Next.js project type
+- [x] Next.js project type
+- [x] Performance tuning sized from a server scan
 - [ ] Per-project resource alerts
 - [ ] Debian testing
 
