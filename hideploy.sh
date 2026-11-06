@@ -24,7 +24,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.3.0"
+HIDEPLOY_VERSION="1.4.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -76,6 +76,11 @@ CLEANUP_LOG="/var/log/hideploy-cleanup.log"
 # Performance tuning
 PERF_CONF="$INFRA_DIR/performance.env"
 PERF_NGINX_CONF="$NGINX_DIR/conf.d/10-hideploy-performance.conf"
+
+# Redis (optional shared service)
+REDIS_CONTAINER="global-redis"
+REDIS_DIR="$INFRA_DIR/redis"
+REDIS_IMAGE="redis:7-alpine"
 
 DEPLOY_MAINT_ON="no"                       # set while a deployment keeps the site in maintenance mode
 
@@ -328,6 +333,7 @@ show_status() {
     container_row "MariaDB container" "$DB_CONTAINER"
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
     pma_status_row
+    redis_status_row
     bk_status_row
     disk_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
@@ -741,7 +747,7 @@ RUN set -eu; \
 
 # PHP-FPM pool. The values come from environment variables: the defaults below are low-memory friendly and the
 # server can change them (main menu 7 -> Performance tuning) through docker-compose.prod.yml and .deploy.env.
-ENV FPM_PM=ondemand FPM_MAX_CHILDREN=5 FPM_START_SERVERS=2 FPM_MIN_SPARE=1 FPM_MAX_SPARE=3 FPM_IDLE_TIMEOUT=10s FPM_MAX_REQUESTS=500
+ENV FPM_PM=ondemand FPM_MAX_CHILDREN=5 FPM_START_SERVERS=2 FPM_MIN_SPARE=1 FPM_MAX_SPARE=3 FPM_IDLE_TIMEOUT=10s FPM_MAX_REQUESTS=500 PHP_UPLOAD_MAX=50M
 RUN printf '%s\n' \
       '[www]' \
       'user = app' \
@@ -754,8 +760,8 @@ RUN printf '%s\n' \
       'pm.process_idle_timeout = ${FPM_IDLE_TIMEOUT}' \
       'pm.max_requests = ${FPM_MAX_REQUESTS}' \
       'php_admin_value[memory_limit] = 256M' \
-      'php_admin_value[upload_max_filesize] = 50M' \
-      'php_admin_value[post_max_size] = 50M' \
+      'php_admin_value[upload_max_filesize] = ${PHP_UPLOAD_MAX}' \
+      'php_admin_value[post_max_size] = ${PHP_UPLOAD_MAX}' \
     > /usr/local/etc/php-fpm.d/zz-laravel.conf \
  && printf '%s\n' \
       'expose_php = 0' \
@@ -831,6 +837,7 @@ services:
       FPM_MAX_SPARE: ${FPM_MAX_SPARE:-3}
       FPM_IDLE_TIMEOUT: ${FPM_IDLE_TIMEOUT:-10s}
       FPM_MAX_REQUESTS: ${FPM_MAX_REQUESTS:-500}
+      PHP_UPLOAD_MAX: ${UPLOAD_MAX:-50M}
     volumes:
       - ${APP_PATH}:${APP_PATH}
     networks:
@@ -1131,6 +1138,7 @@ write_vhost() {
             echo "}"
         fi
     } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__ROOT__|$root|g" > "$out"
+    vhost_postprocess "$out" "$domain" "$mode"
 }
 
 nginx_test_reload() {
@@ -1198,7 +1206,9 @@ ssl_setup() {
     ask "Email for expiry notices" "$(cfg_get ADMIN_EMAIL || true)" email
     [ -n "$email" ] || { err "Email is required."; return 1; }
     cfg_set ADMIN_EMAIL "$email"
-    if certbot_run certonly --webroot -w /var/www/certbot -d "$domain" \
+    local -a dargs=(-d "$domain"); local al
+    for al in $(kv_get "$PROJECTS_DIR/$domain/.deploy.env" ALIASES); do dargs+=(-d "$al"); done
+    if certbot_run certonly --webroot -w /var/www/certbot "${dargs[@]}" --expand \
             --email "$email" --agree-tos --no-eff-email --non-interactive; then
         apply_vhost "$domain" "$container" https "$kind" || return 1
         ok "HTTPS enabled for $domain (certificate valid for $(cert_days "$domain") days)."
@@ -2408,6 +2418,7 @@ write_next_vhost() {
             echo "}"
         fi
     } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__PORT__|$port|g" > "$out"
+    vhost_postprocess "$out" "$domain" "$mode"
 }
 
 # ---------- project menu ---------------------------------------------------
@@ -2432,6 +2443,7 @@ menu_project_next() {
         echo "10) Restore database from a .sql / .sql.gz file"
         echo "11) Deployments: history, rollback"
         echo "12) Remove this project"
+        echo "13) Project settings: domains, memory, Redis, upload size"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -2459,6 +2471,7 @@ menu_project_next() {
             10) project_restore_db "$path"; pause ;;
             11) project_deploy_menu "$path" ;;
             12) project_remove "$path"; pause; return ;;
+            13) project_settings_menu "$path" ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -2761,6 +2774,7 @@ menu_project() {
         echo "12) Restore database from a .sql / .sql.gz file"
         echo "13) Deployments: history, rollback, maintenance mode"
         echo "14) Remove this project"
+        echo "15) Project settings: domains, memory, Redis, upload size"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -2793,6 +2807,7 @@ menu_project() {
             12) project_restore_db "$path"; pause ;;
             13) project_deploy_menu "$path" ;;
             14) project_remove "$path"; pause; return ;;
+            15) project_settings_menu "$path" ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -4404,6 +4419,385 @@ menu_perf() {
 }
 
 # ============================================================================
+# PROJECT SETTINGS (after deployment): memory, extra domains, main domain, Redis, upload size
+# ============================================================================
+
+env_unset() { [ -f "$1" ] && sed -i "/^$2=/d" "$1"; return 0; }
+
+# Called at the end of write_vhost / write_next_vhost: applies per-project extra domains and upload size.
+# Does nothing (the vhost stays byte-for-byte the same) when the project has neither.
+vhost_postprocess() {   # FILE DOMAIN MODE
+    local f="$1" domain="$2" mode="$3" env="$PROJECTS_DIR/$2/.deploy.env" aliases maxb
+    aliases="$(kv_get "$env" ALIASES)"; maxb="$(kv_get "$env" UPLOAD_MAX)"
+    if [ -n "$maxb" ] && [ "$maxb" != "50M" ]; then sed -i "s/client_max_body_size 50M;/client_max_body_size ${maxb};/" "$f"; fi
+    [ -n "$aliases" ] || return 0
+    awk -v d="$domain" -v a="$aliases" 'BEGIN { done = 0 } { if (!done && $0 == "    server_name " d ";") { print "    server_name " d " " a ";"; done = 1 } else print }' "$f" > "$f.tmp" \
+        && cat "$f.tmp" > "$f"; rm -f "$f.tmp"
+    if [ "$mode" = "https" ]; then
+        {
+            echo ""
+            echo "# Extra domains: permanent redirect to the main domain"
+            echo "server {"
+            echo "    listen 443 ssl;"
+            echo "    http2 on;"
+            echo "    server_name $aliases;"
+            echo "    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;"
+            echo "    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;"
+            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "    ssl_session_cache shared:SSL:10m;"
+            echo '    return 301 https://'"$domain"'$request_uri;'
+            echo "}"
+        } >> "$f"
+    fi
+}
+
+project_overview() {
+    local path="$1" domain env aliases db redis
+    load_project "$path" || return 1
+    domain="$(basename "$path")"; env="$path/.deploy.env"
+    aliases="$(kv_get "$env" ALIASES)"
+    db="$(env_get "$path/.env" DB_DATABASE)"
+    if [ "$(env_get "$path/.env" REDIS_HOST)" = "$REDIS_CONTAINER" ] || [[ "$(env_get "$path/.env" REDIS_URL)" == *"$REDIS_CONTAINER"* ]]; then redis="yes"; else redis="no"; fi
+    section "Settings: $domain"
+    printf '  %-22s %s\n' "Type" "${PROJECT_TYPE:-laravel}"
+    printf '  %-22s %s\n' "Main domain" "$domain"
+    printf '  %-22s %s\n' "Extra domains" "${aliases:-none}"
+    printf '  %-22s %s\n' "Git branch" "${BRANCH:-main}"
+    printf '  %-22s %s (%s)\n' "Container" "$CONTAINER_NAME" "$(container_running "$CONTAINER_NAME" && echo running || echo stopped)"
+    printf '  %-22s %s\n' "Memory limit" "${MEM_LIMIT:-512m}"
+    printf '  %-22s %s\n' "Upload size limit" "$(kv_get "$env" UPLOAD_MAX | sed 's/^$/50M (default)/')"
+    printf '  %-22s %s\n' "Database" "$([ "${USE_DATABASE:-yes}" = yes ] && echo "${db:-configured}" || echo none)"
+    printf '  %-22s %s\n' "Shared Redis" "$redis"
+    if ! is_next; then
+        printf '  %-22s %s\n' "PHP-FPM" "$(kv_get "$env" FPM_PM | sed 's/^$/ondemand (default)/'), max workers $(kv_get "$env" FPM_MAX_CHILDREN | sed 's/^$/5 (default)/')"
+        printf '  %-22s %s\n' "Frontend build" "${FRONTEND_BUILD:-no}"
+    fi
+}
+
+project_set_memory() {
+    local path="$1" cur new nm mb min total fm
+    load_project "$path" || return 1
+    section "Memory limit"
+    cur="${MEM_LIMIT:-512m}"
+    min=384; is_next && min=256
+    perf_scan
+    explain "The container is restarted with the new limit (a few seconds; visitors see the friendly page)." \
+            "Current limit: $cur. This server has ${PS_RAM_MB} MB of RAM; all project limits together: ${PS_PROJ_MEM_MB} MB."
+    while true; do
+        ask "New memory limit (e.g. 512m or 1g)" "$cur" new
+        [[ "$new" =~ ^[0-9]+$ ]] && info "No unit given: using ${new}m (m = megabytes)."
+        nm="$(normalize_mem "$new")" || { err "Use a number with a unit, like 512m or 1g."; continue; }
+        mb="$(mem_to_mb "$nm")"
+        if [ "$mb" -lt "$min" ]; then warn "$nm is low for this kind of project (about $min MB or more is comfortable)."; confirm "Use $nm anyway?" n || continue; fi
+        break
+    done
+    total=$(( PS_PROJ_MEM_MB - $(mem_to_mb "$(normalize_mem "$cur" 2>/dev/null || echo 512m)") + mb ))
+    if [ "$total" -gt $(( PS_RAM_MB * 80 / 100 )) ]; then warn "All project limits together would be ${total} MB, more than 80% of this server's RAM (${PS_RAM_MB} MB)."; fi
+    if ! is_next; then
+        fm="$(kv_get "$path/.deploy.env" FPM_MAX_CHILDREN)"
+        if [ -n "$fm" ] && [ $(( fm * 50 + 100 )) -gt "$mb" ]; then warn "$fm PHP workers may need about $(( fm * 50 + 100 )) MB: lower them in Performance tuning -> option 4."; fi
+    fi
+    confirm "Apply $nm now?" y || { info "Cancelled."; return 0; }
+    env_set "$path/.deploy.env" MEM_LIMIT "$nm"
+    is_next && env_set "$path/.deploy.env" NODE_HEAP_MB "$(( mb * 70 / 100 ))"
+    dc up -d || { err "Could not recreate the container."; return 1; }
+    if is_next; then wait_healthy; else wait_container; fi && ok "Memory limit is now $nm."
+}
+
+project_alias_add() {
+    local path="$1" domain kind list alias sug mode email a
+    local -a dargs
+    load_project "$path" || return 1
+    domain="$(basename "$path")"; kind="${PROJECT_TYPE:-laravel}"
+    list="$(kv_get "$path/.deploy.env" ALIASES)"
+    section "Add an extra domain"
+    explain \
+        "Visitors of the extra domain are redirected permanently to the main domain ($domain)." \
+        "Typical use: www.$domain -> $domain. The SSL certificate is extended to cover the new name."
+    if [[ "$domain" == www.* ]]; then sug="${domain#www.}"; else sug="www.$domain"; fi
+    while true; do ask "Extra domain" "$sug" alias; alias="${alias,,}"; valid_domain "$alias" && break; err "Invalid domain."; done
+    [ "$alias" != "$domain" ] || { err "That is the main domain."; return 1; }
+    [[ " $list " != *" $alias "* ]] || { err "$alias is already added."; return 1; }
+    [ ! -f "$NGINX_DIR/conf.d/$alias.conf" ] || { err "$alias is already used by another site on this server."; return 1; }
+    explain "Create an A record for $alias pointing to this server first."
+    if ! dns_check "$alias"; then warn "DNS for $alias does not point to this server yet."; confirm "Continue anyway? (the certificate will fail until DNS is correct)" n || return 1; fi
+    list="${list:+$list }$alias"
+    if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ]; then
+        email="$(cfg_get ADMIN_EMAIL || true)"
+        [ -n "$email" ] || { err "No admin email is saved yet. Run 'Setup / re-issue SSL' once first."; return 1; }
+        dargs=(-d "$domain"); for a in $list; do dargs+=(-d "$a"); done
+        info "Extending the SSL certificate to cover $alias ..."
+        certbot_run certonly --webroot -w /var/www/certbot "${dargs[@]}" --cert-name "$domain" --expand \
+            --email "$email" --agree-tos --no-eff-email --non-interactive \
+            || { err "The certificate request failed. Nothing was changed."; return 1; }
+        mode="https"
+    else
+        mode="http"
+    fi
+    env_set "$path/.deploy.env" ALIASES "$list"
+    apply_vhost "$domain" "$CONTAINER_NAME" "$mode" "$kind" || { err "nginx rejected the configuration."; env_set "$path/.deploy.env" ALIASES "$(kv_get "$path/.deploy.env" ALIASES | sed "s/ *$alias//")"; return 1; }
+    ok "$alias now redirects to $domain."
+}
+
+project_alias_remove() {
+    local path="$1" domain kind list a i=1 choice mode newlist=""
+    local -a items=()
+    load_project "$path" || return 1
+    domain="$(basename "$path")"; kind="${PROJECT_TYPE:-laravel}"
+    list="$(kv_get "$path/.deploy.env" ALIASES)"
+    [ -n "$list" ] || { info "This project has no extra domains."; return 0; }
+    for a in $list; do items+=("$a"); printf '   %d) %s\n' "$i" "$a"; i=$((i+1)); done
+    read -r -p "Remove which one? (number, 0 = cancel): " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#items[@]}" ] || { info "Cancelled."; return 0; }
+    for a in "${items[@]}"; do [ "$a" = "${items[$((choice-1))]}" ] || newlist="${newlist:+$newlist }$a"; done
+    env_set "$path/.deploy.env" ALIASES "$newlist"
+    if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ]; then mode="https"; else mode="http"; fi
+    apply_vhost "$domain" "$CONTAINER_NAME" "$mode" "$kind" && ok "${items[$((choice-1))]} was removed."
+    explain "The SSL certificate keeps listing the old name until its next re-issue. That is harmless."
+}
+
+project_change_domain() {
+    local path="$1" old new newpath kind pm tag typed
+    load_project "$path" || return 1
+    old="$(basename "$path")"; kind="${PROJECT_TYPE:-laravel}"
+    section "Change the main domain"
+    warn "This renames the project folder, moves nginx and SSL to the new name and restarts the container."
+    explain \
+        "Before you start: create an A record for the NEW domain pointing to this server." \
+        "After it finishes you must commit the NEW .gitlab-ci.yml (it contains the folder path), otherwise pipelines will fail." \
+        "Extra domains of this project are cleared; add them again afterwards (including the old domain, if you want it to redirect)."
+    while true; do ask "New main domain" "" new; new="${new,,}"; valid_domain "$new" && break; err "Invalid domain."; done
+    [ "$new" != "$old" ] || { err "That is the current domain."; return 1; }
+    newpath="$PROJECTS_DIR/$new"
+    { [ ! -e "$newpath" ] && [ ! -f "$NGINX_DIR/conf.d/$new.conf" ]; } || { err "$new is already used on this server."; return 1; }
+    if ! dns_check "$new"; then warn "DNS for $new does not point to this server yet."; confirm "Continue anyway? (SSL will fail until DNS is correct)" n || return 1; fi
+    read -r -p "${C_RED}Type the NEW domain to confirm ($new): ${C_RESET}" typed
+    [ "$typed" = "$new" ] || { info "Cancelled."; return 0; }
+    if [ "${USE_DATABASE:-yes}" = "yes" ] && confirm "Back up the database first (recommended)?" y; then project_backup "$path" || { err "Backup failed; cancelled."; return 1; }; fi
+    info "Stopping the container..."
+    dc down >/dev/null 2>&1 || { err "Could not stop the container."; return 1; }
+    if ! mv "$path" "$newpath"; then err "Could not rename the folder."; dc up -d >/dev/null 2>&1; return 1; fi
+    env_set "$newpath/.deploy.env" DOMAIN "$new"
+    env_set "$newpath/.deploy.env" APP_PATH "$newpath"
+    env_set "$newpath/.deploy.env" ALIASES ""
+    rm -f "$NGINX_DIR/conf.d/$old.conf"
+    load_project "$newpath" || return 1
+    apply_vhost "$new" "$CONTAINER_NAME" http "$kind" || warn "nginx could not be configured for $new yet."
+    info "Starting the container from the new folder..."
+    dc up -d || { err "The container did not start. Folder is now $newpath; check: docker logs $CONTAINER_NAME"; return 1; }
+    if is_next; then wait_healthy; else wait_container; fi
+    if [ "$kind" = "laravel" ]; then env_set "$newpath/.env" APP_URL "http://$new"; fi
+    if confirm "Issue the SSL certificate for $new now?" y; then
+        if ssl_setup "$new" "$CONTAINER_NAME" "$kind" && [ "$kind" = "laravel" ]; then env_set "$newpath/.env" APP_URL "https://$new"; fi
+    fi
+    if [ "$kind" = "laravel" ]; then artisan optimize:clear >/dev/null 2>&1; artisan optimize >/dev/null 2>&1; fi
+    if [ -d "$NGINX_DIR/letsencrypt/live/$old" ] && confirm "Delete the SSL certificate of the old domain ($old)?" y; then
+        certbot_run delete --cert-name "$old" --non-interactive >/dev/null 2>&1 && ok "Old certificate deleted."
+    fi
+    tag="$(cfg_get RUNNER_TAG || true)"; tag="${tag:-production}"; pm="pnpm"
+    grep -q 'yarn install' "$newpath/Dockerfile" 2>/dev/null && pm="yarn"
+    grep -q 'npm ci' "$newpath/Dockerfile" 2>/dev/null && pm="npm"
+    generate_project_files "$TEMPLATES_DIR/$new" "$new" "${BRANCH:-main}" "$tag" yes "$kind" "$pm" >/dev/null
+    ok "The main domain is now $new."
+    next_steps \
+        "Copy the new .gitlab-ci.yml into your project and push it:   scp root@SERVER_IP:$TEMPLATES_DIR/$new/.gitlab-ci.yml .   then   git add .gitlab-ci.yml && git commit -m 'New domain' && git push" \
+        "Update APP_URL / NEXT_PUBLIC_* values that mention the old domain (Edit .env)." \
+        "Re-add the old domain as an extra domain if you want it to redirect (Project settings -> Extra domains)."
+}
+
+project_set_upload() {
+    local path="$1" cur size
+    load_project "$path" || return 1
+    section "Upload size limit"
+    cur="$(kv_get "$path/.deploy.env" UPLOAD_MAX)"; cur="${cur:-50M}"
+    explain "The largest file or form a visitor may send (nginx and, for Laravel, PHP). Current: $cur."
+    while true; do ask "New limit (e.g. 10M, 50M, 200M, 1G)" "$cur" size; size="${size^^}"; [[ "$size" =~ ^[1-9][0-9]*[MG]$ ]] && break; err "Use a number with M or G."; done
+    env_set "$path/.deploy.env" UPLOAD_MAX "$size"
+    nginx_refresh_project "$path" || return 1
+    if is_next; then
+        explain "Next.js also has its own body limits inside the app (for example serverActions.bodySizeLimit); nginx now allows $size."
+    elif grep -q 'PHP_UPLOAD_MAX' "$path/docker-compose.prod.yml" 2>/dev/null; then
+        dc up -d >/dev/null 2>&1 && wait_container && ok "nginx and PHP now allow $size."
+    else
+        warn "nginx now allows $size, but PHP still uses the old limit: this project uses an older template."
+        explain "Regenerate the project files (main menu 3), copy them into your project, push and deploy to change PHP too."
+    fi
+}
+
+# ---------- shared Redis ----------
+
+redis_pass() { kv_get "$REDIS_DIR/.env" REDIS_PASSWORD; }
+
+redis_status_row() {
+    if [ ! -f "$REDIS_DIR/docker-compose.yml" ]; then status_row "Redis" dim "NOT SET UP" "optional: Shared Services -> Redis"
+    elif container_running "$REDIS_CONTAINER"; then status_row "Redis" good "RUNNING" "$REDIS_CONTAINER"
+    else status_row "Redis" warn "STOPPED" "start it: docker start $REDIS_CONTAINER"; fi
+}
+
+redis_install() {
+    section "Install shared Redis"
+    explain "One Redis container for ALL projects (cache, sessions, queues). It is password protected, not reachable from the internet, and keeps its data on disk."
+    docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
+    if container_running "$REDIS_CONTAINER"; then ok "Redis is already running."; return 0; fi
+    perf_scan
+    local def mb pass i status=""
+    if [ "$PS_RAM_MB" -lt 1500 ]; then def=64; elif [ "$PS_RAM_MB" -lt 3500 ]; then def=128; else def=256; fi
+    while true; do ask "Memory Redis may use for data, in MB (suggested for this server)" "$def" mb; [[ "$mb" =~ ^[0-9]+$ ]] && [ "$mb" -ge 16 ] && [ "$mb" -le 4096 ] && break; err "Enter a number from 16 to 4096."; done
+    pass="$(gen_password)"
+    mkdir -p "$REDIS_DIR"; printf 'REDIS_PASSWORD=%s\n' "$pass" > "$REDIS_DIR/.env"; chmod 600 "$REDIS_DIR/.env"
+    cat > "$REDIS_DIR/docker-compose.yml" <<EOF
+services:
+  redis:
+    image: ${REDIS_IMAGE}
+    container_name: ${REDIS_CONTAINER}
+    restart: always
+    command: ["redis-server", "--requirepass", "\${REDIS_PASSWORD}", "--maxmemory", "${mb}mb", "--maxmemory-policy", "volatile-lru", "--appendonly", "yes", "--appendfsync", "everysec"]
+    environment:
+      REDIS_PASSWORD: \${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    mem_limit: $(( mb + 64 ))m
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"\$\$REDIS_PASSWORD\" ping 2>/dev/null | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - ${NETWORK}
+
+networks:
+  ${NETWORK}:
+    external: true
+
+volumes:
+  redis_data:
+EOF
+    docker compose -f "$REDIS_DIR/docker-compose.yml" up -d || { err "Redis failed to start."; return 1; }
+    for i in $(seq 1 20); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "$REDIS_CONTAINER" 2>/dev/null)"
+        [ "$status" = "healthy" ] && break
+        sleep 3
+    done
+    [ "$status" = "healthy" ] || { err "Redis is not healthy. Check: docker logs $REDIS_CONTAINER"; return 1; }
+    ok "Redis is running (data limit ${mb} MB, eviction only of keys that have an expiry, so queue jobs are never evicted)."
+    next_steps "Use it in a project: Manage Projects -> project -> Project settings -> Redis."
+}
+
+redis_remove() {
+    [ -f "$REDIS_DIR/docker-compose.yml" ] || { err "Redis is not installed."; return 1; }
+    warn "Projects that use Redis for cache, sessions or queues will fail until you switch them back."
+    confirm "Remove the Redis container?" n || return 0
+    if confirm "Also delete its stored data (queued jobs, cache)?" n; then docker compose -f "$REDIS_DIR/docker-compose.yml" down -v >/dev/null 2>&1; else docker compose -f "$REDIS_DIR/docker-compose.yml" down >/dev/null 2>&1; fi
+    rm -rf "$REDIS_DIR/docker-compose.yml"
+    ok "Redis removed."
+}
+
+menu_redis() {
+    local c
+    while true; do
+        clear; banner "Redis (optional)" "$C_BLUE"
+        redis_status_row; echo ""
+        echo " 1) Install shared Redis"
+        echo " 2) Show status"
+        echo " 3) Remove Redis"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item redis_install ;;
+            2) run_item docker ps -a --filter "name=$REDIS_CONTAINER" --format 'table {{.Names}}\t{{.Status}}' ;;
+            3) run_item redis_remove ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+project_redis_enable() {
+    local path="$1" pass client enc
+    load_project "$path" || return 1
+    container_running "$REDIS_CONTAINER" || { err "The shared Redis is not running. Install it first: Shared Services -> Redis."; return 1; }
+    pass="$(redis_pass)"
+    if is_next; then
+        enc="$(urlencode "$pass")"
+        env_set "$path/.env" REDIS_URL "redis://:${enc}@${REDIS_CONTAINER}:6379/0"
+        ok "REDIS_URL was added to .env."
+        dc up -d --force-recreate >/dev/null 2>&1 && wait_healthy
+        return 0
+    fi
+    if dexec php -m 2>/dev/null | grep -qix 'redis'; then client="phpredis"
+    elif [ -d "$APP_PATH/vendor/predis" ]; then client="predis"
+    else
+        err "Your Laravel app has no Redis client yet."
+        explain "On your computer, in the project:  composer require predis/predis   then commit, push and deploy. After that, come back here."
+        return 1
+    fi
+    env_set "$path/.env" REDIS_CLIENT "$client"
+    env_set "$path/.env" REDIS_HOST "$REDIS_CONTAINER"
+    env_set "$path/.env" REDIS_PASSWORD "$(env_quote "$pass")"
+    env_set "$path/.env" REDIS_PORT 6379
+    env_set "$path/.env" REDIS_PREFIX "${CONTAINER_NAME}_"
+    if confirm "Use Redis for the cache?" y; then env_set "$path/.env" CACHE_STORE redis; env_set "$path/.env" CACHE_DRIVER redis; env_set "$path/.env" CACHE_PREFIX "${CONTAINER_NAME}_cache_"; fi
+    if confirm "Use Redis for sessions? (everyone is logged out once)" n; then env_set "$path/.env" SESSION_DRIVER redis; fi
+    if confirm "Use Redis for queues? (jobs waiting in the old queue are NOT moved)" n; then env_set "$path/.env" QUEUE_CONNECTION redis; fi
+    artisan optimize:clear >/dev/null 2>&1; artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    ok "Redis is configured for $(basename "$path") (client: $client)."
+}
+
+project_redis_disable() {
+    local path="$1" k
+    load_project "$path" || return 1
+    if is_next; then env_unset "$path/.env" REDIS_URL; dc up -d --force-recreate >/dev/null 2>&1 && wait_healthy; ok "REDIS_URL removed."; return 0; fi
+    for k in CACHE_STORE CACHE_DRIVER; do [ "$(env_get "$path/.env" "$k")" = "redis" ] && env_set "$path/.env" "$k" file; done
+    [ "$(env_get "$path/.env" SESSION_DRIVER)" = "redis" ] && env_set "$path/.env" SESSION_DRIVER file
+    if [ "$(env_get "$path/.env" QUEUE_CONNECTION)" = "redis" ]; then
+        if [ "${USE_DATABASE:-yes}" = "yes" ]; then env_set "$path/.env" QUEUE_CONNECTION database; else env_set "$path/.env" QUEUE_CONNECTION sync; fi
+        warn "Jobs still waiting in Redis are not moved to the new queue."
+    fi
+    artisan optimize:clear >/dev/null 2>&1; artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    ok "The project no longer uses Redis."
+}
+
+project_redis_menu() {
+    local path="$1"
+    load_project "$path" || return 1
+    if [ "$(env_get "$path/.env" REDIS_HOST)" = "$REDIS_CONTAINER" ] || [[ "$(env_get "$path/.env" REDIS_URL)" == *"$REDIS_CONTAINER"* ]]; then
+        ok "This project uses the shared Redis."
+        confirm "Stop using Redis in this project?" n && project_redis_disable "$path"
+    else
+        info "This project does not use Redis yet."
+        confirm "Use the shared Redis in this project?" y && project_redis_enable "$path"
+    fi
+}
+
+project_settings_menu() {
+    local path="$1" c
+    while true; do
+        load_project "$path" || return
+        clear; banner "Project settings: $(basename "$path")" "$C_MAGENTA"
+        echo " 1) Show the project's settings"
+        echo " 2) Memory limit"
+        echo " 3) Extra domains (www and others, redirect to the main domain)"
+        echo " 4) Remove an extra domain"
+        echo " 5) Change the main domain"
+        echo " 6) Redis (use the shared Redis, or stop using it)"
+        echo " 7) Upload size limit"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) project_overview "$path"; pause ;;
+            2) project_set_memory "$path"; pause ;;
+            3) project_alias_add "$path"; pause ;;
+            4) project_alias_remove "$path"; pause ;;
+            5) project_change_domain "$path"; pause; return ;;
+            6) project_redis_menu "$path"; pause ;;
+            7) project_set_upload "$path"; pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -4447,6 +4841,7 @@ menu_services() {
         echo " 3) Enable SSL auto-renew"
         echo " 4) Show status"
         echo " 5) phpMyAdmin (optional: web UI for your databases, on its own domain)"
+        echo " 6) Redis (optional: fast cache, sessions and queues for all projects)"
         echo " A) Run ALL of the above in order"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
@@ -4454,6 +4849,7 @@ menu_services() {
             1) run_item step_nginx_install ;;   2) run_item step_mariadb_install ;;
             3) run_item step_renew_enable ;;    4) run_item services_status ;;
             5) menu_phpmyadmin ;;
+            6) menu_redis ;;
             [Aa]) run_item run_all_services ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
