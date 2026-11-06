@@ -94,6 +94,7 @@ HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 6) Backups                     →  automatic, encrypted, copied off the server
 7) Performance tuning          →  nginx, MariaDB, PHP-FPM sized for your server, cold-start diagnosis
 8) Security                    →  firewall with lockout guard, fail2ban, automatic security updates, SSH, security check
+9) Email                       →  your own mail server for every domain: mailboxes, DNS help, optional webmail
 ```
 
 On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**, and finally **`8`** (security). Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status (including firewall, fail2ban, automatic updates and SSH login) and the recommended next step.
@@ -147,6 +148,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **Firewall (UFW) with lockout guard:** detects the real SSH port, shows the rules first, switches itself off again if you do not confirm you can still log in | Security → Firewall |
 | **fail2ban for SSH** with safe defaults (your IP is never banned) | Security → fail2ban |
 | **Automatic security updates** (security patches only; automatic reboot is off by default) | Security → Automatic security updates |
+| **Own mail server, no outside SMTP/API service:** one shared server for all your domains; `info@example.com`, `noreply@example.com`, aliases; DKIM key, SPF/DMARC records generated and checked; a project can send through its own mailbox with one menu step | Email (main menu 9) / Project menu → Email |
+| **Webmail (Roundcube)** on its own domain: read and send mail in the browser; HTTPS, optional Basic Auth and IP list; start/stop on demand like phpMyAdmin | Email → Webmail |
 | **Keys-only SSH** (optional), with key check, `sshd -t`, backup and automatic undo | Security → Harden SSH |
 
 ---
@@ -187,6 +190,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Weekly cleanup schedule / log | `/etc/cron.d/hideploy-cleanup` / `/var/log/hideploy-cleanup.log` |
 | Generated project files | `/root/hideploy-templates/<domain>` |
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
+| Mail server: config (accounts, aliases, DKIM keys) / messages | `/var/www/infrastructure/mail/config` / `/var/www/infrastructure/mail/data` |
+| Webmail (optional) | `/var/www/infrastructure/webmail` |
 | Security settings, SSH backups and undo script | `/var/www/infrastructure/security` |
 | fail2ban jail (SSH) | `/etc/fail2ban/jail.d/hideploy-sshd.local` |
 | Automatic updates | `/etc/apt/apt.conf.d/20auto-upgrades` + `/etc/apt/apt.conf.d/52hideploy-unattended` |
@@ -296,6 +301,28 @@ Every successful deployment also removes the dangling images it leaves behind.
 
 ---
 
+## Email (your own mail server)
+
+Open **9) Email**. HiDeploy runs **one shared mail server** (Postfix + Dovecot + Rspamd, via [docker-mailserver](https://github.com/docker-mailserver/docker-mailserver)) for **all** your domains, the same way it shares one nginx and one MariaDB. You can send and receive mail for `info@example.com`, `noreply@example.org` and so on without any outside SMTP or API service.
+
+1. **Install the mail server** (once). You choose a hostname such as `mail.example.com` (A record to this server, **no AAAA record**); HiDeploy checks that outgoing port 25 is open, issues the certificate, starts the server, opens ports 25, 465, 587 and 993 and shows the DNS records of the server itself.
+2. **Mail domains → Add / enable.** Any domain works (it does not have to be a deployed project). HiDeploy creates a 2048-bit **DKIM** key and prints the exact **MX, SPF, DKIM and DMARC** records. *Check DNS* later compares them with what the internet really answers.
+3. **Mailboxes and aliases.** Create `info`, `noreply`, … (a strong password is generated if you press Enter). Passwords are stored only as hashes and never appear on a command line.
+4. **Webmail (optional).** Roundcube on its own domain with HTTPS, an optional browser login and IP list. Like phpMyAdmin it is **closed by default**: *Start* opens it, *Stop* makes the domain stop answering completely.
+5. **Deliverability check.** Ports, outgoing port 25, A/AAAA record, reverse DNS (PTR), certificate, blacklists, and the DNS of every mail domain. *Send a test email* sends through your own server and shows the delivery log.
+
+**Per project.** In a project's menu choose **Email for this project**: enable its domain, manage its mailboxes and let the project send through one of them. HiDeploy writes the SMTP settings into the project's `.env` (`MAIL_*` for Laravel, `SMTP_*` and `SMTP_URL` for Next.js). The project reaches the mail server through the internal Docker network by its real hostname, so the certificate is valid.
+
+**What no script can do for you**
+- **Reverse DNS (PTR)** of the server IP must point to the mail hostname. Only the company that owns the IP (your server provider) can set it.
+- **Outgoing port 25** must be open (some providers block it until you ask).
+- A **new or previously blacklisted IP** may land in spam at Gmail / Outlook for a while, whatever the configuration. Receiving mail and low-volume sending (confirmation and password-reset mails) normally work well; large mailings from a fresh IP do not.
+- Memory: expect roughly 600-900 MB of RAM in use (antivirus is off).
+
+**Backups.** Mail accounts, aliases and DKIM keys are part of the encrypted server-configuration backup. The messages are a separate encrypted file (`mail-data`) that you can switch off in *Email → Include mailboxes in the nightly backup*.
+
+---
+
 ## Automatic backups
 
 Open **6) Backups** and follow the recommended order shown at the top of the menu:
@@ -323,6 +350,7 @@ Each backup contains, per run: one file per project database, the project files 
 - MariaDB is not published to the internet; only containers on `web_network` can reach it.
 - Each project gets its **own database user** with access to its own database only.
 - phpMyAdmin is optional and **off by default**. When enabled it is protected by HTTPS and Basic Auth (plus an optional IP allow-list). Stop it when you are done: the domain then stops answering completely.
+- The mail server is **off until you install it**. Once installed it must be reachable from the internet (ports 25, 465, 587, 993); sending as another mailbox is blocked, and the mail server bans addresses that fail to log in repeatedly. The webmail is **closed by default**; open it only when needed.
 - Deploy keys are read-only.
 
 ---
@@ -348,7 +376,8 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] Frontend (Vite) builds, optional databases, backup/restore, phpMyAdmin
 - [ ] Web panel (Persian-friendly dashboard for the same actions)
 - [x] Automatic encrypted backups (SSH + S3)
-- [ ] Failure notifications (email / Telegram)
+- [x] Own mail server and webmail for every project domain
+- [ ] Failure notifications (email / Telegram), using your own mail server
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
 - [x] Security hardening (firewall with lockout guard, fail2ban, automatic security updates, SSH keys-only, security check)

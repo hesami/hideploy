@@ -9,6 +9,7 @@
 #   4) Deploy a new Laravel project (clone, DB, .env, container, vhost, SSL)
 #   5) Manage projects (logs, deploy, backup, SSL, remove)
 #   8) Security (firewall with lockout guard, fail2ban, automatic security updates, SSH, checks)
+#   9) Email (own mail server for all your domains: mailboxes, DKIM/SPF/DMARC help, optional webmail)
 #
 # Architecture (kept deliberately simple):
 #
@@ -25,7 +26,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.5.0"
+HIDEPLOY_VERSION="1.6.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -82,6 +83,17 @@ PERF_NGINX_CONF="$NGINX_DIR/conf.d/10-hideploy-performance.conf"
 REDIS_CONTAINER="global-redis"
 REDIS_DIR="$INFRA_DIR/redis"
 REDIS_IMAGE="redis:7-alpine"
+
+# Email (optional shared service: own mail server + optional webmail, main menu 9)
+MAIL_CONTAINER="global-mailserver"
+MAIL_DIR="$INFRA_DIR/mail"                 # config/ = accounts, aliases, DKIM keys (in every backup); data/ = messages
+MAIL_IMAGE="ghcr.io/docker-mailserver/docker-mailserver:latest"
+MAIL_DKIM_SELECTOR="mail"
+MAIL_PORTS="25 465 587 993"
+MAILWEB_CONTAINER="global-webmail"
+MAILWEB_DIR="$INFRA_DIR/webmail"
+MAILWEB_IMAGE="roundcube/roundcubemail:latest-apache"
+MAILWEB_HTPASSWD="$NGINX_DIR/conf.d/webmail.htpasswd"
 
 # Security (main menu 8)
 SEC_DIR="$INFRA_DIR/security"              # settings and SSH backups (no secrets)
@@ -344,6 +356,8 @@ show_status() {
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
     pma_status_row
     redis_status_row
+    mail_status_row
+    mailweb_status_row
     bk_status_row
     sec_status_rows
     disk_row
@@ -689,11 +703,14 @@ docker run --rm \
     __CERTBOT_IMAGE__ renew --quiet
 rc=$?
 if docker exec __NGINX_CONTAINER__ nginx -s reload >/dev/null 2>&1; then echo "nginx reloaded"; fi
+if docker inspect __MAIL_CONTAINER__ >/dev/null 2>&1; then
+    if docker exec __MAIL_CONTAINER__ sh -c 'postfix reload >/dev/null 2>&1; doveadm reload >/dev/null 2>&1'; then echo "mail server reloaded"; fi
+fi
 echo "[$(date -Is)] Finished (certbot exit code: $rc)"
 exit $rc
 EOF
     sed -i -e "s|__NGINX_DIR__|$NGINX_DIR|g" -e "s|__CERTBOT_IMAGE__|$CERTBOT_IMAGE|g" \
-           -e "s|__NGINX_CONTAINER__|$NGINX_CONTAINER|g" "$RENEW_SCRIPT"
+           -e "s|__NGINX_CONTAINER__|$NGINX_CONTAINER|g" -e "s|__MAIL_CONTAINER__|$MAIL_CONTAINER|g" "$RENEW_SCRIPT"
     chmod 755 "$RENEW_SCRIPT"
     printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n17 3 * * * root %s >> %s 2>&1\n' \
         "$RENEW_SCRIPT" "$RENEW_LOG" > "$RENEW_CRON"
@@ -1105,6 +1122,7 @@ EOF
 write_vhost() {
     local domain="$1" container="$2" mode="$3" out="$NGINX_DIR/conf.d/$1.conf" root
     if [ "${4:-laravel}" = "pma" ]; then write_pma_vhost "$domain" "$mode"; return; fi
+    if [ "${4:-laravel}" = "mailweb" ]; then write_mailweb_vhost "$domain" "$mode"; return; fi
     if [ "${4:-laravel}" = "nextjs" ]; then write_next_vhost "$domain" "$container" "$mode"; return; fi
     ensure_maintenance_page
     root="$PROJECTS_DIR/$domain/public"
@@ -2445,6 +2463,7 @@ menu_project_next() {
         echo "11) Deployments: history, rollback"
         echo "12) Remove this project"
         echo "13) Project settings: domains, memory, Redis, upload size"
+        echo "14) Email for this project (mailboxes, send mail through your own server)"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -2473,6 +2492,7 @@ menu_project_next() {
             11) project_deploy_menu "$path" ;;
             12) project_remove "$path"; pause; return ;;
             13) project_settings_menu "$path" ;;
+            14) project_mail_menu "$path" ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -2737,6 +2757,7 @@ project_remove() {
     load_project "$path" || return 1
     db="$(env_get "$path/.env" DB_DATABASE)"; dbuser="$(env_get "$path/.env" DB_USERNAME)"
     [ "$USE_DATABASE" = "yes" ] || { db=""; dbuser=""; }
+    local mdom; mdom="$(kv_get "$path/.deploy.env" MAIL_DOMAIN)"
     warn "This will stop the container, delete the nginx config and delete the folder $path"
     read -r -p "${C_RED}Type the domain name to confirm ($domain): ${C_RESET}" typed
     [ "$typed" = "$domain" ] || { info "Cancelled."; return 0; }
@@ -2750,6 +2771,9 @@ project_remove() {
         printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'%%';\n" "$db" "$(sql_escape "$dbuser")" | db_sql && ok "Database and user dropped."
     fi
     cd / && rm -rf "$path" && ok "Project folder removed."
+    if [ -n "$mdom" ] && mail_installed && mail_domain_registered "$mdom"; then
+        warn "The mail domain $mdom (and its mailboxes) still exists on the mail server. Remove it in main menu 9) Email -> Mail domains if you no longer need it."
+    fi
     next_steps "Remove the project's Deploy Key and pipeline in GitLab if you no longer need them."
 }
 
@@ -2776,6 +2800,7 @@ menu_project() {
         echo "13) Deployments: history, rollback, maintenance mode"
         echo "14) Remove this project"
         echo "15) Project settings: domains, memory, Redis, upload size"
+        echo "16) Email for this project (mailboxes, send mail through your own server)"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -2809,6 +2834,7 @@ menu_project() {
             13) project_deploy_menu "$path" ;;
             14) project_remove "$path"; pause; return ;;
             15) project_settings_menu "$path" ;;
+            16) project_mail_menu "$path" ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
@@ -3523,11 +3549,20 @@ bk_run_inner() {
         [ -n "$f" ] && [ -e "/$f" ] && extras+=("$f")
     done
     if [ -d "$INFRA_DIR" ]; then
-        if { tar -C / --exclude="${INFRA_DIR#/}/backup" -czf - "${INFRA_DIR#/}" "${extras[@]}" 2>/dev/null || [ $? -eq 1 ]; } \
+        if { tar -C / --exclude="${INFRA_DIR#/}/backup" --exclude="${INFRA_DIR#/}/mail/data" -czf - "${INFRA_DIR#/}" "${extras[@]}" 2>/dev/null || [ $? -eq 1 ]; } \
                 | bk_encrypt "$dir/server-config.tar.gz.gpg"; then
             echo "  server configuration: ok"
         else
             echo "  server configuration: FAILED"; fail=$((fail+1)); rm -f "$dir/server-config.tar.gz.gpg"
+        fi
+    fi
+
+    # 2b) mailboxes: the messages (accounts, passwords and DKIM keys are already inside the server configuration above)
+    if mail_installed && [ "$(bk_val INCLUDE_MAIL yes)" = "yes" ] && [ -d "$MAIL_DIR/data/mail-data" ]; then
+        if { tar -C "$MAIL_DIR/data" -czf - mail-data 2>/dev/null || [ $? -eq 1 ]; } | bk_encrypt "$dir/mail-data.tar.gz.gpg"; then
+            echo "  mailboxes: ok"
+        else
+            echo "  mailboxes: FAILED"; fail=$((fail+1)); rm -f "$dir/mail-data.tar.gz.gpg"
         fi
     fi
 
@@ -3637,6 +3672,7 @@ bk_status() {
         printf '  S3 bucket:           %s/%s%s/  (kept %s days)\n' "$(bk_get S3_BUCKET)" "${pre:+$pre/}" "$(bk_host)" "$(bk_val REMOTE_KEEP_DAYS 30)"
     else printf '  S3 bucket:           not configured\n'; fi
     printf '  Project files:       %s\n' "$([ "$(bk_val INCLUDE_FILES yes)" = yes ] && echo "included" || echo "not included")"
+    if mail_installed; then printf '  Mailboxes:           %s\n' "$([ "$(bk_val INCLUDE_MAIL yes)" = yes ] && echo "included" || echo "not included (Email menu, option 9)")"; fi
     if [ -f "$BK_DIR/last_run.txt" ]; then
         printf '  Last run:            %s - %s (%s, SSH: %s, S3: %s)\n' "$(kv_get "$BK_DIR/last_run.txt" TIME)" \
             "$(kv_get "$BK_DIR/last_run.txt" RESULT)" "$(kv_get "$BK_DIR/last_run.txt" SIZE)" \
@@ -3776,6 +3812,8 @@ bk_decrypt_menu() {
                              "  tar -xzf $out/${f%.gpg} -C /var/www/projects/<domain>" ;;
             server-config*) explain "Contents: nginx config, SSL certificates, runner config, hideploy settings (paths start without a leading slash)." \
                                     "Only on a rebuilt server, to bring everything back:  tar -xzf $out/${f%.gpg} -C /" ;;
+            mail-data*) explain "The messages of all mailboxes. To restore them (stop the mail server first: docker stop $MAIL_CONTAINER):" \
+                                "  tar -xzf $out/${f%.gpg} -C $MAIL_DIR/data   then   docker start $MAIL_CONTAINER" ;;
             db-*) explain "A database dump: restore it through the project menu (Manage Projects -> project -> Restore database) or option 8." ;;
         esac
         warn "Remember to delete $out when you are done."
@@ -4469,6 +4507,7 @@ project_overview() {
     printf '  %-22s %s\n' "Upload size limit" "$(kv_get "$env" UPLOAD_MAX | sed 's/^$/50M (default)/')"
     printf '  %-22s %s\n' "Database" "$([ "${USE_DATABASE:-yes}" = yes ] && echo "${db:-configured}" || echo none)"
     printf '  %-22s %s\n' "Shared Redis" "$redis"
+    printf '  %-22s %s\n' "Mail domain" "$(kv_get "$env" MAIL_DOMAIN | head -n1 | grep . || echo 'not enabled (menu: Email for this project)')"
     if ! is_next; then
         printf '  %-22s %s\n' "PHP-FPM" "$(kv_get "$env" FPM_PM | sed 's/^$/ondemand (default)/'), max workers $(kv_get "$env" FPM_MAX_CHILDREN | sed 's/^$/5 (default)/')"
         printf '  %-22s %s\n' "Frontend build" "${FRONTEND_BUILD:-no}"
@@ -5050,7 +5089,7 @@ sec_users_with_keys() {
 sec_file_issues() {
     SEC_BAD_FILES=()
     local f m p
-    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR"; do
+    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR" "$MAIL_DIR/config/postfix-accounts.cf"; do
         [ -e "$f" ] || continue
         m="$(stat -c %a "$f" 2>/dev/null)" || continue
         if (( (8#$m & 077) != 0 )); then SEC_BAD_FILES+=("$f|$m|priv"); fi
@@ -5127,7 +5166,10 @@ sec_report_ports() {
         if [ "$proto" = "tcp" ]; then
             if   [[ "$ssh_ports" == *" $pn "* ]]; then name="SSH"
             elif [ "$pn" = "80" ];  then name="HTTP"
-            elif [ "$pn" = "443" ]; then name="HTTPS"; fi
+            elif [ "$pn" = "443" ]; then name="HTTPS"
+            elif mail_installed && [[ " $MAIL_PORTS " == *" $pn "* ]]; then
+                case "$pn" in 25) name="Mail (SMTP)" ;; 465) name="Mail (SMTPS)" ;; 587) name="Mail (submission)" ;; *) name="Mail (IMAPS)" ;; esac
+            fi
         elif [ "$proto" = "udp" ] && [ "$pn" = "443" ]; then name="HTTPS (HTTP/3)"; fi
 
         if [ -n "$name" ]; then
@@ -5235,7 +5277,7 @@ sec_report() {
         sec_row dim "SSH server" "NOT FOUND" "sshd is not installed on this machine"
     fi
 
-    section "Ports reachable from outside (expected: SSH, 80, 443)"
+    section "Ports reachable from outside (expected: SSH, 80, 443, and the mail ports if the mail server is installed)"
     sec_report_ports
 
     section "Sensitive files"
@@ -5267,7 +5309,7 @@ sec_report() {
 sec_firewall_enable() {
     section "Firewall (UFW) with lockout protection"
     explain \
-        "Allows only SSH, HTTP (80) and HTTPS (443). Every other incoming connection is blocked." \
+        "Allows only SSH, HTTP (80) and HTTPS (443), plus the mail ports if the mail server is installed. Every other incoming connection is blocked." \
         "Safety net: right after the firewall is switched on you must confirm that you can still reach this server." \
         "If you do not confirm within about $((SEC_GUARD_SECS / 60)) minutes (or your connection drops), the firewall switches itself off again."
     local state ssh_in ssh_ports p ufw_bin existing
@@ -5293,6 +5335,7 @@ sec_firewall_enable() {
     for p in $ssh_ports; do echo "   allow      ${p}/tcp    SSH"; done
     echo "   allow      80/tcp     HTTP (websites, Let's Encrypt)"
     echo "   allow      443/tcp    HTTPS"
+    if mail_installed; then for p in $MAIL_PORTS; do echo "   allow      ${p}/tcp    Mail"; done; fi
     if has_cmd ufw; then
         existing="$(ufw show added 2>/dev/null | grep '^ufw ' || true)"
         if [ -n "$existing" ]; then
@@ -5310,6 +5353,7 @@ sec_firewall_enable() {
     ufw_bin="$(command -v ufw)"
     for p in $ssh_ports; do ufw allow "${p}/tcp" >/dev/null || { err "Could not add the rule for port $p."; return 1; }; done
     ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null || { err "Could not add the web rules."; return 1; }
+    if mail_installed; then for p in $MAIL_PORTS; do ufw allow "${p}/tcp" >/dev/null || { err "Could not add the rule for mail port $p."; return 1; }; done; fi
     ufw default deny incoming >/dev/null 2>&1; ufw default allow outgoing >/dev/null 2>&1
     sec_set SSH_PORTS "$ssh_ports"
 
@@ -5843,6 +5887,1299 @@ menu_security() {
 }
 
 # ============================================================================
+# EMAIL (main menu 9): your own mail server, mailboxes for every domain, optional webmail
+# ============================================================================
+# ONE shared mail server (docker-mailserver: Postfix + Dovecot + Rspamd) serves ALL your domains,
+# exactly like the shared nginx and MariaDB. A domain becomes a "mail domain" when you add it;
+# a mailbox (info@example.com, noreply@example.com, ...) is then created inside it.
+#
+# How the pieces connect:
+#   * The mail server gets the Docker network alias <mail hostname>, so your project containers and the
+#     webmail reach it by the SAME name as the outside world, and the Let's Encrypt certificate matches.
+#   * Mailboxes are plain lines in  $MAIL_DIR/config/postfix-accounts.cf  (password = SHA512-CRYPT hash),
+#     so a password never appears on a command line ("ps").
+#   * Webmail (Roundcube) is optional and closed by default: you open it when you need it, like phpMyAdmin.
+
+valid_mail_local() { [[ "$1" =~ ^[a-z0-9]([a-z0-9._+-]{0,62}[a-z0-9])?$ ]]; }
+valid_email() {
+    [[ "$1" == *@* ]] && [[ "$1" != *@*@* ]] || return 1
+    valid_mail_local "${1%@*}" && valid_domain "${1#*@}"
+}
+valid_mail_pass() { local re='^[A-Za-z0-9._%+=!@^*~-]{10,64}$'; [[ "$1" =~ $re ]]; }
+
+mail_installed() { [ -f "$MAIL_DIR/docker-compose.yml" ] && [ -n "$(cfg_get MAIL_FQDN || true)" ]; }
+mail_up()        { container_running "$MAIL_CONTAINER"; }
+mail_dc()        { docker compose -f "$MAIL_DIR/docker-compose.yml" "$@"; }
+mail_cmd()       { docker exec "$MAIL_CONTAINER" "$@"; }
+mail_accounts_file() { printf '%s/config/postfix-accounts.cf' "$MAIL_DIR"; }
+mail_virtual_file()  { printf '%s/config/postfix-virtual.cf' "$MAIL_DIR"; }
+
+mail_status_row() {
+    local f; f="$(cfg_get MAIL_FQDN || true)"
+    if ! mail_installed; then
+        status_row "Mail server" dim "NOT SET UP" "optional: main menu 9) Email"
+    elif mail_up; then
+        status_row "Mail server" good "RUNNING" "$f - $(mail_domains | wc -l) domain(s), $(mail_boxes | wc -l) mailbox(es)"
+    else
+        status_row "Mail server" bad "STOPPED" "start it: main menu 9) Email -> Start / stop"
+    fi
+}
+
+mailweb_configured() { [ -f "$MAILWEB_DIR/docker-compose.yml" ] && [ -n "$(cfg_get MAILWEB_DOMAIN || true)" ]; }
+mailweb_dc()         { docker compose -f "$MAILWEB_DIR/docker-compose.yml" "$@"; }
+
+mailweb_status_row() {
+    local d; d="$(cfg_get MAILWEB_DOMAIN || true)"
+    mail_installed || return 0
+    if [ -z "$d" ]; then
+        status_row "Webmail" dim "NOT SET UP" "optional: main menu 9) Email -> Webmail"
+    elif container_running "$MAILWEB_CONTAINER"; then
+        status_row "Webmail" warn "OPEN" "public at https://$d - close it when you are done"
+    else
+        status_row "Webmail" good "CLOSED" "https://$d (stopped, not reachable)"
+    fi
+}
+
+# ---------- registry of mail domains and mailboxes ---------------------------------------
+
+mail_domains() {
+    local -a arr=(); local d
+    IFS=',' read -ra arr <<< "$(cfg_get MAIL_DOMAINS || true)"
+    for d in "${arr[@]}"; do [ -n "$d" ] && printf '%s\n' "$d"; done
+    return 0
+}
+mail_domain_registered() { grep -qx -- "$1" <<<"$(mail_domains)"; }
+mail_domain_register() {
+    local cur
+    mail_domain_registered "$1" && return 0
+    cur="$(cfg_get MAIL_DOMAINS || true)"
+    cfg_set MAIL_DOMAINS "${cur:+$cur,}$1"
+}
+mail_domain_unregister() {
+    local d out=""
+    while read -r d; do [ -n "$d" ] && [ "$d" != "$1" ] && out+="${out:+,}$d"; done < <(mail_domains)
+    if [ -n "$out" ]; then cfg_set MAIL_DOMAINS "$out"; else cfg_unset MAIL_DOMAINS; fi
+}
+
+# mail_boxes [DOMAIN] -> one address per line
+mail_boxes() {
+    local f; f="$(mail_accounts_file)"; [ -f "$f" ] || return 0
+    awk -F'|' -v d="${1:-}" '{ n = split($1, a, "@"); if (n == 2 && (d == "" || a[2] == d)) print $1 }' "$f" | sort
+}
+mail_box_exists() { grep -qx -- "$1" <<<"$(mail_boxes)"; }
+
+# mail_aliases [DOMAIN] -> "alias target" per line
+mail_aliases() {
+    local f; f="$(mail_virtual_file)"; [ -f "$f" ] || return 0
+    awk -v d="${1:-}" 'NF >= 2 && $1 !~ /^#/ { n = split($1, a, "@"); if (n == 2 && (d == "" || a[2] == d)) print $1, $2 }' "$f" | sort
+}
+
+# mail_pick_domain VAR  -> choose one of the registered mail domains
+mail_pick_domain() {
+    local __var="$1" choice i=1 d
+    local -a list=()
+    mapfile -t list < <(mail_domains)
+    if [ "${#list[@]}" -eq 0 ]; then err "No mail domain yet. Add one first (Email -> Mail domains)."; return 1; fi
+    if [ "${#list[@]}" -eq 1 ]; then printf -v "$__var" '%s' "${list[0]}"; return 0; fi
+    echo ""
+    for d in "${list[@]}"; do printf '   %2d) %s\n' "$i" "$d"; i=$((i+1)); done
+    echo "    0) Cancel"
+    while true; do
+        read -r -p "${C_YELLOW}Select a domain: ${C_RESET}" choice
+        [ "$choice" = "0" ] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ]; then
+            printf -v "$__var" '%s' "${list[$((choice-1))]}"; return 0
+        fi
+        err "Invalid selection."
+    done
+}
+
+# mail_pick_box VAR [DOMAIN] -> choose one existing mailbox
+mail_pick_box() {
+    local __var="$1" choice i=1 b
+    local -a list=()
+    mapfile -t list < <(mail_boxes "${2:-}")
+    if [ "${#list[@]}" -eq 0 ]; then err "There is no mailbox${2:+ for $2} yet."; return 1; fi
+    echo ""
+    for b in "${list[@]}"; do printf '   %2d) %s\n' "$i" "$b"; i=$((i+1)); done
+    echo "    0) Cancel"
+    while true; do
+        read -r -p "${C_YELLOW}Select a mailbox: ${C_RESET}" choice
+        [ "$choice" = "0" ] && return 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ]; then
+            printf -v "$__var" '%s' "${list[$((choice-1))]}"; return 0
+        fi
+        err "Invalid selection."
+    done
+}
+
+# ---------- passwords and accounts -------------------------------------------------------
+
+# Sets MAIL_NEW_PASS / MAIL_PASS_GENERATED
+mail_ask_pass() {
+    local pass pass2
+    MAIL_NEW_PASS=""; MAIL_PASS_GENERATED="no"
+    while true; do
+        ask_secret "Password (Enter = generate a strong one; or 10-64 characters: letters, digits, . _ % + = ! @ ^ * ~ -)" pass
+        if [ -z "$pass" ]; then MAIL_NEW_PASS="$(gen_password)"; MAIL_PASS_GENERATED="yes"; return 0; fi
+        valid_mail_pass "$pass" || { err "Use 10-64 characters from: letters, digits and . _ % + = ! @ ^ * ~ -  (no spaces, quotes or \$)."; continue; }
+        ask_secret "Repeat password" pass2
+        [ "$pass" = "$pass2" ] && { MAIL_NEW_PASS="$pass"; return 0; }
+        err "Passwords do not match."
+    done
+}
+
+# mail_account_write ADDRESS PASSWORD — adds the mailbox or replaces its password.
+# The hash is made by openssl reading the password from stdin, so it never shows up in "ps".
+mail_account_write() {
+    local addr="$1" pass="$2" f hash tmp
+    f="$(mail_accounts_file)"
+    mkdir -p "$(dirname "$f")"; touch "$f"; chmod 600 "$f"
+    hash="$(printf '%s' "$pass" | openssl passwd -6 -stdin 2>/dev/null)" || return 1
+    [[ "$hash" == '$6$'* ]] || return 1
+    tmp="$(mktemp)"
+    awk -F'|' -v a="$addr" '$1 != a' "$f" > "$tmp"
+    printf '%s|{SHA512-CRYPT}%s\n' "$addr" "$hash" >> "$tmp"
+    cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+# mail_smtp_py MODE USER PASS [TO SUBJECT BODY] — talks to the local mail server on port 587 (STARTTLS).
+#   MODE login: only checks that the login works.   MODE send: sends one message.
+# Values travel in environment variables, never on a command line. Returns 2 when python3 is missing.
+mail_smtp_py() {
+    has_cmd python3 || return 2
+    MS_MODE="$1" MS_USER="$2" MS_PASS="$3" MS_TO="${4:-}" MS_SUBJECT="${5:-}" MS_BODY="${6:-}" python3 - <<'PY'
+import os, smtplib, ssl, sys
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+u = os.environ["MS_USER"]
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE          # we talk to 127.0.0.1: only the login and delivery are tested here
+try:
+    with smtplib.SMTP("127.0.0.1", 587, timeout=30) as s:
+        s.starttls(context=ctx)
+        s.login(u, os.environ["MS_PASS"])
+        if os.environ["MS_MODE"] == "send":
+            m = EmailMessage()
+            m["From"] = u
+            m["To"] = os.environ["MS_TO"]
+            m["Subject"] = os.environ["MS_SUBJECT"]
+            m["Date"] = formatdate(localtime=True)
+            m["Message-ID"] = make_msgid(domain=u.split("@")[1])
+            m.set_content(os.environ["MS_BODY"])
+            s.send_message(m)
+except Exception as e:
+    print("SMTP error:", e)
+    sys.exit(1)
+PY
+}
+
+# mail_wait_login ADDRESS PASSWORD — the mail server picks up account changes within a few seconds
+mail_wait_login() {
+    local addr="$1" pass="$2" i rc
+    info "Waiting for the mail server to pick up the change (up to about 40 seconds)..."
+    for i in $(seq 1 20); do
+        mail_smtp_py login "$addr" "$pass" >/dev/null 2>&1; rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        if [ "$rc" -eq 2 ]; then sleep 15; return 0; fi    # no python3: cannot verify, just give it time
+        sleep 2
+    done
+    return 1
+}
+
+# ---------- DNS helpers ------------------------------------------------------------------
+
+mail_dig_ready() {
+    has_cmd dig && return 0
+    info "Installing the 'dig' DNS tool (package dnsutils)..."
+    sec_apt_install dnsutils >/dev/null 2>&1
+    has_cmd dig
+}
+
+# mail_dig TYPE NAME -> answers, one per line (asks a public resolver first, then the system resolver)
+mail_dig() {
+    local out
+    out="$(dig +short +time=3 +tries=1 "$2" "$1" @1.1.1.1 2>/dev/null)"
+    [ -n "$out" ] || out="$(dig +short +time=3 +tries=1 "$2" "$1" 2>/dev/null)"
+    printf '%s\n' "$out" | sed '/^$/d'
+}
+# TXT answers with the quotes and the 255-character splitting removed
+mail_dig_txt() { mail_dig TXT "$1" | sed -e 's/" "//g' -e 's/"//g'; }
+
+# DKIM: the key files are made by docker-mailserver; we only read the public part
+mail_dkim_dns_file() {
+    local d="$1" f
+    for f in "$MAIL_DIR"/config/rspamd/dkim/*"${MAIL_DKIM_SELECTOR}-${d}.public.dns.txt" \
+             "$MAIL_DIR/config/opendkim/keys/$d/${MAIL_DKIM_SELECTOR}.txt"; do
+        [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+    done
+    return 0
+}
+
+# mail_dkim_record DOMAIN -> "v=DKIM1; k=rsa; p=..." on one line (empty when there is no key)
+mail_dkim_record() {
+    local d="$1" f rec pub
+    f="$(mail_dkim_dns_file "$d")"
+    if [ -n "$f" ]; then
+        rec="$(grep -o '"[^"]*"' "$f" | tr -d '"\n \t')"
+        if [[ "$rec" == *p=* ]]; then printf '%s' "$rec" | sed -e 's/;/; /g' -e 's/; $//'; return 0; fi
+    fi
+    for f in "$MAIL_DIR"/config/rspamd/dkim/*"${MAIL_DKIM_SELECTOR}-${d}.public.txt"; do
+        [ -f "$f" ] || continue
+        pub="$(grep -v '^-' "$f" | tr -d '\n \t')"
+        [ -n "$pub" ] && { printf 'v=DKIM1; k=rsa; p=%s' "$pub"; return 0; }
+    done
+    return 0
+}
+
+mail_wait_ready() {
+    local i
+    for i in $(seq 1 60); do
+        if mail_cmd sh -c 'supervisorctl status postfix dovecot 2>/dev/null | grep -c RUNNING | grep -qx 2'; then return 0; fi
+        sleep 3
+    done
+    return 1
+}
+
+# mail_dkim_ensure DOMAIN — create the DKIM key once; reuse it afterwards
+mail_dkim_ensure() {
+    local d="$1" out
+    if [ -n "$(mail_dkim_dns_file "$d")" ]; then return 0; fi
+    info "Creating a 2048-bit DKIM key for $d ..."
+    if ! out="$(mail_cmd setup config dkim keysize 2048 selector "$MAIL_DKIM_SELECTOR" domain "$d" 2>&1)"; then
+        err "Could not create the DKIM key:"; printf '%s\n' "$out" | tail -n 5 | sed 's/^/    /'
+        return 1
+    fi
+    info "Restarting the mail server so it starts signing with the new key (about 30 seconds)..."
+    docker restart "$MAIL_CONTAINER" >/dev/null 2>&1
+    mail_wait_ready || warn "The mail server is slow to come back. Check: docker logs $MAIL_CONTAINER"
+    [ -n "$(mail_dkim_dns_file "$d")" ] || { err "The DKIM key file was not found after creation."; return 1; }
+    ok "DKIM key created."
+}
+
+mail_dns_row() {   # NUMBER TYPE NAME VALUE
+    printf '\n  %s) %s record\n     Name:  %s\n     Value: %s\n' "$1" "$2" "$3" "$4"
+}
+
+# Records that belong to the mail SERVER (once per server)
+mail_dns_server_show() {
+    local fqdn ip; fqdn="$(cfg_get MAIL_FQDN)"; ip="$(server_ip)"
+    section "DNS records for the mail server itself ($fqdn)"
+    explain "Create these once, at the company that hosts the DNS of the domain that contains $fqdn."
+    mail_dns_row 1 A   "$fqdn" "${ip:-<server IP>}"
+    mail_dns_row 2 TXT "$fqdn" "v=spf1 a -all"
+    printf '\n  3) Reverse DNS (PTR) for %s  ->  %s\n' "${ip:-<server IP>}" "$fqdn"
+    explain "     This one is NOT in your DNS panel: only the company that owns the IP (your server provider) can set it." \
+            "     Look for 'reverse DNS' / 'PTR' in their panel, or ask their support. Many big mail providers distrust mail without it."
+    explain "" "Create ONLY an A record for $fqdn (no AAAA/IPv6 record): Docker does not pass the real IPv6 address of senders to the mail server."
+}
+
+# Records that belong to ONE mail domain
+mail_dns_show() {
+    local d="$1" fqdn dkim; fqdn="$(cfg_get MAIL_FQDN)"
+    dkim="$(mail_dkim_record "$d")"
+    section "DNS records for $d"
+    explain "Create these at the company that hosts the DNS of $d. 'Name @' (or empty) means the domain itself." \
+            "Mail records must be 'DNS only': if you use Cloudflare, the grey cloud, never the orange one."
+    mail_dns_row 1 MX  "$d" "priority 10, mail server ${fqdn}."
+    mail_dns_row 2 TXT "$d" "v=spf1 mx ~all"
+    mail_dns_row 3 TXT "${MAIL_DKIM_SELECTOR}._domainkey.$d" "${dkim:-<no DKIM key yet: use 'Add / enable' first>}"
+    mail_dns_row 4 TXT "_dmarc.$d" "v=DMARC1; p=none"
+    echo ""
+    explain "SPF: '~all' accepts other senders with a warning. If this domain also sends through another service, add its 'include:' to the SPF record." \
+            "DMARC: 'p=none' only reports. After a few weeks of correct mail, you can change it to 'p=quarantine'."
+}
+
+# mail_dns_check DOMAIN — compares what the internet answers with what is expected
+mail_dns_check() {
+    local d="$1" fqdn ip mx spf dkim_expect dkim_got p dmarc bad=0
+    fqdn="$(cfg_get MAIL_FQDN)"; ip="$(server_ip)"
+    mail_dig_ready || { err "The 'dig' tool is missing and could not be installed."; return 1; }
+    section "DNS check: $d (answers of a public resolver)"
+    mx="$(mail_dig MX "$d" | tr 'A-Z' 'a-z')"
+    if grep -qF -- " ${fqdn}." <<<"$mx"; then status_row "MX" good "OK" "points to $fqdn"
+    elif [ -n "$mx" ]; then status_row "MX" bad "DIFFERENT" "answers: $(tr '\n' ' ' <<<"$mx")"; bad=$((bad+1))
+    else status_row "MX" bad "MISSING" "no MX record: nobody can send mail to $d"; bad=$((bad+1)); fi
+
+    spf="$(mail_dig_txt "$d" | grep -i '^v=spf1' | head -n1)"
+    if [ -z "$spf" ]; then status_row "SPF" bad "MISSING" "add the TXT record: v=spf1 mx ~all"; bad=$((bad+1))
+    elif [[ "$spf" == *" mx"* || "$spf" == *"ip4:$ip"* || "$spf" == *"a:$fqdn"* ]]; then status_row "SPF" good "OK" "$spf"
+    else status_row "SPF" warn "CHECK" "exists, but does not mention this server (mx or $ip): $spf"; bad=$((bad+1)); fi
+
+    dkim_expect="$(mail_dkim_record "$d")"
+    dkim_got="$(mail_dig_txt "${MAIL_DKIM_SELECTOR}._domainkey.$d" | tr -d ' ' | head -n1)"
+    p="${dkim_expect##*p=}"; p="${p// /}"
+    if [ -z "$dkim_expect" ]; then status_row "DKIM" warn "NO KEY" "this server has no DKIM key for $d yet (Mail domains -> Add / enable)"; bad=$((bad+1))
+    elif [ -z "$dkim_got" ]; then status_row "DKIM" bad "MISSING" "add the TXT record ${MAIL_DKIM_SELECTOR}._domainkey.$d"; bad=$((bad+1))
+    elif [[ "$dkim_got" == *"$p"* ]]; then status_row "DKIM" good "OK" "public key matches"
+    else status_row "DKIM" bad "DIFFERENT" "the published key is not the key of this server"; bad=$((bad+1)); fi
+
+    dmarc="$(mail_dig_txt "_dmarc.$d" | grep -i '^v=DMARC1' | head -n1)"
+    if [ -n "$dmarc" ]; then status_row "DMARC" good "OK" "$dmarc"
+    else status_row "DMARC" warn "MISSING" "recommended: TXT _dmarc.$d = v=DMARC1; p=none"; bad=$((bad+1)); fi
+    echo ""
+    if [ "$bad" -eq 0 ]; then ok "All DNS records of $d look right."
+    else warn "$bad record(s) need attention. DNS changes can take from minutes up to a few hours to spread."; fi
+    return 0
+}
+
+mail_port25_out() { timeout 8 bash -c '</dev/tcp/gmail-smtp-in.l.google.com/25' 2>/dev/null; }
+
+mail_blacklist_check() {
+    local ip="$1" rev zone res
+    rev="$(awk -F. '{print $4"."$3"."$2"."$1}' <<<"$ip")"
+    for zone in zen.spamhaus.org bl.spamcop.net; do
+        res="$(dig +short +time=3 +tries=1 "$rev.$zone" A 2>/dev/null | head -n1)"
+        if   [[ "$res" == 127.255.255.* ]]; then status_row "$zone" dim "UNKNOWN" "this list refuses queries from shared resolvers"
+        elif [[ "$res" == 127.* ]];          then status_row "$zone" bad "LISTED" "your IP is on this blacklist: mail will be rejected or go to spam"
+        else status_row "$zone" good "NOT LISTED"; fi
+    done
+}
+
+# The full deliverability report (server level + every mail domain)
+mail_check() {
+    local fqdn ip ptr a aaaa days d p listen
+    mail_installed || { err "The mail server is not installed yet (Email -> Install)."; return 1; }
+    mail_dig_ready || { err "The 'dig' tool is missing and could not be installed."; return 1; }
+    fqdn="$(cfg_get MAIL_FQDN)"; ip="$(server_ip)"
+    section "Mail server check: $fqdn"
+    printf '  Server IP: %s\n\n' "${ip:-unknown}"
+    if container_running "$MAIL_CONTAINER"; then status_row "Mail container" good "RUNNING"; else status_row "Mail container" bad "STOPPED" "start it: Email -> Start / stop"; fi
+    listen="$(ss -ltnH 2>/dev/null | awk '{print $4}')"
+    for p in $MAIL_PORTS; do
+        if grep -Eq ":${p}\$" <<<"$listen"; then status_row "Port $p" good "LISTENING"
+        else status_row "Port $p" bad "NOT LISTENING" "the mail server does not answer on this port"; fi
+    done
+    if mail_port25_out; then status_row "Outgoing port 25" good "OPEN" "this server can reach other mail servers"
+    else status_row "Outgoing port 25" bad "BLOCKED" "your provider blocks it: you can receive mail, but sending needs them to unblock port 25"; fi
+    a="$(mail_dig A "$fqdn" | head -n1)"; aaaa="$(mail_dig AAAA "$fqdn" | head -n1)"
+    if [ -n "$ip" ] && [ "$a" = "$ip" ]; then status_row "A record" good "OK" "$fqdn -> $a"
+    else status_row "A record" bad "WRONG" "$fqdn answers '${a:-nothing}', this server is ${ip:-unknown}"; fi
+    if [ -n "$aaaa" ]; then status_row "AAAA record" warn "REMOVE IT" "$fqdn has an IPv6 address ($aaaa); remove it (Docker hides the real IPv6 of senders)"; fi
+    ptr="$(getent hosts "$ip" 2>/dev/null | awk '{print tolower($2)}' | head -n1)"
+    if [ "$ptr" = "${fqdn,,}" ]; then status_row "Reverse DNS (PTR)" good "OK" "$ip -> $ptr"
+    elif [ -n "$ptr" ]; then status_row "Reverse DNS (PTR)" warn "DIFFERENT" "$ip -> $ptr (should be $fqdn): ask your server provider"
+    else status_row "Reverse DNS (PTR)" warn "MISSING" "ask your server provider to set the PTR of $ip to $fqdn"; fi
+    days="$(cert_days "$fqdn")"
+    if [ -z "$days" ]; then status_row "Certificate" bad "MISSING" "no certificate for $fqdn"
+    elif [ "$days" -lt 10 ]; then status_row "Certificate" warn "EXPIRES SOON" "$days days left"
+    else status_row "Certificate" good "OK" "$days days left"; fi
+    mail_blacklist_check "$ip"
+    explain "" "Port 25 from the OUTSIDE cannot be tested from this server. From another computer run:  telnet $fqdn 25   (you should see a 220 greeting)."
+    while read -r d; do [ -n "$d" ] && mail_dns_check "$d"; done < <(mail_domains)
+    return 0
+}
+
+# ---------- installation -----------------------------------------------------------------
+
+mail_write_compose() {
+    local fqdn mem; fqdn="$(cfg_get MAIL_FQDN)"; mem="$(cfg_get MAIL_MEM || true)"; mem="${mem:-1g}"
+    mkdir -p "$MAIL_DIR/config" "$MAIL_DIR/data/mail-data" "$MAIL_DIR/data/mail-state" "$MAIL_DIR/data/mail-logs"
+    cat > "$MAIL_DIR/docker-compose.yml" <<EOF
+services:
+  mailserver:
+    image: ${MAIL_IMAGE}
+    container_name: ${MAIL_CONTAINER}
+    hostname: ${fqdn}
+    restart: always
+    stop_grace_period: 1m
+    cap_add:
+      - NET_ADMIN              # needed by fail2ban inside the mail server
+    ports:
+      - "25:25"                # incoming mail from other servers
+      - "465:465"              # sending (SSL/TLS)
+      - "587:587"              # sending (STARTTLS)
+      - "993:993"              # reading (IMAP over SSL/TLS)
+    volumes:
+      - ./data/mail-data:/var/mail
+      - ./data/mail-state:/var/mail-state
+      - ./data/mail-logs:/var/log/mail
+      - ./config:/tmp/docker-mailserver
+      - ${NGINX_DIR}/letsencrypt:/etc/letsencrypt:ro
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      SSL_TYPE: "letsencrypt"
+      ENABLE_RSPAMD: "1"          # spam filter + DKIM signing
+      ENABLE_OPENDKIM: "0"
+      ENABLE_OPENDMARC: "0"
+      ENABLE_POLICYD_SPF: "0"
+      ENABLE_AMAVIS: "0"
+      ENABLE_SPAMASSASSIN: "0"
+      ENABLE_CLAMAV: "0"          # antivirus needs about 1.5 GB of RAM: off
+      ENABLE_FAIL2BAN: "1"
+      ENABLE_POP3: "0"
+      ENABLE_UPDATE_CHECK: "0"
+      SPOOF_PROTECTION: "1"       # a mailbox may only send as itself (or its aliases)
+      PERMIT_DOCKER: "none"       # containers must log in like everybody else
+      POSTFIX_MESSAGE_SIZE_LIMIT: "26214400"
+      POSTFIX_INET_PROTOCOLS: "ipv4"
+      DOVECOT_INET_PROTOCOLS: "ipv4"
+    mem_limit: ${mem}
+    networks:
+      ${NETWORK}:
+        aliases:
+          - ${fqdn}            # projects and webmail reach the mail server by its real name (certificate matches)
+
+networks:
+  ${NETWORK}:
+    external: true
+EOF
+}
+
+# Docker network addresses must never be banned by the mail server's fail2ban (webmail and projects live there)
+mail_write_fail2ban() {
+    local subnets
+    subnets="$(docker network inspect "$NETWORK" -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null)"
+    mkdir -p "$MAIL_DIR/config"
+    cat > "$MAIL_DIR/config/fail2ban-jail.cf" <<EOF
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1 ${subnets}
+EOF
+}
+
+mail_fw_open() {
+    local p
+    [ "$(sec_fw_state)" = "active" ] || return 0
+    for p in $MAIL_PORTS; do ufw allow "${p}/tcp" >/dev/null 2>&1; done
+    ok "Firewall: mail ports $MAIL_PORTS opened."
+}
+
+mail_install() {
+    section "Install the shared mail server"
+    explain \
+        "One mail server (Postfix + Dovecot + Rspamd spam filter, in one container) serves ALL your domains." \
+        "It sends and receives mail by itself: no outside SMTP/API service is needed." \
+        "You need: a hostname for the mail server (e.g. mail.example.com) with an A record pointing to this server," \
+        "and open ports 25, 465, 587, 993. Memory: expect roughly 600-900 MB of RAM in use."
+    docker_ready && net_exists && container_running "$NGINX_CONTAINER" \
+        || { err "Docker, the network and nginx must be ready first (main menu 1 and 2)."; return 1; }
+    if mail_installed; then ok "The mail server is already installed ($(cfg_get MAIL_FQDN))."; return 0; fi
+
+    local busy ram fqdn email mem
+    busy="$(ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E ':(25|465|587|993)$' || true)"
+    if [ -n "$busy" ]; then
+        err "These mail ports are already in use on this server:"; sed 's/^/    /' <<<"$busy"
+        explain "Stop that service first (for example: systemctl disable --now postfix exim4), then run this again."
+        return 1
+    fi
+    ram="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+    if [ -n "$ram" ] && [ "$ram" -lt 1800 ]; then
+        warn "This server has only about ${ram} MB of RAM. A mail server with spam filter needs 600-900 MB on top of your sites."
+        confirm "Continue anyway?" n || return 0
+    fi
+    if mail_port25_out; then ok "Outgoing port 25 is open: this server can send mail to other servers."
+    else
+        warn "Outgoing port 25 is BLOCKED by your server provider. You can still RECEIVE mail, but sending to other servers will not work"
+        warn "until they unblock it (ask their support, many do it on request)."
+        confirm "Continue anyway?" n || return 0
+    fi
+
+    while true; do
+        ask "Mail server hostname (e.g. mail.example.com)" "$(cfg_get MAIL_FQDN || true)" fqdn
+        fqdn="${fqdn,,}"; valid_domain "$fqdn" && break; err "Invalid hostname."
+    done
+    explain "" "Create an A record  $fqdn  ->  this server's IP first (and NO AAAA record)."
+    if ! dns_check "$fqdn"; then
+        warn "DNS does not point to this server yet; the certificate cannot be issued until it does."
+        confirm "Try anyway?" n || return 0
+    fi
+
+    ask "Email for certificate expiry notices" "$(cfg_get ADMIN_EMAIL || true)" email
+    [ -n "$email" ] || { err "Email is required."; return 1; }
+    cfg_set ADMIN_EMAIL "$email"
+    info "Requesting a certificate for $fqdn ..."
+    if ! certbot_run certonly --webroot -w /var/www/certbot -d "$fqdn" --email "$email" \
+            --agree-tos --no-eff-email --non-interactive --keep-until-expiring; then
+        err "Certificate request failed. Check that the A record is correct and port 80 is reachable."
+        return 1
+    fi
+    ok "Certificate ready for $fqdn."
+
+    ask "Memory limit for the mail server" "1g" mem
+    [[ "$mem" =~ ^[0-9]+[mg]$ ]] || mem="1g"
+    cfg_set MAIL_FQDN "$fqdn"; cfg_set MAIL_MEM "$mem"
+    mail_write_compose
+    mail_write_fail2ban
+    chmod 700 "$MAIL_DIR/config" "$MAIL_DIR/data" 2>/dev/null || true
+    info "Starting the mail server (the first start downloads the image, about 1-2 minutes)..."
+    if ! mail_dc up -d; then err "The mail server could not be started."; cfg_unset MAIL_FQDN; return 1; fi
+    if mail_wait_ready; then ok "The mail server is running."
+    else warn "It is still starting. Check in a minute: docker logs $MAIL_CONTAINER"; fi
+    mail_fw_open
+    if renew_enabled; then step_renew_enable >/dev/null 2>&1; fi   # refreshes the renewal job: it now also reloads the mail server
+    mail_dns_server_show
+    next_steps \
+        "Create the A record (and ask your provider for the reverse DNS / PTR) shown above." \
+        "Add your first mail domain: Email -> Mail domains -> Add / enable." \
+        "Then create mailboxes (Email -> Mailboxes) and check everything with Email -> Deliverability check." \
+        "Turn on the nightly backup of mailboxes if you have not: Email -> Include mailboxes in the nightly backup."
+}
+
+mail_remove() {
+    mail_installed || { err "The mail server is not installed."; return 1; }
+    local typed
+    warn "This stops and removes the mail server container (and the webmail, if set up)."
+    warn "Your mailboxes and messages stay on disk in $MAIL_DIR/data unless you delete them in the next question."
+    read -r -p "${C_RED}Type REMOVE to confirm: ${C_RESET}" typed
+    [ "$typed" = "REMOVE" ] || { info "Cancelled."; return 0; }
+    if mailweb_configured; then mailweb_remove_quiet; fi
+    mail_dc down >/dev/null 2>&1
+    if confirm "ALSO delete all mailboxes, messages, accounts and DKIM keys? (cannot be undone)" n; then
+        rm -rf "$MAIL_DIR"; cfg_unset MAIL_DOMAINS
+        ok "Mail data deleted."
+    else
+        rm -f "$MAIL_DIR/docker-compose.yml"
+        info "Data kept in $MAIL_DIR (installing the mail server again with the same hostname brings it back)."
+    fi
+    cfg_unset MAIL_FQDN; cfg_unset MAIL_MEM
+    ok "Mail server removed. Firewall rules for the mail ports were left in place (remove them with: ufw delete allow <port>/tcp)."
+}
+
+mail_start_stop() {
+    mail_installed || { err "The mail server is not installed."; return 1; }
+    local c
+    echo " 1) Start"; echo " 2) Stop"; echo " 3) Restart"; echo " 0) Cancel"
+    read -r -p "Select: " c
+    case "$c" in
+        1) mail_dc up -d && mail_wait_ready && ok "The mail server is running." ;;
+        2) confirm "Stop the mail server? (incoming mail will be retried by the senders for a few days)" n && mail_dc stop && ok "Stopped." ;;
+        3) docker restart "$MAIL_CONTAINER" >/dev/null && mail_wait_ready && ok "Restarted." ;;
+        *) info "Cancelled." ;;
+    esac
+}
+
+mail_logs() {
+    mail_installed || { err "The mail server is not installed."; return 1; }
+    local c lines
+    echo " 1) Recent mail activity (delivered, deferred, rejected)"
+    echo " 2) Container log (last 80 lines)"
+    echo " 3) Follow the mail log live (Ctrl-C to stop)"
+    echo " 4) Banned addresses (fail2ban)"
+    echo " 0) Cancel"
+    read -r -p "Select: " c
+    case "$c" in
+        1) lines="$(mail_cmd sh -c 'tail -n 600 /var/log/mail/mail.log 2>/dev/null' | grep -E 'status=|NOQUEUE|reject|warning:|SASL' | tail -n 30)"
+           if [ -n "$lines" ]; then printf '%s\n' "$lines" | cut -c1-200; else info "Nothing to show yet."; fi ;;
+        2) docker logs --tail 80 "$MAIL_CONTAINER" 2>&1 ;;
+        3) info "Press Ctrl-C to stop."; follow_cmd docker exec "$MAIL_CONTAINER" tail -n 20 -f /var/log/mail/mail.log ;;
+        4) mail_cmd setup fail2ban status 2>&1 | head -n 40
+           explain "" "Unban an address:  docker exec $MAIL_CONTAINER setup fail2ban unban <ip>" ;;
+        *) info "Cancelled." ;;
+    esac
+}
+
+mail_toggle_backup() {
+    local cur; cur="$(bk_val INCLUDE_MAIL yes)"
+    printf '  Mailboxes in the nightly backup: %s\n' "$([ "$cur" = yes ] && echo INCLUDED || echo "NOT included")"
+    explain "The mail ACCOUNTS, passwords (hashes) and DKIM keys are always part of the server-configuration backup." \
+            "This switch controls the MESSAGES: a separate encrypted file 'mail-data' per run. Large mailboxes make backups bigger."
+    if [ "$cur" = "yes" ]; then confirm "Stop including the messages?" n && bk_set INCLUDE_MAIL no && ok "Messages are no longer backed up."
+    else confirm "Include the messages in the nightly backup?" y && bk_set INCLUDE_MAIL yes && ok "Messages will be included."; fi
+}
+
+# ---------- mail domains -----------------------------------------------------------------
+
+# mail_domain_enable DOMAIN — register the domain, create its DKIM key and show the DNS records
+mail_domain_enable() {
+    local d="$1"
+    mail_installed || { err "The mail server is not installed yet: main menu 9) Email -> Install."; return 1; }
+    mail_up || { err "The mail server is not running."; return 1; }
+    valid_domain "$d" || { err "Invalid domain: $d"; return 1; }
+    mail_domain_register "$d"
+    mail_dkim_ensure "$d" || return 1
+    ok "$d is a mail domain now."
+    mail_dns_show "$d"
+    explain "" "The domain starts receiving mail after its MX record is published AND at least one mailbox exists."
+    if [ -z "$(mail_boxes "$d")" ] && confirm "Create the first mailbox for $d now?" y; then mail_box_add "$d"; fi
+    next_steps "Publish the DNS records above, wait a little, then run: Email -> Mail domains -> Check DNS."
+}
+
+mail_domain_add_menu() {
+    local d
+    section "Add / enable a mail domain"
+    explain "Any domain you control can be a mail domain; it does not have to be one of your deployed projects." \
+            "Example: example.com  (mailboxes will look like info@example.com)"
+    while true; do ask "Domain" "" d; d="${d,,}"; valid_domain "$d" && break; err "Invalid domain."; done
+    mail_domain_enable "$d"
+}
+
+mail_domain_remove() {
+    local d="$1" typed b
+    mail_domain_registered "$d" || { err "$d is not a mail domain."; return 1; }
+    warn "This deletes ALL mailboxes and aliases of $d from the mail server."
+    printf '  Mailboxes: %s\n' "$(mail_boxes "$d" | tr '\n' ' ')"
+    read -r -p "${C_RED}Type the domain to confirm ($d): ${C_RESET}" typed
+    [ "$typed" = "$d" ] || { info "Cancelled."; return 0; }
+    local f tmp
+    f="$(mail_accounts_file)"
+    if [ -f "$f" ]; then
+        tmp="$(mktemp)"; awk -F'|' -v d="$d" '{ n = split($1, a, "@"); if (!(n == 2 && a[2] == d)) print }' "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    fi
+    f="$(mail_virtual_file)"
+    if [ -f "$f" ]; then
+        tmp="$(mktemp)"; awk -v d="$d" '{ n = split($1, a, "@"); if (!(n == 2 && a[2] == d)) print }' "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    fi
+    if confirm "Also delete the stored messages of $d? (cannot be undone)" n && valid_domain "$d"; then
+        rm -rf "$MAIL_DIR/data/mail-data/$d"; ok "Messages deleted."
+    fi
+    mail_domain_unregister "$d"
+    ok "$d was removed from the mail server. Its DKIM key is kept (adding the domain again reuses it)."
+    explain "Remember to delete the MX / SPF / DKIM / DMARC records at your DNS provider."
+}
+
+menu_mail_domains() {
+    local c d
+    while true; do
+        clear; banner "Mail domains" "$C_BLUE"
+        mail_status_row
+        printf '\n  Domains: %s\n\n' "$(mail_domains | tr '\n' ' ' | sed 's/^$/none/')"
+        echo " 1) Add / enable a mail domain (creates the DKIM key and shows the DNS records)"
+        echo " 2) Show the DNS records of a domain"
+        echo " 3) Check the DNS of a domain"
+        echo " 4) Show the DNS records of the mail server itself (A, PTR)"
+        echo " 5) Remove a mail domain"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) if mail_installed; then mail_domain_add_menu; else err "Install the mail server first."; fi; pause ;;
+            2) if mail_installed && mail_pick_domain d; then mail_dns_show "$d"; fi; pause ;;
+            3) if mail_installed && mail_pick_domain d; then mail_dns_check "$d"; fi; pause ;;
+            4) if mail_installed; then mail_dns_server_show; else err "Install the mail server first."; fi; pause ;;
+            5) if mail_installed && mail_pick_domain d; then mail_domain_remove "$d"; fi; pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- mailboxes and aliases --------------------------------------------------------
+
+mail_client_settings() {   # ADDRESS
+    local fqdn; fqdn="$(cfg_get MAIL_FQDN)"
+    printf '\n  Settings for mail programs and phones:\n'
+    printf '    Username:        %s   (the full address)\n' "$1"
+    printf '    Incoming (IMAP): %s   port 993, SSL/TLS\n' "$fqdn"
+    printf '    Outgoing (SMTP): %s   port 587 STARTTLS  (or port 465 SSL/TLS)\n' "$fqdn"
+}
+
+mail_box_add() {
+    local domain="${1:-}" lp addr
+    mail_installed && mail_up || { err "The mail server is not running."; return 1; }
+    if [ -z "$domain" ]; then mail_pick_domain domain || return 1; fi
+    mail_domain_registered "$domain" || { err "$domain is not a mail domain yet (Mail domains -> Add)."; return 1; }
+    while true; do
+        ask "Mailbox name before the @ (e.g. info, noreply, support)" "" lp; lp="${lp,,}"
+        valid_mail_local "$lp" && break
+        err "Use letters, digits and . _ + - (start and end with a letter or digit)."
+    done
+    addr="$lp@$domain"
+    mail_box_exists "$addr" && { err "$addr already exists."; return 1; }
+    mail_ask_pass
+    mail_account_write "$addr" "$MAIL_NEW_PASS" || { err "Could not create the account."; return 1; }
+    if mail_wait_login "$addr" "$MAIL_NEW_PASS"; then ok "Mailbox $addr is ready."
+    else warn "The mailbox was created but the login is not confirmed yet. Give it a minute, then try a test email."; fi
+    printf '\n  Address:  %s\n' "$addr"
+    if [ "$MAIL_PASS_GENERATED" = "yes" ]; then printf '  Password: %s   (shown only now, save it)\n' "$MAIL_NEW_PASS"
+    else printf '  Password: the one you typed\n'; fi
+    mail_client_settings "$addr"
+    explain "" "Read and send in a browser: Email -> Webmail.  Use it from a project: Project menu -> Email for this project."
+}
+
+mail_box_password() {
+    local addr="$1"
+    mail_box_exists "$addr" || { err "$addr does not exist."; return 1; }
+    warn "Everything that logs in as $addr (phones, projects) must be updated afterwards."
+    mail_ask_pass
+    mail_account_write "$addr" "$MAIL_NEW_PASS" || { err "Could not change the password."; return 1; }
+    mail_wait_login "$addr" "$MAIL_NEW_PASS" && ok "Password changed." || warn "Not confirmed yet; give it a minute."
+    if [ "$MAIL_PASS_GENERATED" = "yes" ]; then printf '  New password: %s   (shown only now, save it)\n' "$MAIL_NEW_PASS"; fi
+}
+
+mail_box_delete() {
+    local addr="$1" typed f tmp d lp
+    mail_box_exists "$addr" || { err "$addr does not exist."; return 1; }
+    warn "This deletes the mailbox $addr (and the aliases that point to it)."
+    read -r -p "${C_RED}Type the address to confirm ($addr): ${C_RESET}" typed
+    [ "$typed" = "$addr" ] || { info "Cancelled."; return 0; }
+    f="$(mail_accounts_file)"; tmp="$(mktemp)"
+    awk -F'|' -v a="$addr" '$1 != a' "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    f="$(mail_virtual_file)"
+    if [ -f "$f" ]; then tmp="$(mktemp)"; awk -v a="$addr" '$2 != a' "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"; fi
+    d="${addr#*@}"; lp="${addr%@*}"
+    if valid_mail_local "$lp" && valid_domain "$d" && [ -d "$MAIL_DIR/data/mail-data/$d/$lp" ] \
+            && confirm "Also delete the stored messages of $addr? (cannot be undone)" n; then
+        rm -rf "$MAIL_DIR/data/mail-data/$d/$lp"; ok "Messages deleted."
+    fi
+    ok "Mailbox $addr removed."
+}
+
+mail_alias_add() {
+    local domain="${1:-}" lp al target
+    if [ -z "$domain" ]; then mail_pick_domain domain || return 1; fi
+    explain "An alias is an extra address that delivers to another address, e.g. contact@example.com -> info@example.com." \
+            "The target can also be an address on another server."
+    while true; do ask "Alias name before the @ (e.g. contact)" "" lp; lp="${lp,,}"; valid_mail_local "$lp" && break; err "Invalid name."; done
+    al="$lp@$domain"
+    mail_box_exists "$al" && { err "$al is already a real mailbox."; return 1; }
+    while true; do ask "Deliver it to (full address)" "" target; target="${target,,}"; valid_email "$target" && break; err "Invalid address."; done
+    [ "$al" != "$target" ] || { err "An alias cannot point to itself."; return 1; }
+    local f; f="$(mail_virtual_file)"; mkdir -p "$(dirname "$f")"; touch "$f"
+    grep -qE "^${al//./\\.}[[:space:]]" "$f" 2>/dev/null && { err "$al already exists."; return 1; }
+    printf '%s %s\n' "$al" "$target" >> "$f"
+    ok "Alias added: $al -> $target (active within a few seconds)."
+}
+
+mail_alias_remove() {
+    local domain="${1:-}" choice i=1 line f tmp
+    local -a list=()
+    mapfile -t list < <(mail_aliases "$domain")
+    [ "${#list[@]}" -gt 0 ] || { info "There are no aliases${domain:+ for $domain}."; return 0; }
+    echo ""
+    for line in "${list[@]}"; do printf '   %2d) %s\n' "$i" "${line/ / -> }"; i=$((i+1)); done
+    echo "    0) Cancel"
+    read -r -p "${C_YELLOW}Remove which alias: ${C_RESET}" choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ] || { info "Cancelled."; return 0; }
+    line="${list[$((choice-1))]}"
+    f="$(mail_virtual_file)"; tmp="$(mktemp)"
+    awk -v a="${line%% *}" -v t="${line#* }" '!($1 == a && $2 == t)' "$f" > "$tmp"; cat "$tmp" > "$f"; rm -f "$tmp"
+    ok "Alias removed."
+}
+
+mail_box_list() {   # [DOMAIN]
+    local b size d lp
+    section "Mailboxes${1:+ of $1}"
+    if [ -z "$(mail_boxes "${1:-}")" ]; then info "No mailboxes yet."; else
+        while read -r b; do
+            d="${b#*@}"; lp="${b%@*}"
+            size="$(du -sh "$MAIL_DIR/data/mail-data/$d/$lp" 2>/dev/null | cut -f1)"
+            printf '  %-40s %s\n' "$b" "${size:-empty}"
+        done < <(mail_boxes "${1:-}")
+    fi
+    if [ -n "$(mail_aliases "${1:-}")" ]; then
+        echo ""; echo "  Aliases:"
+        mail_aliases "${1:-}" | sed 's/ / -> /; s/^/    /'
+    fi
+}
+
+# menu_mail_boxes [DOMAIN]  (with a domain: only that domain, used from the project menu)
+menu_mail_boxes() {
+    local dom="${1:-}" c b
+    while true; do
+        clear; banner "Mailboxes${dom:+: $dom}" "$C_BLUE"
+        mail_status_row; echo ""
+        echo " 1) List mailboxes and aliases"
+        echo " 2) Create a mailbox"
+        echo " 3) Change a mailbox password"
+        echo " 4) Delete a mailbox"
+        echo " 5) Add an alias (extra address that delivers to another address)"
+        echo " 6) Remove an alias"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) mail_box_list "$dom"; pause ;;
+            2) mail_box_add "$dom"; pause ;;
+            3) if mail_pick_box b "$dom"; then mail_box_password "$b"; fi; pause ;;
+            4) if mail_pick_box b "$dom"; then mail_box_delete "$b"; fi; pause ;;
+            5) mail_alias_add "$dom"; pause ;;
+            6) mail_alias_remove "$dom"; pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+mail_send_test() {
+    local from pass to
+    mail_installed && mail_up || { err "The mail server is not running."; return 1; }
+    has_cmd python3 || { err "python3 is needed for this test (apt install python3)."; return 1; }
+    section "Send a test email"
+    explain "Sends one message from one of your mailboxes through your own server, to any address you choose." \
+            "Use an address you can read (for example on another provider) and check whether it arrives in the inbox or in spam."
+    mail_pick_box from || return 1
+    ask_secret "Password of $from" pass
+    ask "Send the test to (full address)" "" to; to="${to,,}"
+    valid_email "$to" || { err "Invalid address."; return 1; }
+    if ! mail_smtp_py send "$from" "$pass" "$to" "Test from your own mail server" \
+        "This message was sent by HiDeploy through your own mail server ($(cfg_get MAIL_FQDN)). If you can read it, sending works."; then
+        err "Sending failed (wrong password, or the mail server is not ready)."; return 1
+    fi
+    ok "The server accepted the message. Delivery to $to now happens in the background."
+    sleep 6
+    local lines
+    lines="$(mail_cmd sh -c 'tail -n 300 /var/log/mail/mail.log 2>/dev/null' | grep -F -- "$to" | grep -E 'status=' | tail -n 3)"
+    if [ -n "$lines" ]; then
+        echo "  Delivery log:"; printf '%s\n' "$lines" | sed 's/^/    /' | cut -c1-200
+        grep -q 'status=sent' <<<"$lines" && ok "Delivered to the other server." || warn "Not delivered yet. See: Email -> Status and logs."
+    else
+        info "No delivery line yet. Check again in a minute: Email -> Status and logs."
+    fi
+}
+
+# ---------- webmail (Roundcube), closed unless you open it -------------------------------
+
+# write_mailweb_vhost DOMAIN MODE   MODE: http | open | closed | https (= open if running, else closed)
+write_mailweb_vhost() {
+    local domain="$1" mode="$2" out="$NGINX_DIR/conf.d/$1.conf" ip have_allow=0
+    local -a ips=()
+    if [ "$mode" = "https" ]; then
+        if container_running "$MAILWEB_CONTAINER"; then mode="open"; else mode="closed"; fi
+    fi
+    IFS=',' read -ra ips <<< "$(cfg_get MAILWEB_ALLOW || true)"
+    {
+        if [ "$mode" = "http" ]; then
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            echo "    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }"
+            echo "    location / { return 444; }"
+            echo "}"
+        else
+            echo "server {"
+            echo "    listen 80;"
+            echo "    server_name __DOMAIN__;"
+            echo "    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }"
+            if [ "$mode" = "open" ]; then echo '    location / { return 301 https://$host$request_uri; }'; else echo "    location / { return 444; }"; fi
+            echo "}"
+            echo ""
+            echo "server {"
+            echo "    listen 443 ssl;"
+            echo "    http2 on;"
+            echo "    server_name __DOMAIN__;"
+            echo "    ssl_certificate     /etc/letsencrypt/live/__DOMAIN__/fullchain.pem;"
+            echo "    ssl_certificate_key /etc/letsencrypt/live/__DOMAIN__/privkey.pem;"
+            echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+            echo "    ssl_session_cache shared:SSL:10m;"
+            if [ "$mode" = "closed" ]; then
+                echo ""
+                echo "    # Webmail is stopped: this domain is closed completely."
+                echo "    return 444;"
+            else
+                echo "    client_max_body_size 30M;"
+                echo "    resolver 127.0.0.11 valid=10s ipv6=off;"
+                for ip in "${ips[@]}"; do
+                    ip="${ip// /}"
+                    [ -n "$ip" ] && { echo "    allow $ip;"; have_allow=1; }
+                done
+                [ "$have_allow" -eq 1 ] && echo "    deny all;"
+                if [ -f "$MAILWEB_HTPASSWD" ]; then
+                    echo '    auth_basic "Restricted";'
+                    echo "    auth_basic_user_file /etc/nginx/conf.d/webmail.htpasswd;"
+                fi
+                echo '    add_header X-Robots-Tag "noindex, nofollow" always;'
+                cat <<'EOF'
+
+    location / {
+        set $web_upstream "http://__WEB__:80";
+        proxy_pass $web_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+EOF
+            fi
+            echo "}"
+        fi
+    } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__WEB__|$MAILWEB_CONTAINER|g" > "$out"
+}
+
+mailweb_write_compose() {
+    local fqdn; fqdn="$(cfg_get MAIL_FQDN)"
+    mkdir -p "$MAILWEB_DIR"
+    cat > "$MAILWEB_DIR/docker-compose.yml" <<EOF
+services:
+  webmail:
+    image: ${MAILWEB_IMAGE}
+    container_name: ${MAILWEB_CONTAINER}
+    restart: "no"          # does NOT come back after a server reboot: you open it only when you need it
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: "tls://${fqdn}"
+      ROUNDCUBEMAIL_DEFAULT_PORT: "143"
+      ROUNDCUBEMAIL_SMTP_SERVER: "tls://${fqdn}"
+      ROUNDCUBEMAIL_SMTP_PORT: "587"
+      ROUNDCUBEMAIL_DB_TYPE: "sqlite"
+      ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE: "25M"
+      ROUNDCUBEMAIL_PLUGINS: "archive,zipdownload"
+    volumes:
+      - webmail-db:/var/roundcube/db
+    mem_limit: 256m
+    networks:
+      - ${NETWORK}
+
+volumes:
+  webmail-db:
+
+networks:
+  ${NETWORK}:
+    external: true
+EOF
+}
+
+mailweb_write_auth() {
+    local user="$1" pass="$2" hash
+    hash="$(printf '%s' "$pass" | openssl passwd -apr1 -stdin)" || return 1
+    printf '%s:%s\n' "$user" "$hash" > "$MAILWEB_HTPASSWD"
+    chmod 644 "$MAILWEB_HTPASSWD"
+}
+
+# Sets MW_USER / MW_PASS / MW_GENERATED; MW_USER empty = no extra login
+mailweb_ask_auth() {
+    local pass pass2
+    MW_USER=""; MW_PASS=""; MW_GENERATED="no"
+    explain \
+        "Extra protection (recommended): a browser login (HTTP Basic Auth) in front of the webmail page." \
+        "After it you still log in with your mailbox address and password."
+    confirm "Add the extra browser login?" y || return 0
+    while true; do
+        ask "Basic-auth username" "${1:-admin}" MW_USER
+        [[ "$MW_USER" =~ ^[A-Za-z0-9_.-]{3,32}$ ]] && break
+        err "Use 3-32 characters: letters, digits, dot, dash, underscore."
+    done
+    while true; do
+        ask_secret "Basic-auth password (Enter = auto-generate a strong one)" pass
+        if [ -z "$pass" ]; then MW_PASS="$(gen_password)"; MW_GENERATED="yes"; break; fi
+        [ "${#pass}" -ge 10 ] || { err "Use at least 10 characters."; continue; }
+        ask_secret "Repeat password" pass2
+        [ "$pass" = "$pass2" ] && { MW_PASS="$pass"; break; }
+        err "Passwords do not match."
+    done
+}
+
+mailweb_ask_ips() {
+    local ips ip ok_all=1 mine="${SSH_CLIENT:-}"
+    mine="${mine%% *}"
+    explain \
+        "Optional: only these IP addresses may open the webmail at all." \
+        "Example: 203.0.113.10,198.51.100.0/24   (Enter = no IP restriction)"
+    [ -n "$mine" ] && explain "Your current IP (from your SSH session) looks like: $mine"
+    while true; do
+        ask "Allowed IPs, comma-separated" "$(cfg_get MAILWEB_ALLOW || true)" ips
+        ips="${ips// /}"; ok_all=1
+        local -a list=(); IFS=',' read -ra list <<< "$ips"
+        for ip in "${list[@]}"; do
+            [[ "$ip" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || ok_all=0
+        done
+        [ "$ok_all" -eq 1 ] && break
+        err "Invalid IP list."
+    done
+    if [ -n "$ips" ]; then cfg_set MAILWEB_ALLOW "$ips"; else cfg_unset MAILWEB_ALLOW; fi
+}
+
+mailweb_setup() {
+    section "Webmail setup (optional)"
+    explain \
+        "Roundcube: read, write and send mail in the browser, for every mailbox on your mail server." \
+        "It runs on its own domain with HTTPS. It does NOT start automatically after a reboot:" \
+        "you open it when you need it and close it when you are done. While closed, the domain does not answer at all."
+    mail_installed && mail_up || { err "Install and start the mail server first (Email -> Install)."; return 1; }
+    container_running "$NGINX_CONTAINER" || { err "nginx is not running."; return 1; }
+    local domain
+    while true; do
+        ask "Webmail domain (e.g. webmail.example.com)" "$(cfg_get MAILWEB_DOMAIN || true)" domain
+        domain="${domain,,}"; valid_domain "$domain" && break; err "Invalid domain."
+    done
+    if [ -f "$NGINX_DIR/conf.d/$domain.conf" ] && ! mailweb_configured; then
+        err "A site configuration for $domain already exists (used by a project). Choose another domain."; return 1
+    fi
+    explain "Create an A record for $domain pointing to this server first."
+    if ! dns_check "$domain"; then
+        warn "DNS does not point to this server yet."
+        confirm "Continue anyway? (the certificate will fail until DNS is correct)" n || return 1
+    fi
+    mailweb_ask_auth "admin"
+    mailweb_ask_ips
+    mailweb_write_compose
+    if [ -n "$MW_USER" ]; then mailweb_write_auth "$MW_USER" "$MW_PASS" || { err "Could not create the password file."; return 1; }
+    else rm -f "$MAILWEB_HTPASSWD"; fi
+    cfg_set MAILWEB_DOMAIN "$domain"
+    info "Starting the webmail container (the first start downloads the image)..."
+    mailweb_dc up -d || { err "Could not start the webmail."; return 1; }
+    apply_vhost "$domain" "$MAILWEB_CONTAINER" http mailweb || return 1
+    if ssl_setup "$domain" "$MAILWEB_CONTAINER" mailweb; then
+        echo ""; banner "Webmail is ready" "$C_BLUE"
+        printf '  URL: https://%s\n' "$domain"
+        if [ -n "$MW_USER" ]; then
+            printf '  Browser login user: %s\n' "$MW_USER"
+            if [ "$MW_GENERATED" = "yes" ]; then printf '  Browser login pass: %s   (shown only now, save it)\n' "$MW_PASS"; else printf '  Browser login pass: the one you typed\n'; fi
+        fi
+        explain "" "Then log in with a full mailbox address (for example info@example.com) and its password."
+        warn "While it is open, anyone who reaches the page can try to log in. Close it when you finish."
+        confirm "Leave the webmail OPEN right now?" y || mailweb_stop
+        next_steps "Close it any time: Email -> Webmail -> Stop." "Open it again: Email -> Webmail -> Start."
+    else
+        warn "SSL failed, so for safety the webmail stays closed. Fix DNS and run this setup again."
+        mailweb_dc stop >/dev/null 2>&1
+        return 1
+    fi
+}
+
+mailweb_start() {
+    mailweb_configured || { err "Webmail is not set up yet (option 1)."; return 1; }
+    mail_up || { err "The mail server is not running."; return 1; }
+    local domain; domain="$(cfg_get MAILWEB_DOMAIN)"
+    mailweb_dc up -d || { err "Could not start the webmail."; return 1; }
+    apply_vhost "$domain" "$MAILWEB_CONTAINER" open mailweb || return 1
+    ok "Webmail is OPEN: https://$domain"
+    warn "Remember to close it when you are done: Email -> Webmail -> Stop."
+}
+
+mailweb_stop() {
+    mailweb_configured || { err "Webmail is not set up."; return 1; }
+    local domain; domain="$(cfg_get MAILWEB_DOMAIN)"
+    apply_vhost "$domain" "$MAILWEB_CONTAINER" closed mailweb || return 1
+    mailweb_dc stop >/dev/null 2>&1
+    ok "Webmail is CLOSED: the domain no longer answers and the container is stopped."
+}
+
+mailweb_status() {
+    section "Webmail status"
+    if ! mailweb_configured; then info "Not set up. Use option 1."; return 0; fi
+    local d days allow user
+    d="$(cfg_get MAILWEB_DOMAIN)"; days="$(cert_days "$d")"; allow="$(cfg_get MAILWEB_ALLOW || true)"
+    user="$(cut -d: -f1 "$MAILWEB_HTPASSWD" 2>/dev/null)"
+    printf '  Domain:            https://%s\n' "$d"
+    printf '  State:             %s\n' "$(container_running "$MAILWEB_CONTAINER" && echo "OPEN (running)" || echo "CLOSED (stopped)")"
+    printf '  SSL days left:     %s\n' "${days:--}"
+    printf '  Browser login:     %s\n' "${user:-none}"
+    printf '  Allowed IPs:       %s\n' "${allow:-anyone who reaches the page}"
+}
+
+# Remove without questions (used when the whole mail server is removed)
+mailweb_remove_quiet() {
+    local domain; domain="$(cfg_get MAILWEB_DOMAIN)"
+    mailweb_dc down -v >/dev/null 2>&1
+    [ -n "$domain" ] && rm -f "$NGINX_DIR/conf.d/$domain.conf"
+    rm -f "$MAILWEB_HTPASSWD"; nginx_test_reload >/dev/null 2>&1
+    rm -rf "$MAILWEB_DIR"; cfg_unset MAILWEB_DOMAIN; cfg_unset MAILWEB_ALLOW
+}
+
+mailweb_remove() {
+    mailweb_configured || { err "Webmail is not set up."; return 1; }
+    local domain; domain="$(cfg_get MAILWEB_DOMAIN)"
+    warn "This removes the webmail container, its settings and its nginx configuration (your mailboxes are NOT touched)."
+    confirm "Remove the webmail?" n || return 0
+    mailweb_remove_quiet
+    if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ] && confirm "Delete the SSL certificate for $domain too?" y; then
+        certbot_run delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 && ok "Certificate deleted."
+    fi
+    ok "Webmail removed."
+}
+
+menu_webmail() {
+    local c domain
+    while true; do
+        clear; banner "Webmail (optional)" "$C_BLUE"
+        mailweb_status_row; echo ""
+        echo " 1) Set up the webmail (domain + HTTPS + extra login + optional IP list)"
+        echo " 2) Start  (open it to the internet)"
+        echo " 3) Stop   (close it completely)"
+        echo " 4) Show status"
+        echo " 5) Change the browser login (Basic Auth)"
+        echo " 6) Change the allowed IP list"
+        echo " 7) Remove the webmail"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item mailweb_setup ;;
+            2) run_item mailweb_start ;;
+            3) run_item mailweb_stop ;;
+            4) run_item mailweb_status ;;
+            5) if mailweb_configured; then
+                   mailweb_ask_auth "$(cut -d: -f1 "$MAILWEB_HTPASSWD" 2>/dev/null)"
+                   if [ -n "$MW_USER" ]; then mailweb_write_auth "$MW_USER" "$MW_PASS"; else rm -f "$MAILWEB_HTPASSWD"; fi
+                   domain="$(cfg_get MAILWEB_DOMAIN)"
+                   apply_vhost "$domain" "$MAILWEB_CONTAINER" https mailweb && ok "Browser login updated."
+                   [ "$MW_GENERATED" = "yes" ] && warn "New generated password: $MW_PASS   (shown only now)"
+               else err "Webmail is not set up."; fi
+               pause ;;
+            6) if mailweb_configured; then
+                   mailweb_ask_ips
+                   domain="$(cfg_get MAILWEB_DOMAIN)"
+                   apply_vhost "$domain" "$MAILWEB_CONTAINER" https mailweb && ok "IP list applied."
+               else err "Webmail is not set up."; fi
+               pause ;;
+            7) run_item mailweb_remove ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- email inside a project -------------------------------------------------------
+
+# Writes the SMTP settings of one mailbox into the project's .env
+mail_project_connect() {
+    local path="$1" domain mdom addr pass fqdn from_name enc_u enc_p
+    load_project "$path" || return 1
+    mail_installed && mail_up || { err "The mail server is not running (main menu 9) Email)."; return 1; }
+    [ -f "$path/.env" ] || { err "This project has no .env file yet."; return 1; }
+    domain="$(basename "$path")"; mdom="$(kv_get "$path/.deploy.env" MAIL_DOMAIN)"; mdom="${mdom:-$domain}"
+    mail_domain_registered "$mdom" || { err "$mdom is not a mail domain yet. Use option 1 first."; return 1; }
+    mail_pick_box addr "$mdom" || return 1
+    fqdn="$(cfg_get MAIL_FQDN)"
+    echo ""
+    ask_secret "Password of $addr (Enter = set a NEW generated password now)" pass
+    if [ -z "$pass" ]; then
+        warn "A new password replaces the old one: everything else that logs in as $addr must be updated."
+        confirm "Set a new password for $addr?" y || return 0
+        pass="$(gen_password)"
+        mail_account_write "$addr" "$pass" || { err "Could not change the password."; return 1; }
+        mail_wait_login "$addr" "$pass" || warn "The new password is not confirmed yet; the project may fail to send for a minute."
+    else
+        mail_smtp_py login "$addr" "$pass" >/dev/null 2>&1
+        case $? in
+            0) ok "Login verified." ;;
+            2) warn "python3 is missing: could not verify the password." ;;
+            *) err "That password does not work for $addr."; return 1 ;;
+        esac
+    fi
+    if is_next; then
+        enc_u="$(urlencode "$addr")"; enc_p="$(urlencode "$pass")"
+        env_set "$path/.env" SMTP_HOST "$fqdn"
+        env_set "$path/.env" SMTP_PORT 587
+        env_set "$path/.env" SMTP_SECURE false
+        env_set "$path/.env" SMTP_USER "$addr"
+        env_set "$path/.env" SMTP_PASSWORD "${pass//\$/\$\$}"
+        env_set "$path/.env" SMTP_FROM "$addr"
+        env_set "$path/.env" SMTP_URL "smtp://${enc_u}:${enc_p}@${fqdn}:587"
+        ok "SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_USER, SMTP_PASSWORD, SMTP_FROM and SMTP_URL were written to .env."
+        dc up -d --force-recreate >/dev/null 2>&1 && wait_healthy
+    else
+        env_set "$path/.env" MAIL_MAILER smtp
+        env_set "$path/.env" MAIL_HOST "$fqdn"
+        env_set "$path/.env" MAIL_PORT 587
+        env_set "$path/.env" MAIL_USERNAME "$addr"
+        env_set "$path/.env" MAIL_PASSWORD "$(env_quote "$pass")"
+        env_set "$path/.env" MAIL_ENCRYPTION tls
+        env_set "$path/.env" MAIL_FROM_ADDRESS "$(env_quote "$addr")"
+        env_unset "$path/.env" MAIL_SCHEME
+        if [ -z "$(env_get "$path/.env" MAIL_FROM_NAME)" ]; then
+            from_name='"${APP_NAME}"'; env_set "$path/.env" MAIL_FROM_NAME "$from_name"
+        fi
+        ok "MAIL_MAILER, MAIL_HOST, MAIL_PORT, MAIL_USERNAME, MAIL_PASSWORD, MAIL_ENCRYPTION and MAIL_FROM_ADDRESS were written to .env."
+        artisan optimize:clear >/dev/null 2>&1; artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    fi
+    kv_set "$path/.deploy.env" MAIL_DOMAIN "$mdom"
+    echo ""
+    printf '  %s now sends through your own mail server (%s:587, STARTTLS) as %s.\n' "$domain" "$fqdn" "$addr"
+    explain "The project container reaches the mail server through the internal Docker network; nothing leaves this server until the message goes to its recipient." \
+            "Try it from the project (a password-reset mail, for example) and watch: Email -> Status and logs."
+}
+
+mail_project_disconnect() {
+    local path="$1" k
+    load_project "$path" || return 1
+    confirm "Remove the SMTP settings from this project's .env?" n || return 0
+    if is_next; then
+        for k in SMTP_HOST SMTP_PORT SMTP_SECURE SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_URL; do env_unset "$path/.env" "$k"; done
+        dc up -d --force-recreate >/dev/null 2>&1 && wait_healthy
+    else
+        env_set "$path/.env" MAIL_MAILER log
+        for k in MAIL_HOST MAIL_USERNAME MAIL_PASSWORD; do env_set "$path/.env" "$k" ""; done
+        artisan optimize:clear >/dev/null 2>&1; artisan optimize >/dev/null 2>&1; artisan queue:restart >/dev/null 2>&1
+    fi
+    ok "SMTP settings removed (a Laravel project now writes mail to its log instead of sending it)."
+}
+
+mail_project_show() {
+    local path="$1" domain mdom fqdn
+    load_project "$path" || return 1
+    domain="$(basename "$path")"; mdom="$(kv_get "$path/.deploy.env" MAIL_DOMAIN)"
+    section "Email of $domain"
+    printf '  Mail domain:   %s\n' "${mdom:-not enabled (project domain $domain is the default)}"
+    if mail_installed; then fqdn="$(cfg_get MAIL_FQDN)"; printf '  Mail server:   %s (%s)\n' "$fqdn" "$(mail_up && echo running || echo stopped)"; else printf '  Mail server:   not installed\n'; fi
+    if is_next; then
+        printf '  In .env:       SMTP_HOST=%s  SMTP_USER=%s\n' "$(env_get "$path/.env" SMTP_HOST)" "$(env_get "$path/.env" SMTP_USER)"
+    else
+        printf '  In .env:       MAIL_MAILER=%s  MAIL_HOST=%s  MAIL_USERNAME=%s\n' "$(env_get "$path/.env" MAIL_MAILER)" "$(env_get "$path/.env" MAIL_HOST)" "$(env_get "$path/.env" MAIL_USERNAME)"
+    fi
+    [ -n "${mdom:-}" ] && { echo ""; echo "  Mailboxes:"; mail_boxes "$mdom" | sed 's/^/    /'; }
+    return 0
+}
+
+project_mail_menu() {
+    local path="$1" c domain mdom
+    domain="$(basename "$path")"
+    while true; do
+        load_project "$path" || return
+        mdom="$(kv_get "$path/.deploy.env" MAIL_DOMAIN)"; mdom="${mdom:-$domain}"
+        clear; banner "Email for: $domain" "$C_BLUE"
+        mail_status_row
+        printf '  Mail domain of this project: %s\n\n' "$mdom"
+        echo " 1) Enable email for this domain (adds it to the mail server, DKIM key, DNS records)"
+        echo " 2) Mailboxes and aliases of $mdom"
+        echo " 3) Let this project send mail through a mailbox (writes the SMTP settings to .env)"
+        echo " 4) Show the DNS records / check the DNS"
+        echo " 5) Show this project's mail settings"
+        echo " 6) Stop sending mail from this project (remove the SMTP settings)"
+        echo " 7) Use a different mail domain for this project (default: the project domain)"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) mail_domain_enable "$mdom" && kv_set "$path/.deploy.env" MAIL_DOMAIN "$mdom"; pause ;;
+            2) if mail_installed && mail_domain_registered "$mdom"; then menu_mail_boxes "$mdom"; else err "Enable email for $mdom first (option 1)."; pause; fi ;;
+            3) mail_project_connect "$path"; pause ;;
+            4) if mail_installed && mail_domain_registered "$mdom"; then
+                   mail_dns_show "$mdom"
+                   confirm "Check now what the internet answers for these records?" y && mail_dns_check "$mdom"
+               else err "Enable email for $mdom first (option 1)."; fi
+               pause ;;
+            5) mail_project_show "$path"; pause ;;
+            6) mail_project_disconnect "$path"; pause ;;
+            7) ask "Mail domain (e.g. example.com)" "$mdom" c; c="${c,,}"
+               if valid_domain "$c"; then kv_set "$path/.deploy.env" MAIL_DOMAIN "$c"; ok "Mail domain of this project: $c (enable it with option 1 if it is new)."; else err "Invalid domain."; fi
+               pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- main menu 9 ------------------------------------------------------------------
+
+menu_mail() {
+    local c
+    while true; do
+        clear; banner "9) Email (your own mail server)" "$C_BLUE"
+        explain "One shared mail server for ALL your domains: send and receive without any outside SMTP/API service." \
+                "Typical order: 1 (install) -> 2 (add a domain, publish its DNS) -> 3 (mailboxes) -> 5 (check) -> 4 (webmail)." ""
+        mail_status_row; mailweb_status_row; echo ""
+        echo " 1) Install the mail server (once per server)"
+        echo " 2) Mail domains (add, DNS records, check DNS, remove)"
+        echo " 3) Mailboxes and aliases (info@..., noreply@...)"
+        echo " 4) Webmail (Roundcube: read and send in the browser; open / close on demand)"
+        echo " 5) Deliverability check (ports, reverse DNS, blacklists, DNS of every domain)"
+        echo " 6) Send a test email"
+        echo " 7) Status and logs"
+        echo " 8) Start / stop / restart the mail server"
+        echo " 9) Include mailboxes in the nightly backup (on/off)"
+        echo "10) Remove the mail server"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item mail_install ;;
+            2) menu_mail_domains ;;
+            3) if mail_installed; then menu_mail_boxes ""; else err "Install the mail server first."; pause; fi ;;
+            4) if mail_installed; then menu_webmail; else err "Install the mail server first."; pause; fi ;;
+            5) run_item mail_check ;;
+            6) run_item mail_send_test ;;
+            7) run_item mail_logs ;;
+            8) run_item mail_start_stop ;;
+            9) run_item mail_toggle_backup ;;
+            10) run_item mail_remove ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -5957,6 +7294,7 @@ main() {
         echo " 6) Backups                     (automatic, encrypted, copied off the server)"
         echo " 7) Performance tuning          (nginx, MariaDB, PHP-FPM: faster pages, less cold start)"
         echo " 8) Security                    (firewall, fail2ban, automatic security updates, SSH, checks)"
+        echo " 9) Email                       (own mail server for all your domains: mailboxes, webmail)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -5968,6 +7306,7 @@ main() {
             6) menu_backups ;;
             7) menu_perf ;;
             8) menu_security ;;
+            9) menu_mail ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
