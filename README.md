@@ -127,6 +127,7 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 |---|---|
 | Shared nginx + MariaDB, one container per project | Shared Services |
 | **Next.js projects** (standalone build, pnpm / npm / yarn, health-checked deployments) | Deploy New Project → Next.js |
+| **Project settings after deployment:** memory limit, extra domains (`www` etc.), change of the main domain, upload size, shared Redis | Project menu → Project settings |
 | **Performance tuning** sized from a scan of your server (nginx, MariaDB, PHP-FPM) and a first-load diagnosis | Performance tuning |
 | Automatic SSL issuance and daily renewal | Shared Services / SSL Management |
 | SSL overview: expiry dates, days left, file paths, forced renewal | Manage Projects → SSL management |
@@ -175,11 +176,26 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Backup settings, passphrase, destination keys | `/var/www/infrastructure/backup` (root only; never included in a backup) |
 | Backup schedule / log | `/etc/cron.d/hideploy-backup` / `/var/log/hideploy-backup.log` |
 | Deployment history | `/var/www/projects/<domain>/.deploy.history` |
+| Shared Redis (optional) | `/var/www/infrastructure/redis` |
 | Weekly cleanup schedule / log | `/etc/cron.d/hideploy-cleanup` / `/var/log/hideploy-cleanup.log` |
 | Generated project files | `/root/hideploy-templates/<domain>` |
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 
 Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
+
+---
+
+## Project settings after deployment
+
+Open a project in **Manage Projects** and choose **Project settings**:
+
+- **Memory limit:** change it any time; the container restarts with the new limit. HiDeploy warns if all limits together exceed 80% of the server's RAM.
+- **Extra domains (`www` and others):** visitors of an extra domain are redirected permanently to the main domain. The SSL certificate is extended to cover the new name, so create its DNS record first. Removing an extra domain stops serving it (the certificate keeps listing the name until its next re-issue, which is harmless).
+- **Change the main domain:** renames the project folder, moves nginx and SSL to the new name and restarts the container. Afterwards **commit the new `.gitlab-ci.yml`** (it contains the folder path; a copy is prepared in `/root/hideploy-templates/<new-domain>`), update `APP_URL` / `NEXT_PUBLIC_*` values, and re-add the old domain as an extra domain if you want it to redirect.
+- **Upload size limit:** nginx and, for Laravel projects with the newest generated files, PHP.
+- **Redis:** *Shared Services → Redis* installs one password-protected Redis for all projects (data on disk, eviction only for keys with an expiry, so queue jobs are never evicted). Each project can then use it: Laravel (cache, sessions and/or queues, with a per-project key prefix) or Next.js (`REDIS_URL` in `.env`). Laravel needs a Redis client: the PHP extension, or `composer require predis/predis` in your project (HiDeploy checks and tells you).
+
+Projects deployed with older generated files keep working unchanged; options that need the newest template (PHP upload limit, PHP-FPM tuning) tell you so.
 
 ---
 
@@ -296,7 +312,7 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
 - [ ] Security hardening (firewall, fail2ban, automatic security updates)
-- [ ] Project management after deployment (change domain, `www`/extra domains, memory, Redis)
+- [x] Project management after deployment (domains, memory, Redis, upload size)
 - [x] Next.js project type
 - [x] Performance tuning sized from a server scan
 - [ ] Per-project resource alerts
