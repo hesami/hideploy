@@ -8,6 +8,7 @@
 #   3) Generate the standard project files (Dockerfile, compose, CI, ...)
 #   4) Deploy a new Laravel project (clone, DB, .env, container, vhost, SSL)
 #   5) Manage projects (logs, deploy, backup, SSL, remove)
+#   8) Security (firewall with lockout guard, fail2ban, automatic security updates, SSH, checks)
 #
 # Architecture (kept deliberately simple):
 #
@@ -24,7 +25,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.4.0"
+HIDEPLOY_VERSION="1.5.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -81,6 +82,11 @@ PERF_NGINX_CONF="$NGINX_DIR/conf.d/10-hideploy-performance.conf"
 REDIS_CONTAINER="global-redis"
 REDIS_DIR="$INFRA_DIR/redis"
 REDIS_IMAGE="redis:7-alpine"
+
+# Security (main menu 8)
+SEC_DIR="$INFRA_DIR/security"              # settings and SSH backups (no secrets)
+SEC_CONF="$SEC_DIR/security.env"
+SEC_GUARD_SECS=120                         # how long you have to confirm a firewall / SSH change before it is undone
 
 DEPLOY_MAINT_ON="no"                       # set while a deployment keeps the site in maintenance mode
 
@@ -307,6 +313,10 @@ suggest_next() {
     if ! renew_enabled;                  then echo "Choose 2) Shared Services -> Enable SSL auto-renew"; return; fi
     if [ "$(project_count)" -eq 0 ];     then echo "Choose 3) Generate Project Files, then 4) Deploy New Project"; return; fi
     if ! bk_enabled;                     then echo "Choose 6) Backups -> set up automatic, encrypted backups"; return; fi
+    if [ "$(sec_fw_state)" != "active" ];   then echo "Choose 8) Security -> Firewall (with lockout protection)"; return; fi
+    if [ "$(sec_f2b_state)" != "active" ];  then echo "Choose 8) Security -> fail2ban"; return; fi
+    if [ "$(sec_auto_state)" != "on" ];     then echo "Choose 8) Security -> Automatic security updates"; return; fi
+    if sec_reboot_needed;                   then echo "The server needs a reboot to finish updates: sudo reboot"; return; fi
     echo "Choose 4) to deploy another project, or 5) to manage existing ones"
 }
 
@@ -335,6 +345,7 @@ show_status() {
     pma_status_row
     redis_status_row
     bk_status_row
+    sec_status_rows
     disk_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
     printf '\n%sRecommended next step:%s %s\n' "$C_YELLOW" "$C_RESET" "$(suggest_next)"
@@ -498,17 +509,7 @@ step_runner_access() {
         "Then go to main menu 2) Shared Services."
 }
 
-step_firewall() {
-    section "Firewall (UFW) — optional"
-    explain "Allows only SSH, HTTP (80) and HTTPS (443). Everything else incoming is blocked."
-    local ssh_port
-    ssh_port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"; ssh_port="${ssh_port:-22}"
-    warn "Make sure SSH port ${ssh_port} is the one you use to log in, otherwise you could lock yourself out."
-    confirm "Enable UFW with ports ${ssh_port}, 80, 443?" n || { info "Skipped."; return 0; }
-    has_cmd ufw || apt-get install -y ufw
-    ufw allow "${ssh_port}/tcp" && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
-    ok "Firewall enabled."
-}
+step_firewall() { sec_firewall_enable; }   # guarded version: see "SECURITY" below
 
 step_swap() {
     section "Swap file — optional"
@@ -4798,6 +4799,1050 @@ project_settings_menu() {
 }
 
 # ============================================================================
+# SECURITY (main menu 8): firewall, fail2ban, automatic security updates, SSH hardening
+# ============================================================================
+# Nothing here changes anything until you confirm. The two risky steps (firewall, SSH login)
+# have a lockout guard: a timer undoes the change by itself if you do not confirm that you
+# can still log in. Nothing in this part touches Docker, your projects or your databases.
+
+sec_get() { kv_get "$SEC_CONF" "$1"; }
+sec_set() { mkdir -p "$SEC_DIR"; chmod 700 "$SEC_DIR"; kv_set "$SEC_CONF" "$1" "$2"; }
+sec_val() { local v; v="$(sec_get "$1")"; printf '%s' "${v:-$2}"; }
+
+sec_apt_install() {   # PACKAGE...
+    export DEBIAN_FRONTEND=noninteractive
+    info "Installing: $*"
+    apt-get update -y >/dev/null 2>&1 || warn "apt update reported a problem; trying to install anyway."
+    apt-get install -y "$@"
+}
+
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$1))" -ge 1 ] && [ "$((10#$1))" -le 65535 ]; }
+
+# "22, 2222 22" -> "22 2222"   (fails when something is not a valid port)
+sec_parse_ports() {
+    local t="${1//,/ }" p out=""
+    for p in $t; do valid_port "$p" || return 1; out+="$((10#$p)) "; done
+    [ -n "$out" ] || return 1
+    printf '%s\n' $out | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+# "host:port" / "[v6]:port" / "*:port" -> SEC_H (host) and SEC_P (port)
+sec_split_addr() {
+    local a="$1"
+    SEC_P="${a##*:}"; SEC_H="${a%:*}"
+    SEC_H="${SEC_H#[}"; SEC_H="${SEC_H%]}"; SEC_H="${SEC_H#::ffff:}"; SEC_H="${SEC_H%%\%*}"
+}
+
+# Who is running this menu? Sets SEC_CLIENT_IP, SEC_SESSION_PORT (the SSH port of THIS connection)
+# and SEC_SERVER_IP. Works under sudo too (it follows the process tree up to the sshd session).
+sec_session_info() {
+    SEC_CLIENT_IP=""; SEC_SESSION_PORT=""; SEC_SERVER_IP=""
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        read -r SEC_CLIENT_IP _ SEC_SERVER_IP SEC_SESSION_PORT <<<"$SSH_CONNECTION"
+        return 0
+    fi
+    local pid=$$ comm line loc peer
+    while [ "${pid:-0}" -gt 1 ] 2>/dev/null; do
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+        if [ "$comm" = "sshd" ]; then
+            line="$(ss -H -tnp 2>/dev/null | grep -E "pid=${pid}[,)]" | head -n1)"
+            if [ -n "$line" ]; then
+                loc="$(awk '{print $4}' <<<"$line")"; peer="$(awk '{print $5}' <<<"$line")"
+                sec_split_addr "$loc";  SEC_SERVER_IP="$SEC_H"; SEC_SESSION_PORT="$SEC_P"
+                sec_split_addr "$peer"; SEC_CLIENT_IP="$SEC_H"
+                return 0
+            fi
+        fi
+        pid="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+    done
+    return 0
+}
+
+# The real SSH port(s): sshd configuration + what sshd listens on + the port of this very session
+sec_ssh_ports() {
+    local list=""
+    list="$(sshd -T 2>/dev/null | awk '/^port /{print $2}')"
+    list+=$'\n'"$(ss -H -tlnp 2>/dev/null | grep '"sshd"' | awk '{n=split($4,a,":"); print a[n]}')"
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        list+=$'\n'"$(systemctl show ssh.socket -p Listen 2>/dev/null | sed -nE 's/^Listen=.*:([0-9]+) \(Stream\).*/\1/p')"
+    fi
+    sec_session_info
+    [ -n "$SEC_SESSION_PORT" ] && list+=$'\n'"$SEC_SESSION_PORT"
+    printf '%s\n' "$list" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+
+# ---------- lockout guard: undo a risky change automatically ---------------
+
+sec_guard_cancel() {   # NAME
+    local u="hideploy-guard-$1" pidf="$SEC_DIR/guard-$1.pid" pid
+    systemctl stop "$u.timer" "$u.service" >/dev/null 2>&1 || true
+    systemctl reset-failed "$u.service" "$u.timer" >/dev/null 2>&1 || true
+    if [ -f "$pidf" ]; then
+        pid="$(cat "$pidf" 2>/dev/null)"
+        if [[ "$pid" =~ ^[0-9]+$ ]]; then pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null; fi
+        rm -f "$pidf"
+    fi
+    return 0
+}
+
+# Run COMMAND after SECONDS unless the guard is cancelled first. Survives a closed terminal
+# and a dropped SSH connection (systemd timer; a detached background shell as a fallback).
+sec_guard_start() {   # NAME SECONDS COMMAND [ARGS...]
+    local n="$1" secs="$2"; shift 2
+    sec_guard_cancel "$n"
+    mkdir -p "$SEC_DIR"; chmod 700 "$SEC_DIR"
+    if has_cmd systemd-run && [ -d /run/systemd/system ]; then
+        systemd-run --quiet --unit="hideploy-guard-$n" --on-active="${secs}s" --timer-property=AccuracySec=1s "$@" >/dev/null 2>&1 && return 0
+    fi
+    ( nohup bash -c 'echo $$ > "$1"; s="$2"; shift 2; sleep "$s"; exec "$@"' _ "$SEC_DIR/guard-$n.pid" "$secs" "$@" >/dev/null 2>&1 & )
+    sleep 0.3
+    [ -s "$SEC_DIR/guard-$n.pid" ]
+}
+
+# Wait up to SECONDS for the user to type "yes". Returns 1 on "no", on timeout and on end of input.
+sec_wait_confirm() {   # SECONDS
+    local end=$(( $(date +%s) + $1 )) left reply
+    while true; do
+        left=$(( end - $(date +%s) ))
+        [ "$left" -gt 0 ] || { echo ""; return 1; }
+        if read -r -t "$left" -p "${C_YELLOW}Type yes to keep this change, no to undo it (${left}s left): ${C_RESET}" reply; then
+            case "${reply,,}" in yes) return 0 ;; no) return 1 ;; esac
+        else
+            echo ""; return 1
+        fi
+    done
+}
+
+# ---------- state checks (cheap: also used by the main status table) -------
+
+sec_fw_state() {   # active | inactive | missing
+    has_cmd ufw || { echo missing; return; }
+    local out; out="$(ufw status 2>/dev/null)"      # captured first: "| grep -q" can break a pipe under pipefail
+    case "${out,,}" in "status: active"*) echo active ;; *) echo inactive ;; esac
+}
+
+sec_f2b_state() {  # active | nojail | inactive | missing
+    has_cmd fail2ban-client || { echo missing; return; }
+    systemctl is-active --quiet fail2ban 2>/dev/null || { echo inactive; return; }
+    if timeout 5 fail2ban-client status sshd >/dev/null 2>&1; then echo active; else echo nojail; fi
+}
+
+sec_auto_state() { # on | off | missing
+    local st cfg
+    st="$(dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null)"
+    [[ "$st" == *"install ok installed"* ]] || { echo missing; return; }
+    cfg="$(apt-config dump 2>/dev/null)"            # captured first: "| grep -q" can break a pipe under pipefail
+    if grep -qE '^APT::Periodic::Unattended-Upgrade "[1-9][0-9]*";' <<<"$cfg"; then echo on; else echo off; fi
+}
+
+# Non-security origins that unattended-upgrades is allowed to install from (empty = security only)
+sec_auto_extra_origins() {
+    apt-config dump 2>/dev/null | grep -E '^Unattended-Upgrade::Allowed-Origins::' | grep -E -- '-(updates|proposed|backports)' || true
+}
+
+sec_reboot_needed() { [ -f /var/run/reboot-required ]; }
+
+sshd_val() { sshd -T 2>/dev/null | awk -v k="$1" '$1==k{print $2; exit}'; }
+
+# 0 when sshd's effective settings could be read at all (sshd -T works)
+sec_ssh_known() { [ -n "$(sshd_val passwordauthentication)" ]; }
+
+# 0 only when the settings are readable AND password login is really closed
+sec_ssh_password_closed() { sec_ssh_known && ! sec_ssh_password_open; }
+
+# 0 when somebody can still log in with a password (plain or through PAM keyboard-interactive)
+sec_ssh_password_open() {
+    local pa ki pam
+    pa="$(sshd_val passwordauthentication)"
+    ki="$(sshd_val kbdinteractiveauthentication)"; [ -n "$ki" ] || ki="$(sshd_val challengeresponseauthentication)"
+    pam="$(sshd_val usepam)"
+    [ "$pa" = "yes" ] || { [ "$ki" = "yes" ] && [ "$pam" = "yes" ]; }
+}
+
+# ---------- main status table (menu top) -----------------------------------
+
+sec_status_rows() {
+    case "$(sec_fw_state)" in
+        active)  status_row "Firewall (UFW)" good "ON" "incoming traffic blocked except the allowed ports" ;;
+        missing) status_row "Firewall (UFW)" warn "NOT SET UP" "main menu 8) Security" ;;
+        *)       status_row "Firewall (UFW)" warn "OFF" "all ports are open: main menu 8) Security" ;;
+    esac
+    case "$(sec_f2b_state)" in
+        active)   status_row "fail2ban (SSH)" good "ON" "repeated wrong passwords are banned" ;;
+        nojail)   status_row "fail2ban (SSH)" warn "NO SSH JAIL" "main menu 8) Security" ;;
+        inactive) status_row "fail2ban (SSH)" warn "OFF" "installed but not running: main menu 8) Security" ;;
+        *)        status_row "fail2ban (SSH)" warn "NOT SET UP" "main menu 8) Security" ;;
+    esac
+    case "$(sec_auto_state)" in
+        on)
+            if [ "$(sec_val AUTO_REBOOT no)" = "yes" ]; then
+                status_row "Auto updates" good "ON" "automatic reboot at $(sec_val AUTO_REBOOT_TIME 04:30)"
+            else
+                status_row "Auto updates" good "ON" "no automatic reboot"
+            fi ;;
+        *) status_row "Auto updates" warn "OFF" "main menu 8) Security" ;;
+    esac
+    if has_cmd sshd && sec_ssh_known; then
+        if [ "$(sshd_val permitrootlogin)" = "yes" ] && sec_ssh_password_open; then
+            status_row "SSH login" bad "ROOT+PASSWORD" "root can log in with a password: main menu 8) Security"
+        elif sec_ssh_password_open; then
+            status_row "SSH login" warn "PASSWORD OPEN" "key-only login is safer: main menu 8) Security"
+        else
+            status_row "SSH login" good "KEY ONLY" "password login is closed"
+        fi
+    fi
+    if sec_reboot_needed; then status_row "Server reboot" warn "NEEDED" "updates are waiting for a reboot: sudo reboot (containers start again by themselves)"; fi
+}
+
+# ---------- check helpers for the full report ------------------------------
+
+SEC_ISSUES=0; SEC_WARNS=0; SEC_TODO=()
+sec_row()  {   # KIND LABEL TEXT [HINT]
+    case "$1" in bad) SEC_ISSUES=$((SEC_ISSUES+1)) ;; warn) SEC_WARNS=$((SEC_WARNS+1)) ;; esac
+    status_row "$2" "$1" "$3" "${4:-}"
+}
+sec_todo() { SEC_TODO+=("$1"); }
+
+sec_lists_age_days() {
+    local f=/var/lib/apt/periodic/update-success-stamp t
+    [ -e "$f" ] || f=/var/lib/apt/lists
+    t="$(stat -c %Y "$f" 2>/dev/null)" || return 1
+    echo $(( ( $(date +%s) - t ) / 86400 ))
+}
+
+# Counts what is waiting, using the package list that is already on the server (no network)
+sec_pending_counts() {
+    SEC_PEND_TOTAL=0; SEC_PEND_SEC=0
+    local out
+    out="$(apt-get -s -o Debug::NoLocking=1 dist-upgrade 2>/dev/null | grep '^Inst ' || true)"
+    [ -n "$out" ] || return 0
+    SEC_PEND_TOTAL="$(grep -c '' <<<"$out")"
+    SEC_PEND_SEC="$(grep -c -- '-security' <<<"$out" || true)"
+}
+
+# Users that can log in over SSH and have a public key on the server
+sec_users_with_keys() {
+    local u home files f n out="" cand
+    files="$(sshd -T 2>/dev/null | awk '/^authorizedkeysfile /{$1=""; print}')"
+    files="${files:-.ssh/authorized_keys .ssh/authorized_keys2}"
+    cand="root ${SUDO_USER:-}"
+    sec_session_info
+    cand+=" $(logname 2>/dev/null || true) $(who -m 2>/dev/null | awk '{print $1}')"
+    for u in $cand; do
+        [ -n "$u" ] || continue
+        case " $out " in *" $u "*) continue ;; esac
+        id "$u" >/dev/null 2>&1 || continue
+        home="$(getent passwd "$u" | cut -d: -f6)"
+        n=0
+        for f in $files; do
+            f="${f//%h/$home}"; f="${f//%u/$u}"; f="${f//%U/$(id -u "$u")}"
+            [[ "$f" == /* ]] || f="$home/$f"
+            [ -r "$f" ] || continue
+            n=$(( n + $(grep -Ev '^[[:space:]]*(#|$)' "$f" 2>/dev/null | grep -Ec '(ssh-(rsa|ed25519|dss)|ecdsa-sha2|sk-(ssh|ecdsa))' || true) ))
+        done
+        [ "$n" -gt 0 ] && out+="$u "
+    done
+    printf '%s' "${out% }"
+}
+
+# Sensitive files and folders that are readable by other users. Fills SEC_BAD_FILES with "path|mode|kind"
+#   priv = nobody except the owner may touch it     env = "others" must have no access
+sec_file_issues() {
+    SEC_BAD_FILES=()
+    local f m p
+    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR"; do
+        [ -e "$f" ] || continue
+        m="$(stat -c %a "$f" 2>/dev/null)" || continue
+        if (( (8#$m & 077) != 0 )); then SEC_BAD_FILES+=("$f|$m|priv"); fi
+    done
+    for p in "$PROJECTS_DIR"/*/; do
+        p="${p%/}"
+        [ -f "$p/.deploy.env" ] || continue
+        for f in "$p/.env" "$p/.deploy.env"; do
+            [ -e "$f" ] || continue
+            m="$(stat -c %a "$f" 2>/dev/null)" || continue
+            if (( (8#$m & 007) != 0 )); then SEC_BAD_FILES+=("$f|$m|env"); fi
+        done
+        for f in "$p"/storage/oauth-*.key; do
+            [ -e "$f" ] || continue
+            m="$(stat -c %a "$f" 2>/dev/null)" || continue
+            if (( (8#$m & 077) != 0 )); then SEC_BAD_FILES+=("$f|$m|priv"); fi
+        done
+    done
+    return 0
+}
+
+sec_files_fix() {
+    section "Permissions of sensitive files"
+    explain "Secrets (.env, .deploy.env, backup passphrase and keys, database password) must not be readable by other users."
+    sec_file_issues
+    if [ "${#SEC_BAD_FILES[@]}" -eq 0 ]; then ok "All sensitive files have safe permissions."; return 0; fi
+    local e path mode kind
+    for e in "${SEC_BAD_FILES[@]}"; do IFS='|' read -r path mode kind <<<"$e"; printf '  %s  (mode %s)\n' "$path" "$mode"; done
+    explain "" "Fix: project .env / .deploy.env become owner:group of the project user with mode 640 (what HiDeploy itself creates);" \
+        "everything else becomes owner-only (go-rwx). Containers keep working, because they run as the project user."
+    confirm "Fix these ${#SEC_BAD_FILES[@]} item(s)?" y || { info "Skipped."; return 0; }
+    local dir uid gid
+    for e in "${SEC_BAD_FILES[@]}"; do
+        IFS='|' read -r path mode kind <<<"$e"
+        if [ "$kind" = "env" ]; then
+            dir="$(dirname "$path")"
+            uid="$(kv_get "$dir/.deploy.env" APP_UID)"; gid="$(kv_get "$dir/.deploy.env" APP_GID)"
+            if [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]]; then chown "$uid:$gid" "$path" 2>/dev/null || true; fi
+            chmod o-rwx "$path"
+        else
+            chmod go-rwx "$path"
+        fi
+    done
+    ok "Permissions fixed."
+}
+
+# Prints one row per port that listens on a non-loopback address, and says whether it is expected
+sec_report_ports() {
+    local ssh_ports ufw_on=0 ufw_txt="" dpub="" proto la pn proc key seen=" " bypass allowed name hint sev found=0
+    ssh_ports=" $(sec_ssh_ports) "
+    if [ "$(sec_fw_state)" = "active" ]; then ufw_on=1; ufw_txt="$(ufw status 2>/dev/null)"; fi
+    if docker_ready; then
+        dpub="$(docker ps --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' \
+            | grep -oE '(0\.0\.0\.0|\[::\]):[0-9]+->[0-9]+/(tcp|udp)' \
+            | sed -E 's#^.*:([0-9]+)->.*/(tcp|udp)$#\1/\2#' | sort -u)"
+    fi
+    while read -r proto _ _ _ la _ rest; do
+        sec_split_addr "$la"
+        case "$SEC_H" in 127.*|::1) continue ;; esac
+        pn="$SEC_P"
+        [[ "$pn" =~ ^[0-9]+$ ]] || continue
+        if [ "$proto" = "udp" ]; then case "$pn" in 68|546) continue ;; esac; fi
+        key="$pn/$proto"
+        case "$seen" in *" $key "*) continue ;; esac
+        seen+="$key "
+        found=$((found+1))
+        proc="$(sed -nE 's/.*\(\("([^"]+)".*/\1/p' <<<"$rest")"
+        bypass=0; [ "$proc" = "docker-proxy" ] && bypass=1
+        if [ -n "$dpub" ] && grep -qx "$key" <<<"$dpub"; then bypass=1; fi
+        allowed=0
+        if [ "$ufw_on" -eq 1 ] && grep -qE "^${pn}(/${proto})?([[:space:]]|\$).*ALLOW" <<<"$ufw_txt"; then allowed=1; fi
+
+        name=""
+        if [ "$proto" = "tcp" ]; then
+            if   [[ "$ssh_ports" == *" $pn "* ]]; then name="SSH"
+            elif [ "$pn" = "80" ];  then name="HTTP"
+            elif [ "$pn" = "443" ]; then name="HTTPS"; fi
+        elif [ "$proto" = "udp" ] && [ "$pn" = "443" ]; then name="HTTPS (HTTP/3)"; fi
+
+        if [ -n "$name" ]; then
+            if [ "$ufw_on" -eq 1 ] && [ "$bypass" -eq 0 ] && [ "$allowed" -eq 0 ]; then
+                sec_row warn "Port $key" "BLOCKED BY FW" "$name is expected, but the firewall blocks it: Security -> Firewall"
+                sec_todo "Port $key ($name) is blocked by the firewall: Security -> Firewall -> enable (it adds the rules)"
+            else
+                sec_row good "Port $key" "EXPECTED" "$name"
+            fi
+        elif [ "$ufw_on" -eq 1 ] && [ "$bypass" -eq 0 ] && [ "$allowed" -eq 0 ]; then
+            sec_row good "Port $key" "BLOCKED" "${proc:-service} listens, but the firewall blocks it"
+        else
+            sev=warn
+            case "$pn" in 1433|2375|2376|3306|3307|5432|5984|6379|9200|11211|27017) sev=bad ;; esac
+            if   [ "$bypass" -eq 1 ]; then hint="published by Docker (UFW does not filter it): remove the port mapping or bind it to 127.0.0.1"
+            elif [ "$ufw_on" -eq 1 ]; then hint="the firewall allows it: remove the rule (ufw delete allow $pn) if you do not need it"
+            else hint="reachable from the internet: turn on the firewall, or stop the service"; fi
+            sec_row "$sev" "Port $key" "OPEN" "${proc:-service}: $hint"
+            sec_todo "Port $key (${proc:-service}) is open to the internet; close it unless you need it"
+        fi
+    done < <(ss -H -tulnp 2>/dev/null)
+    if [ "$found" -eq 0 ]; then sec_row dim "Open ports" "UNKNOWN" "could not read the listening ports (ss)"; fi
+}
+
+# ---------- the full report (menu 8 -> 1, and: hideploy security-check) ----
+
+sec_report() {
+    SEC_ISSUES=0; SEC_WARNS=0; SEC_TODO=()
+    local st n age users root_mode e path mode kind
+
+    section "Protection"
+    case "$(sec_fw_state)" in
+        active)  sec_row good "Firewall (UFW)" "ON" "incoming traffic is blocked except the allowed ports" ;;
+        missing) sec_row warn "Firewall (UFW)" "NOT SET UP" "ufw is not installed"; sec_todo "Turn on the firewall: Security -> Firewall" ;;
+        *)       sec_row warn "Firewall (UFW)" "OFF" "every port that has a service behind it is reachable"; sec_todo "Turn on the firewall: Security -> Firewall" ;;
+    esac
+    st="$(sec_f2b_state)"
+    case "$st" in
+        active)
+            n="$(timeout 5 fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{gsub(/[ \t]/,"",$2); print $2}')"
+            sec_row good "fail2ban (SSH)" "ON" "${n:-0} address(es) banned right now" ;;
+        nojail)   sec_row warn "fail2ban (SSH)" "NO SSH JAIL" "running, but it does not watch SSH"; sec_todo "Set up fail2ban for SSH: Security -> fail2ban" ;;
+        inactive) sec_row warn "fail2ban (SSH)" "OFF" "installed but not running"; sec_todo "Start fail2ban: Security -> fail2ban" ;;
+        *)        sec_row warn "fail2ban (SSH)" "NOT SET UP" "nobody blocks repeated wrong passwords"; sec_todo "Set up fail2ban for SSH: Security -> fail2ban" ;;
+    esac
+    if [ "$(sec_auto_state)" = "on" ]; then
+        if [ "$(sec_val AUTO_REBOOT no)" = "yes" ]; then
+            sec_row good "Auto updates" "ON" "automatic reboot at $(sec_val AUTO_REBOOT_TIME 04:30)"
+        else
+            sec_row good "Auto updates" "ON" "security patches only, no automatic reboot"
+        fi
+        e="$(sec_auto_extra_origins)"
+        if [ -n "$e" ]; then sec_row warn "Update sources" "NOT ONLY SEC." "other updates are also installed automatically ($(awk -F'"' '{print $2}' <<<"$e" | head -n2 | tr '\n' ' '))"; fi
+    else
+        sec_row warn "Auto updates" "OFF" "patches are installed only when you do it yourself"
+        sec_todo "Turn on automatic security updates: Security -> Automatic security updates"
+    fi
+
+    section "Updates"
+    sec_pending_counts
+    if [ "$SEC_PEND_TOTAL" -eq 0 ]; then
+        sec_row good "Waiting packages" "NONE" "nothing is waiting to be installed"
+    elif [ "$SEC_PEND_SEC" -gt 0 ]; then
+        sec_row bad "Waiting packages" "${SEC_PEND_SEC} SECURITY" "$SEC_PEND_TOTAL package(s) waiting, ${SEC_PEND_SEC} of them security fixes"
+        sec_todo "Install the security updates: Security -> Automatic security updates -> install now"
+    else
+        sec_row warn "Waiting packages" "$SEC_PEND_TOTAL WAITING" "no security fixes among them"
+    fi
+    age="$(sec_lists_age_days || true)"
+    if [ -n "$age" ] && [ "$age" -ge 3 ]; then
+        sec_row warn "Package list" "${age} DAYS OLD" "the numbers above may be out of date: apt update"
+    fi
+    if sec_reboot_needed; then
+        sec_row warn "Server reboot" "NEEDED" "waiting for a reboot: $(tr '\n' ' ' </var/run/reboot-required.pkgs 2>/dev/null | cut -c1-60)"
+        sec_todo "Reboot the server when it is convenient: sudo reboot (containers start again by themselves)"
+    else
+        sec_row good "Server reboot" "NOT NEEDED"
+    fi
+
+    section "SSH login"
+    if has_cmd sshd && ! sec_ssh_known; then
+        sec_row dim "SSH login" "UNKNOWN" "could not read the effective settings (sshd -T)"
+    elif has_cmd sshd; then
+        if sec_ssh_password_open; then
+            sec_row warn "SSH password login" "OPEN" "anyone can try passwords (fail2ban slows them down)"
+            sec_todo "Switch SSH to keys only: Security -> Harden SSH"
+        else
+            sec_row good "SSH password login" "CLOSED" "keys only"
+        fi
+        root_mode="$(sshd_val permitrootlogin)"
+        case "$root_mode" in
+            yes) if sec_ssh_password_open; then
+                     sec_row bad "SSH root login" "PASSWORD OPEN" "root can log in with a password"
+                     sec_todo "Close root password login: Security -> Harden SSH"
+                 else sec_row good "SSH root login" "KEY ONLY" "root can log in with a key only"; fi ;;
+            prohibit-password|without-password|forced-commands-only) sec_row good "SSH root login" "KEY ONLY" "root can log in with a key only" ;;
+            no) sec_row good "SSH root login" "CLOSED" ;;
+            *)  sec_row dim "SSH root login" "UNKNOWN" "could not read the setting" ;;
+        esac
+        users="$(sec_users_with_keys)"
+        if [ -n "$users" ]; then sec_row good "SSH keys on server" "FOUND" "for: $users"
+        else sec_row dim "SSH keys on server" "NONE FOUND" "needed before keys-only login: add yours with ssh-copy-id"; fi
+        explain "SSH port(s): $(sec_ssh_ports)"
+    else
+        sec_row dim "SSH server" "NOT FOUND" "sshd is not installed on this machine"
+    fi
+
+    section "Ports reachable from outside (expected: SSH, 80, 443)"
+    sec_report_ports
+
+    section "Sensitive files"
+    sec_file_issues
+    if [ "${#SEC_BAD_FILES[@]}" -eq 0 ]; then
+        sec_row good ".env, backup secrets" "SAFE" "not readable by other users"
+    else
+        for e in "${SEC_BAD_FILES[@]}"; do
+            IFS='|' read -r path mode kind <<<"$e"
+            sec_row bad "File permissions" "TOO OPEN" "$path (mode $mode)"
+        done
+        sec_todo "Fix file permissions: Security -> Fix permissions of sensitive files"
+    fi
+
+    echo ""
+    if [ "$SEC_ISSUES" -eq 0 ] && [ "$SEC_WARNS" -eq 0 ]; then
+        ok "All checks passed."
+    else
+        printf '%s%d problem(s), %d warning(s).%s\n' "$C_BOLD" "$SEC_ISSUES" "$SEC_WARNS" "$C_RESET"
+        if [ "${#SEC_TODO[@]}" -gt 0 ]; then next_steps "${SEC_TODO[@]}"; fi
+    fi
+    return 0
+}
+
+# ============================================================================
+# FIREWALL (UFW) with lockout protection
+# ============================================================================
+
+sec_firewall_enable() {
+    section "Firewall (UFW) with lockout protection"
+    explain \
+        "Allows only SSH, HTTP (80) and HTTPS (443). Every other incoming connection is blocked." \
+        "Safety net: right after the firewall is switched on you must confirm that you can still reach this server." \
+        "If you do not confirm within about $((SEC_GUARD_SECS / 60)) minutes (or your connection drops), the firewall switches itself off again."
+    local state ssh_in ssh_ports p ufw_bin existing
+    state="$(sec_fw_state)"
+    ssh_in="$(sec_ssh_ports)"; ssh_in="${ssh_in:-22}"
+    sec_session_info
+    info "SSH port(s) detected: $ssh_in"
+    if [ -n "$SEC_SESSION_PORT" ]; then info "Your current connection uses port $SEC_SESSION_PORT (your IP: ${SEC_CLIENT_IP:-?})."; fi
+    while true; do
+        ask "SSH port(s) to keep open" "$ssh_in" p
+        ssh_ports="$(sec_parse_ports "$p")" && break
+        err "Enter port numbers (1-65535) separated by spaces or commas."
+    done
+    if [ -n "$SEC_SESSION_PORT" ] && [[ " $ssh_ports " != *" $SEC_SESSION_PORT "* ]]; then
+        warn "Your current session uses port $SEC_SESSION_PORT, which was not in the list: adding it."
+        ssh_ports="$(sec_parse_ports "$ssh_ports $SEC_SESSION_PORT")"
+    fi
+
+    echo ""
+    printf '%sThe firewall will be set up like this:%s\n' "$C_BOLD" "$C_RESET"
+    echo "   incoming   BLOCK everything except the ports below"
+    echo "   outgoing   allow"
+    for p in $ssh_ports; do echo "   allow      ${p}/tcp    SSH"; done
+    echo "   allow      80/tcp     HTTP (websites, Let's Encrypt)"
+    echo "   allow      443/tcp    HTTPS"
+    if has_cmd ufw; then
+        existing="$(ufw show added 2>/dev/null | grep '^ufw ' || true)"
+        if [ -n "$existing" ]; then
+            echo ""; echo "   Rules that already exist (kept):"; sed 's/^/      /' <<<"$existing"
+        fi
+    fi
+    echo ""
+    explain \
+        "Docker note: ports that Docker publishes (80 and 443 here) bypass UFW by design; UFW protects everything else." \
+        "MariaDB and Redis are not published, so they stay private either way."
+    if [ "$state" = "active" ]; then info "UFW is already ON: these rules are added without turning it off."; fi
+    confirm "Apply this?" n || { info "Skipped. Nothing was changed."; return 0; }
+
+    has_cmd ufw || sec_apt_install ufw || { err "Could not install ufw."; return 1; }
+    ufw_bin="$(command -v ufw)"
+    for p in $ssh_ports; do ufw allow "${p}/tcp" >/dev/null || { err "Could not add the rule for port $p."; return 1; }; done
+    ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null || { err "Could not add the web rules."; return 1; }
+    ufw default deny incoming >/dev/null 2>&1; ufw default allow outgoing >/dev/null 2>&1
+    sec_set SSH_PORTS "$ssh_ports"
+
+    if [ "$state" = "active" ]; then ok "Rules added. The firewall stays ON."; return 0; fi
+
+    sec_guard_start firewall $((SEC_GUARD_SECS + 15)) "$ufw_bin" --force disable \
+        || { err "Could not start the safety timer, so the firewall was NOT enabled."; return 1; }
+    if ! ufw --force enable; then
+        sec_guard_cancel firewall
+        err "ufw could not be enabled. Nothing is blocked."
+        return 1
+    fi
+    echo ""
+    ok "Firewall is ON for now."
+    echo "  ${C_BOLD}Open a SECOND terminal window and log in to this server again.${C_RESET}"
+    echo "  If that works, come back here and type yes. If not, type no (or wait): the firewall switches itself off."
+    echo ""
+    if sec_wait_confirm "$SEC_GUARD_SECS"; then
+        sec_guard_cancel firewall
+        ok "Confirmed. The firewall is ON and stays on after a reboot."
+        next_steps "Next: Security -> fail2ban, then automatic security updates."
+    else
+        sec_guard_cancel firewall
+        ufw --force disable >/dev/null 2>&1
+        warn "Not confirmed: the firewall was switched OFF again. Nothing is blocked."
+        explain "Common reasons: SSH runs on another port than the one entered, or the second login was blocked by something outside this server (cloud firewall)."
+    fi
+}
+
+sec_firewall_show() {
+    section "Firewall rules"
+    if [ "$(sec_fw_state)" = "missing" ]; then info "ufw is not installed."; return 0; fi
+    ufw status verbose 2>/dev/null | sed 's/^/  /'
+}
+
+sec_firewall_open_port() {
+    section "Open another port"
+    has_cmd ufw || { err "ufw is not installed: enable the firewall first."; return 1; }
+    explain "Opens one more incoming port to the whole internet. Only do this for a service you really run."
+    local port proto
+    ask "Port number" "" port
+    valid_port "$port" || { err "Not a valid port."; return 1; }
+    ask "Protocol (tcp or udp)" "tcp" proto
+    [[ "$proto" == tcp || "$proto" == udp ]] || { err "Use tcp or udp."; return 1; }
+    confirm "Allow $((10#$port))/$proto from anywhere?" n || { info "Skipped."; return 0; }
+    ufw allow "$((10#$port))/$proto" && ok "Rule added."
+}
+
+sec_firewall_disable() {
+    section "Turn the firewall off"
+    [ "$(sec_fw_state)" = "active" ] || { info "The firewall is already off."; return 0; }
+    warn "All ports with a service behind them become reachable from the internet."
+    confirm "Turn the firewall off?" n || return 0
+    ufw --force disable >/dev/null && ok "Firewall is OFF. Your rules are kept; enabling it again restores them."
+}
+
+menu_sec_firewall() {
+    local c
+    while true; do
+        clear; banner "Firewall (UFW)" "$C_RED"
+        status_row "Firewall (UFW)" "$([ "$(sec_fw_state)" = active ] && echo good || echo warn)" "$([ "$(sec_fw_state)" = active ] && echo ON || echo OFF)"
+        echo ""
+        echo " 1) Turn on with lockout protection (SSH + 80 + 443)"
+        echo " 2) Show current rules"
+        echo " 3) Open another port"
+        echo " 4) Turn the firewall off"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item sec_firewall_enable ;;
+            2) run_item sec_firewall_show ;;
+            3) run_item sec_firewall_open_port ;;
+            4) run_item sec_firewall_disable ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
+# fail2ban for SSH
+# ============================================================================
+
+F2B_JAIL="/etc/fail2ban/jail.d/hideploy-sshd.local"
+
+sec_valid_time() { [[ "$1" =~ ^[0-9]+[smhdw]?$ ]]; }
+
+sec_f2b_setup() {
+    section "fail2ban for SSH"
+    explain \
+        "Somebody who fails to log in several times is blocked for a while (default: 5 failures in 10 minutes = 1 hour ban)." \
+        "Your current IP is put on the allow-list so you can never lock yourself out with a typo."
+    local ports maxretry findtime bantime ignore backend extra a
+    sec_session_info
+    ports="$(sec_ssh_ports)"; ports="${ports:-22}"
+    info "SSH port(s) watched: $ports"
+    while true; do ask "Failures before a ban" "$(sec_val F2B_MAXRETRY 5)" maxretry; [[ "$maxretry" =~ ^[0-9]+$ ]] && [ "$maxretry" -ge 1 ] && break; err "Enter a number."; done
+    while true; do ask "Within how long (e.g. 10m)" "$(sec_val F2B_FINDTIME 10m)" findtime; sec_valid_time "$findtime" && break; err "Use a number with s, m, h or d (e.g. 10m)."; done
+    while true; do ask "Ban for how long (e.g. 1h, 1d)" "$(sec_val F2B_BANTIME 1h)" bantime; sec_valid_time "$bantime" && break; err "Use a number with s, m, h, d or w (e.g. 1h)."; done
+
+    ignore="$(sec_val F2B_IGNORE "127.0.0.1/8 ::1")"
+    if [ -n "$SEC_CLIENT_IP" ] && [[ " $ignore " != *" $SEC_CLIENT_IP "* ]]; then ignore="$ignore $SEC_CLIENT_IP"; info "Your current IP $SEC_CLIENT_IP was added to the allow-list."; fi
+    while true; do
+        ask "Never-ban list (IPs or ranges, space separated)" "$ignore" extra
+        ignore="$extra"
+        local bad=0; for a in $ignore; do [[ "$a" =~ ^[A-Za-z0-9:./_-]+$ ]] || bad=1; done
+        [ "$bad" -eq 0 ] && [ -n "$ignore" ] && break
+        err "That list contains characters that are not allowed."
+    done
+    if [ -n "$SEC_CLIENT_IP" ] && [[ " $ignore " != *" $SEC_CLIENT_IP "* ]]; then
+        warn "Your current IP ($SEC_CLIENT_IP) is not on the never-ban list: a few wrong passwords from it would ban you."
+    fi
+
+    if [ -s /var/log/auth.log ]; then backend="auto"; else backend="systemd"; fi
+    has_cmd fail2ban-client || { sec_apt_install fail2ban || { err "Could not install fail2ban."; return 1; }; }
+    if [ "$backend" = "systemd" ]; then sec_apt_install python3-systemd >/dev/null 2>&1 || warn "python3-systemd could not be installed; fail2ban will try to cope."; fi
+
+    mkdir -p /etc/fail2ban/jail.d
+    [ -f "$F2B_JAIL" ] && cp -a "$F2B_JAIL" "$F2B_JAIL.bak"
+    cat > "$F2B_JAIL" <<EOF
+# Managed by HiDeploy (main menu 8 -> fail2ban). Change the values from the menu, or edit this file.
+[DEFAULT]
+ignoreip = $ignore
+bantime  = $bantime
+findtime = $findtime
+maxretry = $maxretry
+
+[sshd]
+enabled = true
+port    = ${ports// /,}
+backend = $backend
+EOF
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+        err "fail2ban rejected the configuration:"; fail2ban-client -t 2>&1 | tail -n 8 | sed 's/^/    /'
+        if [ -f "$F2B_JAIL.bak" ]; then mv -f "$F2B_JAIL.bak" "$F2B_JAIL"; else rm -f "$F2B_JAIL"; fi
+        return 1
+    fi
+    rm -f "$F2B_JAIL.bak"
+    systemctl enable fail2ban >/dev/null 2>&1 || true
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        [ "$(sec_f2b_state)" = "active" ] && break
+        sleep 1
+    done
+    if [ "$(sec_f2b_state)" = "active" ]; then
+        sec_set F2B_MAXRETRY "$maxretry"; sec_set F2B_FINDTIME "$findtime"; sec_set F2B_BANTIME "$bantime"; sec_set F2B_IGNORE "$ignore"
+        ok "fail2ban is watching SSH (port ${ports// /,}): $maxretry failures in $findtime = banned for $bantime."
+    else
+        err "fail2ban started, but the SSH jail is not active. Last log lines:"
+        journalctl -u fail2ban -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
+        return 1
+    fi
+}
+
+sec_f2b_status() {
+    section "fail2ban status"
+    case "$(sec_f2b_state)" in
+        missing) info "fail2ban is not installed."; return 0 ;;
+        inactive) warn "fail2ban is installed but not running."; return 0 ;;
+        nojail) warn "fail2ban is running, but the SSH jail is not active."; return 0 ;;
+    esac
+    timeout 5 fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
+    echo ""
+    explain "Never banned: $(sec_val F2B_IGNORE '127.0.0.1/8 ::1')"
+}
+
+sec_f2b_unban() {
+    section "Unban an address"
+    [ "$(sec_f2b_state)" = "active" ] || { info "fail2ban is not active."; return 0; }
+    local ip
+    ask "IP address to unban" "" ip
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || { err "That is not an IP address."; return 1; }
+    fail2ban-client set sshd unbanip "$ip" && ok "$ip was unbanned."
+}
+
+sec_f2b_off() {
+    section "Turn fail2ban off"
+    [ "$(sec_f2b_state)" = "missing" ] && { info "fail2ban is not installed."; return 0; }
+    confirm "Stop fail2ban and keep it off after a reboot?" n || return 0
+    systemctl disable --now fail2ban >/dev/null 2>&1 && ok "fail2ban is OFF (the configuration is kept)."
+}
+
+menu_sec_f2b() {
+    local c
+    while true; do
+        clear; banner "fail2ban (SSH)" "$C_RED"
+        sec_status_rows | grep 'fail2ban'; echo ""
+        echo " 1) Set up / change settings (safe defaults, your IP is allow-listed)"
+        echo " 2) Show status and banned addresses"
+        echo " 3) Unban an address"
+        echo " 4) Turn fail2ban off"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item sec_f2b_setup ;;
+            2) run_item sec_f2b_status ;;
+            3) run_item sec_f2b_unban ;;
+            4) run_item sec_f2b_off ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Automatic security updates
+# ============================================================================
+
+SEC_AUTO_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
+SEC_AUTO_LOCAL="/etc/apt/apt.conf.d/52hideploy-unattended"
+
+sec_auto_write_local() {
+    local time; time="$(sec_val AUTO_REBOOT_TIME 04:30)"
+    {
+        echo "// Managed by HiDeploy (main menu 8). Only the origins in 50unattended-upgrades are used (security updates)."
+        if [ "$(sec_val AUTO_REBOOT no)" = "yes" ]; then
+            echo 'Unattended-Upgrade::Automatic-Reboot "true";'
+            echo "Unattended-Upgrade::Automatic-Reboot-Time \"$time\";"
+        else
+            echo 'Unattended-Upgrade::Automatic-Reboot "false";'
+        fi
+    } > "$SEC_AUTO_LOCAL"
+}
+
+sec_auto_enable() {
+    section "Automatic security updates"
+    explain \
+        "Installs security patches by itself every day. Other updates are left alone, and Docker's own packages are never touched." \
+        "The server is NOT rebooted automatically (you can switch that on separately). If a reboot is needed, the menu tells you."
+    if [ "$(sec_auto_state)" = "on" ]; then ok "Automatic security updates are already ON."; return 0; fi
+    confirm "Turn on automatic security updates?" y || { info "Skipped."; return 0; }
+    sec_apt_install unattended-upgrades || { err "Could not install unattended-upgrades."; return 1; }
+    mkdir -p /etc/apt/apt.conf.d
+    cat > "$SEC_AUTO_FILE" <<'EOF'
+// Managed by HiDeploy (main menu 8).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+    sec_auto_write_local
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+    if [ "$(sec_auto_state)" = "on" ]; then
+        ok "Automatic security updates are ON."
+        local e; e="$(sec_auto_extra_origins)"
+        [ -z "$e" ] || warn "This server is also set to install non-security updates (see /etc/apt/apt.conf.d/50unattended-upgrades)."
+    else
+        err "The setting did not take effect. Check $SEC_AUTO_FILE."
+        return 1
+    fi
+}
+
+sec_auto_disable() {
+    section "Turn off automatic security updates"
+    [ "$(sec_auto_state)" = "on" ] || { info "They are already off."; return 0; }
+    warn "Security patches will then be installed only when you do it yourself."
+    confirm "Turn them off?" n || return 0
+    cat > "$SEC_AUTO_FILE" <<'EOF'
+// Managed by HiDeploy (main menu 8).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+    ok "Automatic security updates are OFF."
+}
+
+sec_auto_reboot_toggle() {
+    section "Automatic reboot after updates"
+    if [ "$(sec_val AUTO_REBOOT no)" = "yes" ]; then
+        ok "Automatic reboot is ON (at $(sec_val AUTO_REBOOT_TIME 04:30), only when an update needs it)."
+        if confirm "Turn it OFF?" n; then sec_set AUTO_REBOOT no; sec_auto_write_local; ok "Automatic reboot is OFF."; fi
+        return 0
+    fi
+    explain \
+        "Kernel and some library updates only take effect after a reboot. With this ON the server reboots by itself," \
+        "at the chosen time, but only when an update really needs it." \
+        "Sites are down for about a minute. Containers start again by themselves (restart policy), except phpMyAdmin, which stays closed on purpose."
+    [ "$(sec_auto_state)" = "on" ] || { warn "Turn on automatic security updates first."; return 1; }
+    confirm "Turn on automatic reboot?" n || return 0
+    local t
+    while true; do ask "Reboot time (HH:MM, server time; pick a quiet hour and not during the backup)" "$(sec_val AUTO_REBOOT_TIME 04:30)" t
+        [[ "$t" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && break; err "Use HH:MM, e.g. 04:30."; done
+    sec_set AUTO_REBOOT yes; sec_set AUTO_REBOOT_TIME "$t"; sec_auto_write_local
+    ok "Automatic reboot is ON at $t."
+}
+
+sec_auto_run_now() {
+    section "Install pending security updates now"
+    has_cmd unattended-upgrade || { err "Turn on automatic security updates first (it installs the tool)."; return 1; }
+    explain "Refreshes the package list and installs the security updates that are waiting. Nothing else is installed."
+    confirm "Run it now?" y || return 0
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y >/dev/null 2>&1 || warn "apt update reported a problem."
+    unattended-upgrade -v 2>&1 | tail -n 25 | sed 's/^/  /'
+    if sec_reboot_needed; then warn "A reboot is needed to finish: sudo reboot (containers start again by themselves)."; else ok "Done. No reboot needed."; fi
+}
+
+sec_auto_log() {
+    section "Recent automatic update activity"
+    local f=/var/log/unattended-upgrades/unattended-upgrades.log
+    [ -f "$f" ] || { info "No log yet."; return 0; }
+    tail -n 25 "$f" | sed 's/^/  /'
+}
+
+menu_sec_auto() {
+    local c
+    while true; do
+        clear; banner "Automatic security updates" "$C_RED"
+        sec_status_rows | grep -E 'Auto updates|Server reboot'; echo ""
+        echo " 1) Turn on (security patches only)"
+        echo " 2) Turn off"
+        echo " 3) Automatic reboot when an update needs it: on / off"
+        echo " 4) Install the waiting security updates now"
+        echo " 5) Show recent activity"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item sec_auto_enable ;;
+            2) run_item sec_auto_disable ;;
+            3) run_item sec_auto_reboot_toggle ;;
+            4) run_item sec_auto_run_now ;;
+            5) run_item sec_auto_log ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Harder SSH: keys only (optional)
+# ============================================================================
+
+SEC_SSH_MAIN="/etc/ssh/sshd_config"
+SEC_SSH_DROPIN="/etc/ssh/sshd_config.d/00-hideploy-hardening.conf"
+SEC_SSH_BACKUP="$SEC_DIR/ssh-backup"
+SEC_SSH_ROLLBACK="$SEC_DIR/ssh-rollback.sh"
+SEC_SSH_BEGIN="# BEGIN hideploy ssh hardening"
+SEC_SSH_END="# END hideploy ssh hardening"
+
+sec_ssh_reload() { systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || service ssh reload >/dev/null 2>&1; }
+
+sec_ssh_hardened() { [ -f "$SEC_SSH_DROPIN" ] || grep -qF "$SEC_SSH_BEGIN" "$SEC_SSH_MAIN" 2>/dev/null; }
+
+# The settings we add. PermitRootLogin only changes when it is "yes" (root keeps working with a key).
+sec_ssh_directives() {
+    local ki="KbdInteractiveAuthentication" cur
+    cur="$(sshd -T 2>/dev/null)"
+    grep -q '^kbdinteractiveauthentication ' <<<"$cur" || ki="ChallengeResponseAuthentication"
+    echo "PasswordAuthentication no"
+    echo "$ki no"
+    echo "PubkeyAuthentication yes"
+    if [ "$(sshd_val permitrootlogin)" = "yes" ]; then echo "PermitRootLogin prohibit-password"; fi
+}
+
+sec_ssh_write_rollback() {
+    cat > "$SEC_SSH_ROLLBACK" <<EOF
+#!/bin/bash
+# Written by HiDeploy: puts the SSH settings back the way they were before "Harden SSH".
+rm -f "$SEC_SSH_DROPIN"
+[ -f "$SEC_SSH_BACKUP/sshd_config.original" ] && cp -a "$SEC_SSH_BACKUP/sshd_config.original" "$SEC_SSH_MAIN"
+if sshd -t; then systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null; fi
+EOF
+    chmod 700 "$SEC_SSH_ROLLBACK"
+}
+
+# Evidence that key logins work: recent successful public-key logins from the logs
+sec_ssh_key_logins() {
+    { journalctl -q --no-pager --since "30 days ago" -u ssh -u sshd 2>/dev/null; cat /var/log/auth.log 2>/dev/null; } \
+        | grep 'Accepted publickey' | tail -n 3
+}
+
+sec_ssh_harden() {
+    section "Harden SSH: keys only"
+    explain \
+        "Closes password login, so only people with an SSH key can log in (root keeps working with a key)." \
+        "This is the single most effective protection against password guessing, but a mistake would lock you out." \
+        "So: it checks that a key exists on this server, asks you to test a key login in a SECOND window first," \
+        "backs up the settings, tests the configuration (sshd -t), and then undoes itself if you cannot confirm."
+    has_cmd sshd || { err "sshd is not installed on this machine."; return 1; }
+    if sec_ssh_hardened; then ok "SSH is already hardened by HiDeploy. Use 'Undo' in the SSH menu to go back."; return 0; fi
+    sec_ssh_known || { err "Could not read the effective SSH settings (sshd -T failed), so it is not safe to change them."; return 1; }
+    if ! sec_ssh_password_open && [ "$(sshd_val permitrootlogin)" != "yes" ]; then ok "Password login is already closed on this server."; return 0; fi
+
+    # 1) a key must exist
+    local users ports port target ip
+    users="$(sec_users_with_keys)"
+    if [ -z "$users" ]; then
+        err "No SSH public key was found on this server (checked root, ${SUDO_USER:-your sudo user} and your login user)."
+        explain "Add your key first, from your own computer:  ssh-copy-id -p <port> <user>@<this-server>" "Then run this again."
+        return 1
+    fi
+    ok "SSH key(s) found for: $users"
+
+    # 2) second-window test
+    sec_session_info
+    ports="$(sec_ssh_ports)"; port="${SEC_SESSION_PORT:-${ports%% *}}"; port="${port:-22}"
+    target="${users%% *}"
+    ip="${SEC_SERVER_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
+    echo ""
+    local logins; logins="$(sec_ssh_key_logins || true)"
+    if [ -n "$logins" ]; then
+        info "Recent successful key logins on this server:"; sed 's/^/    /' <<<"$logins"
+    else
+        warn "No successful key login was found in the logs. Do not skip the test below."
+    fi
+    echo ""
+    echo "  ${C_BOLD}Open a SECOND terminal window on your computer and run exactly this:${C_RESET}"
+    echo "    ssh -p ${port} -o PreferredAuthentications=publickey -o PasswordAuthentication=no ${target}@${ip:-<server-ip>}"
+    echo "  If you get a shell without being asked for a password, the key login works."
+    echo ""
+    local ans; ask "Type TESTED when the key login worked in the second window (anything else cancels)" "" ans
+    [ "${ans^^}" = "TESTED" ] || { info "Cancelled. Nothing was changed."; return 0; }
+
+    echo ""; printf '%sThese settings will be added:%s\n' "$C_BOLD" "$C_RESET"; sec_ssh_directives | sed 's/^/   /'
+    confirm "Apply them now?" n || { info "Cancelled. Nothing was changed."; return 0; }
+
+    # 3) backup, write, test, verify
+    mkdir -p "$SEC_SSH_BACKUP"; chmod 700 "$SEC_SSH_BACKUP"
+    cp -a "$SEC_SSH_MAIN" "$SEC_SSH_BACKUP/sshd_config.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$SEC_SSH_MAIN" "$SEC_SSH_BACKUP/sshd_config.original"
+    sec_ssh_write_rollback
+    ok "Backup of the SSH settings saved in $SEC_SSH_BACKUP"
+
+    local directives; directives="$(sec_ssh_directives)"
+    local done_ok=0 tmp
+    if grep -qiE "^[[:space:]]*Include[[:space:]]+$(dirname "$SEC_SSH_DROPIN")/" "$SEC_SSH_MAIN" 2>/dev/null; then
+        mkdir -p "$(dirname "$SEC_SSH_DROPIN")"
+        { echo "# Managed by HiDeploy (main menu 8 -> Harden SSH). Undo from that menu, or delete this file and reload ssh."; echo "$directives"; } > "$SEC_SSH_DROPIN"
+        if sshd -t 2>/dev/null && sec_ssh_password_closed; then done_ok=1; else rm -f "$SEC_SSH_DROPIN"; fi
+    fi
+    if [ "$done_ok" -eq 0 ]; then
+        tmp="$(mktemp)"
+        { echo "$SEC_SSH_BEGIN"; echo "$directives"; echo "$SEC_SSH_END"; echo ""; cat "$SEC_SSH_BACKUP/sshd_config.original"; } > "$tmp"
+        cat "$tmp" > "$SEC_SSH_MAIN"; rm -f "$tmp"
+        if sshd -t 2>/dev/null && sec_ssh_password_closed; then done_ok=1; fi
+    fi
+    if [ "$done_ok" -eq 0 ]; then
+        err "The new settings were rejected by 'sshd -t' or did not take effect. Restoring the original."
+        sshd -t 2>&1 | head -n 5 | sed 's/^/    /'
+        bash "$SEC_SSH_ROLLBACK" >/dev/null 2>&1
+        return 1
+    fi
+    ok "sshd -t passed and the settings are effective."
+
+    # 4) reload with a guard
+    sec_guard_start ssh $((SEC_GUARD_SECS + 15)) /bin/bash "$SEC_SSH_ROLLBACK" \
+        || { err "Could not start the safety timer, so nothing was applied."; bash "$SEC_SSH_ROLLBACK" >/dev/null 2>&1; return 1; }
+    if ! sec_ssh_reload; then
+        sec_guard_cancel ssh; bash "$SEC_SSH_ROLLBACK" >/dev/null 2>&1
+        err "ssh could not be reloaded. The original settings were restored."
+        return 1
+    fi
+    echo ""
+    ok "SSH reloaded: password login is now closed. Your current session stays open."
+    echo "  ${C_BOLD}In a NEW window, log in with your key once more to prove it still works.${C_RESET}"
+    echo "  If you cannot, type no (or wait): the old settings come back by themselves."
+    echo ""
+    if sec_wait_confirm "$SEC_GUARD_SECS"; then
+        sec_guard_cancel ssh
+        ok "Confirmed. SSH accepts keys only."
+        explain "To go back: Security -> Harden SSH -> Undo. Backups: $SEC_SSH_BACKUP"
+    else
+        sec_guard_cancel ssh
+        bash "$SEC_SSH_ROLLBACK" >/dev/null 2>&1
+        warn "Not confirmed: the original SSH settings were restored."
+    fi
+}
+
+sec_ssh_undo() {
+    section "Undo SSH hardening"
+    if ! sec_ssh_hardened; then info "HiDeploy has not hardened SSH on this server (nothing to undo)."; return 0; fi
+    [ -f "$SEC_SSH_ROLLBACK" ] || sec_ssh_write_rollback
+    confirm "Restore the SSH settings from before the hardening (password login comes back)?" n || return 0
+    bash "$SEC_SSH_ROLLBACK" && ok "Original SSH settings restored."
+}
+
+sec_ssh_show() {
+    section "Effective SSH settings"
+    has_cmd sshd || { info "sshd is not installed."; return 0; }
+    sshd -T 2>/dev/null | grep -E '^(port|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitrootlogin|pubkeyauthentication|usepam|authorizedkeysfile) ' | sed 's/^/  /'
+}
+
+menu_sec_ssh() {
+    local c
+    while true; do
+        clear; banner "Harden SSH (keys only)" "$C_RED"
+        sec_status_rows | grep 'SSH login'; echo ""
+        echo " 1) Switch to keys only (with checks, backup and automatic undo)"
+        echo " 2) Undo: restore the previous SSH settings"
+        echo " 3) Show the effective SSH settings"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item sec_ssh_harden ;;
+            2) run_item sec_ssh_undo ;;
+            3) run_item sec_ssh_show ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
+# Menu 8
+# ============================================================================
+
+menu_security() {
+    local c
+    while true; do
+        clear; banner "8) Security" "$C_RED"
+        explain "Basic server protection. Nothing changes until you confirm, and risky steps undo themselves if you lose access." ""
+        sec_status_rows; echo ""
+        echo " 1) Security check (full report: what is fine, what to fix)"
+        echo " 2) Firewall (UFW) with lockout protection"
+        echo " 3) fail2ban (blocks repeated wrong SSH passwords)"
+        echo " 4) Automatic security updates"
+        echo " 5) Harden SSH (keys only)  - optional"
+        echo " 6) Fix permissions of sensitive files"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item sec_report ;;
+            2) menu_sec_firewall ;;
+            3) menu_sec_f2b ;;
+            4) menu_sec_auto ;;
+            5) menu_sec_ssh ;;
+            6) run_item sec_files_fix ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -4814,7 +5859,7 @@ menu_prepare() {
         echo " 4) Install GitLab Runner"
         echo " 5) Register GitLab Runner"
         echo " 6) Runner access (docker group + SSH key)"
-        echo " 7) Firewall (optional)"
+        echo " 7) Firewall (optional, with lockout protection)"
         echo " 8) Swap file (optional)"
         echo " A) Run ALL of the above in order"
         echo " 0) Back"
@@ -4868,6 +5913,7 @@ Usage:
   sudo hideploy update     install the latest version from GitHub (${HIDEPLOY_REPO})
   sudo hideploy backup-run run one backup now (this is what the nightly job calls)
   sudo hideploy cleanup-run run the safe disk cleanup now (the weekly job calls this)
+  sudo hideploy security-check  print the security report (firewall, fail2ban, updates, SSH, ports, files)
 EOF
 }
 
@@ -4887,6 +5933,11 @@ main() {
             [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy cleanup-run" >&2; exit 1; }
             cleanup_safe
             exit 0 ;;
+        security-check)
+            [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy security-check" >&2; exit 1; }
+            sec_report
+            [ "$SEC_ISSUES" -eq 0 ]
+            exit $? ;;
         "") ;;
         *) err "Unknown command: $1"; usage; exit 1 ;;
     esac
@@ -4905,6 +5956,7 @@ main() {
         echo " 5) Manage Projects             (deploy, logs, backup, SSL, remove)"
         echo " 6) Backups                     (automatic, encrypted, copied off the server)"
         echo " 7) Performance tuning          (nginx, MariaDB, PHP-FPM: faster pages, less cold start)"
+        echo " 8) Security                    (firewall, fail2ban, automatic security updates, SSH, checks)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -4915,6 +5967,7 @@ main() {
             5) menu_manage ;;
             6) menu_backups ;;
             7) menu_perf ;;
+            8) menu_security ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac

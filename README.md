@@ -59,6 +59,7 @@ hideploy --help          # show help
 sudo hideploy update     # install the latest version (your projects are not touched)
 sudo hideploy backup-run # run one backup now (the nightly job calls this)
 sudo hideploy cleanup-run # run the safe disk cleanup now (the weekly job calls this)
+sudo hideploy security-check # print the security report (exit code 1 when it finds a problem)
 ```
 
 ### Manual install
@@ -92,9 +93,10 @@ HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 5) Manage Projects             →  deploy, logs, backups, restore, SSL, remove
 6) Backups                     →  automatic, encrypted, copied off the server
 7) Performance tuning          →  nginx, MariaDB, PHP-FPM sized for your server, cold-start diagnosis
+8) Security                    →  firewall with lockout guard, fail2ban, automatic security updates, SSH, security check
 ```
 
-On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**. Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status and the recommended next step.
+On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**, and finally **`8`** (security). Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status (including firewall, fail2ban, automatic updates and SSH login) and the recommended next step.
 
 ---
 
@@ -141,6 +143,11 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **Maintenance mode during every deployment**: visitors see a friendly page instead of errors; manual on/off switch | automatic / Project menu → Deployments |
 | **Disk usage warning and safe cleanup** (Docker leftovers, old logs, package cache), optional weekly automatic cleanup | Manage Projects → Disk usage and cleanup |
 | Logs, shell, artisan, `.env` editing, manual deploy | Project menu |
+| **Security check:** firewall, fail2ban, automatic updates, waiting updates / reboot, SSH password and root login, ports open to the internet, permissions of `.env` and backup secrets | Main menu top + Security → 1 |
+| **Firewall (UFW) with lockout guard:** detects the real SSH port, shows the rules first, switches itself off again if you do not confirm you can still log in | Security → Firewall |
+| **fail2ban for SSH** with safe defaults (your IP is never banned) | Security → fail2ban |
+| **Automatic security updates** (security patches only; automatic reboot is off by default) | Security → Automatic security updates |
+| **Keys-only SSH** (optional), with key check, `sshd -t`, backup and automatic undo | Security → Harden SSH |
 
 ---
 
@@ -180,6 +187,10 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | Weekly cleanup schedule / log | `/etc/cron.d/hideploy-cleanup` / `/var/log/hideploy-cleanup.log` |
 | Generated project files | `/root/hideploy-templates/<domain>` |
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
+| Security settings, SSH backups and undo script | `/var/www/infrastructure/security` |
+| fail2ban jail (SSH) | `/etc/fail2ban/jail.d/hideploy-sshd.local` |
+| Automatic updates | `/etc/apt/apt.conf.d/20auto-upgrades` + `/etc/apt/apt.conf.d/52hideploy-unattended` |
+| Keys-only SSH (when enabled) | `/etc/ssh/sshd_config.d/00-hideploy-hardening.conf` (or a marked block at the top of `sshd_config`) |
 
 Project code stays on the server disk, so `.env` and logs are easy to read and edit. The four files you commit to your repository are generic; server-specific values are in `/var/www/projects/<domain>/.deploy.env`.
 
@@ -245,6 +256,34 @@ Open **7) Performance tuning**. **Nothing is applied automatically**: until you 
 
 ---
 
+## Security (basic server protection)
+
+Open **8) Security**. **Nothing is changed until you confirm**, and the two steps that could lock you out (firewall, SSH login) undo themselves if you cannot confirm that you still have access. The same checks are shown at the top of the main menu, and `sudo hideploy security-check` prints the full report from the command line.
+
+**1. Security check.** One page that shows:
+
+- firewall on or off, fail2ban on or off, automatic security updates on or off
+- packages waiting to be installed (and how many of them are security fixes), and whether the server needs a **reboot**
+- SSH **password login** and **root login** open or closed
+- which ports are reachable from outside: only SSH, 80 and 443 are expected, anything else is flagged (a database or Redis port is marked as a real problem). Ports that Docker publishes are labelled as such, because UFW does not filter them
+- whether `.env`, `.deploy.env`, the backup passphrase, destination keys and the database password are readable by other users (one menu item fixes them)
+
+**2. Firewall with lockout guard.** HiDeploy finds the real SSH port (sshd configuration, what sshd listens on, and the port of your current connection), shows the exact rules, and only then enables UFW with *incoming: block, outgoing: allow, allow SSH + 80 + 443*. Right after enabling, open a **second** terminal and log in again; type `yes` in the first one to keep the firewall. If you type `no`, wait about 2 minutes, or your connection drops, a timer switches the firewall off again. This is the part a manual `ufw enable` does not give you. If UFW is already on, new rules are just added.
+
+**3. fail2ban for SSH.** Installs fail2ban and writes one jail file: by default 5 failed logins within 10 minutes ban the address for 1 hour. Your current IP (and `127.0.0.1`, `::1`) is on the never-ban list. Settings can be changed, banned addresses listed and unbanned from the same menu.
+
+**4. Automatic security updates.** Turns on `unattended-upgrades` for **security patches only** (Docker's own packages are not touched). The server is **not rebooted automatically** unless you switch that on and choose a time; when an update needs a reboot, the status table says so. You can also install the waiting security updates immediately.
+
+**5. Keys-only SSH (optional).** Closes password login (and turns root password login into key-only). It runs only when:
+
+1. a public key exists on the server for a user that can log in,
+2. you confirmed that you tested a key login from a **second window** (HiDeploy prints the exact `ssh` command and shows recent key logins from the logs),
+3. `sshd -t` accepts the new settings and they are really effective (`sshd -T`).
+
+A copy of your SSH settings is saved first. After the reload you must prove once more, from a new window, that the key login works, otherwise the old settings come back by themselves. **Undo** is always in the same menu.
+
+---
+
 ## Disk usage and cleanup
 
 The menu shows the disk usage in the status table (yellow from 80%, red from 90%). *Manage Projects → Disk usage and cleanup* offers:
@@ -278,6 +317,7 @@ Each backup contains, per run: one file per project database, the project files 
 
 ## Security notes
 
+- Use **8) Security** after the first deployment: firewall, fail2ban and automatic security updates cover the most common ways a small server gets compromised. Keep a cloud-provider console at hand the first time you touch the firewall or SSH.
 - HiDeploy must run as **root**. Install it only on servers you control, and read `install.sh` and `hideploy.sh` before piping anything into `sudo bash`.
 - The `gitlab-runner` user is added to the `docker` group, which is **equivalent to root access** on that server. Only run pipelines you trust.
 - MariaDB is not published to the internet; only containers on `web_network` can reach it.
@@ -311,7 +351,7 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [ ] Failure notifications (email / Telegram)
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
-- [ ] Security hardening (firewall, fail2ban, automatic security updates)
+- [x] Security hardening (firewall with lockout guard, fail2ban, automatic security updates, SSH keys-only, security check)
 - [x] Project management after deployment (domains, memory, Redis, upload size)
 - [x] Next.js project type
 - [x] Performance tuning sized from a server scan
