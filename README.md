@@ -60,6 +60,8 @@ sudo hideploy update     # install the latest version (your projects are not tou
 sudo hideploy backup-run # run one backup now (the nightly job calls this)
 sudo hideploy cleanup-run # run the safe disk cleanup now (the weekly job calls this)
 sudo hideploy security-check # print the security report (exit code 1 when it finds a problem)
+sudo hideploy notify-test # send a test notification to every channel that is switched on
+sudo hideploy notify-run  # send waiting notifications and check the server (the every-minute job calls this)
 ```
 
 ### Manual install
@@ -95,6 +97,7 @@ HiDeploy installs Docker, GitLab Runner, nginx and MariaDB for you.
 7) Performance tuning          →  nginx, MariaDB, PHP-FPM sized for your server, cold-start diagnosis
 8) Security                    →  firewall with lockout guard, fail2ban, automatic security updates, SSH, security check
 9) Email                       →  your own mail server for every domain: mailboxes, DNS help, optional webmail
+10) Notifications              →  alerts by email and Telegram: deployments, backups, stopped services, disk, certificates
 ```
 
 On a brand-new server choose **`1` → `A`** (run everything), then **`2` → `A`**, and finally **`8`** (security). Each step checks what is already done and skips it, so re-running is safe. The top of the menu always shows the server status (including firewall, fail2ban, automatic updates and SSH login) and the recommended next step.
@@ -149,6 +152,7 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **fail2ban for SSH** with safe defaults (your IP is never banned) | Security → fail2ban |
 | **Automatic security updates** (security patches only; automatic reboot is off by default) | Security → Automatic security updates |
 | **Own mail server, no outside SMTP/API service:** one shared server for all your domains; `info@example.com`, `noreply@example.com`, aliases; DKIM key, SPF/DMARC records generated and checked; a project can send through its own mailbox with one menu step | Email (main menu 9) / Project menu → Email |
+| **Notifications by email and Telegram:** deployment succeeded / failed (from the menu **and** from GitLab pipelines), rollback, backup result, SSL renewal failed, certificate about to expire, a project or shared service stopped, disk almost full, reboot needed; each event can be switched on or off, projects can be muted | Notifications (main menu 10) |
 | **Webmail (Roundcube)** on its own domain: read and send mail in the browser; HTTPS, optional Basic Auth and IP list; start/stop on demand like phpMyAdmin | Email → Webmail |
 | **Keys-only SSH** (optional), with key check, `sshd -t`, backup and automatic undo | Security → Harden SSH |
 
@@ -192,6 +196,9 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 | Mail server: config (accounts, aliases, DKIM keys) / messages | `/var/www/infrastructure/mail/config` / `/var/www/infrastructure/mail/data` |
 | Webmail (optional) | `/var/www/infrastructure/webmail` |
+| Notifications: settings and secrets / remembered problems | `/var/www/infrastructure/notify/notify.env` / `.../notify/state` (root only) |
+| Notifications: events dropped by pipelines | `/var/spool/hideploy-notify` (no secrets) |
+| Notifications: job / log | `/etc/cron.d/hideploy-notify` (every minute) / `/var/log/hideploy-notify.log` |
 | Security settings, SSH backups and undo script | `/var/www/infrastructure/security` |
 | fail2ban jail (SSH) | `/etc/fail2ban/jail.d/hideploy-sshd.local` |
 | Automatic updates | `/etc/apt/apt.conf.d/20auto-upgrades` + `/etc/apt/apt.conf.d/52hideploy-unattended` |
@@ -323,6 +330,39 @@ Open **9) Email**. HiDeploy runs **one shared mail server** (Postfix + Dovecot +
 
 ---
 
+## Notifications (email and Telegram)
+
+Open **10) Notifications**. HiDeploy tells you what happens on your server, so you do not have to look.
+
+**Channels** (use one or both; both together is safest):
+- **Email**, sent by **your own mail server** (menu 9). HiDeploy creates a dedicated mailbox `notifications@<your domain>` with a generated password, kept in a file only root can read, and sends alerts to the addresses you give (they can be on any provider).
+- **Telegram:** create a bot with @BotFather (one minute), paste its token, write one message to the bot, and HiDeploy finds your chat by itself. Several chats or groups are possible. If Telegram is blocked from your server, set a proxy (`socks5h://...` or `http://...`).
+
+**Events** (each one can be switched on or off):
+
+| Event | When | Default |
+|---|---|---|
+| Deployment failed / succeeded | after every deployment, from a GitLab pipeline **or** from the HiDeploy menu (commit, author, duration, pipeline and job links) | on |
+| Rollback | when you roll back to an earlier version | on |
+| Backup failed / finished | result of every backup run | failed: on, finished: off |
+| SSL renewal failed | the daily renewal job reports an error | on |
+| Certificate expires soon | fewer than 14 days left (adjustable) | on |
+| A project or shared service stopped | a project, nginx, MariaDB, Redis, the mail server or Docker stopped, missing or unhealthy | on |
+| Disk almost full | 90% used or more (adjustable) | on |
+| Server needs a reboot | updates are waiting for a reboot | off |
+
+**No message storms.** A problem is announced **once**, repeated as a reminder after 24 hours if it is still there, and announced again as **resolved** when it is fixed. A stopped container must be seen in two checks in a row (5 minutes apart), so the normal restart during a deployment never triggers an alert. Several problems found together arrive as one message. If a channel is temporarily unreachable, delivery is retried for up to an hour, and only the recipients that did not get it yet are retried.
+
+**Pipelines.** A GitLab pipeline runs as the unprivileged `gitlab-runner` user, which must never see your Telegram token or mailbox password. So the pipeline only drops a small event file into `/var/spool/hideploy-notify`, and a root job (every minute) turns it into messages. For this the project needs the newer `.gitlab-ci.yml`: *Notifications → Pipeline notifications* lists which projects are ready and writes the new file for the others (copy it into your repository and push; the Dockerfile and compose file are not touched). Deployments started from the HiDeploy menu always notify.
+
+**Good to know**
+- *Notifications → Settings* sets the server name shown in messages, the disk and certificate thresholds, and lets you **mute projects** (for example a test site).
+- *Notifications → Send a test notification* shows, per channel, whether delivery worked and the reason if it did not.
+- If the mail server itself is down, an email about it cannot be delivered; that is why Telegram next to email is recommended.
+- Nothing is sent, and no background job exists, until you turn notifications on. Turning them off removes the job and the spool folder; your settings are kept.
+
+---
+
 ## Automatic backups
 
 Open **6) Backups** and follow the recommended order shown at the top of the menu:
@@ -351,6 +391,7 @@ Each backup contains, per run: one file per project database, the project files 
 - Each project gets its **own database user** with access to its own database only.
 - phpMyAdmin is optional and **off by default**. When enabled it is protected by HTTPS and Basic Auth (plus an optional IP allow-list). Stop it when you are done: the domain then stops answering completely.
 - The mail server is **off until you install it**. Once installed it must be reachable from the internet (ports 25, 465, 587, 993); sending as another mailbox is blocked, and the mail server bans addresses that fail to log in repeatedly. The webmail is **closed by default**; open it only when needed.
+- Notification secrets (Telegram bot token, the mailbox password of the sender) live in `notify.env`, readable by root only, and are part of the encrypted server-configuration backup. The Telegram token is never placed on a command line, and pipelines can only drop event files: files from the spool are never executed or sourced, only a few known fields are read and cleaned.
 - Deploy keys are read-only.
 
 ---
@@ -377,7 +418,7 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [ ] Web panel (Persian-friendly dashboard for the same actions)
 - [x] Automatic encrypted backups (SSH + S3)
 - [x] Own mail server and webmail for every project domain
-- [ ] Failure notifications (email / Telegram), using your own mail server
+- [x] Notifications by email (own mail server) and Telegram
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
 - [x] Security hardening (firewall with lockout guard, fail2ban, automatic security updates, SSH keys-only, security check)

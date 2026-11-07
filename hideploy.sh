@@ -10,6 +10,7 @@
 #   5) Manage projects (logs, deploy, backup, SSL, remove)
 #   8) Security (firewall with lockout guard, fail2ban, automatic security updates, SSH, checks)
 #   9) Email (own mail server for all your domains: mailboxes, DKIM/SPF/DMARC help, optional webmail)
+#  10) Notifications (email + Telegram alerts: deployments, backups, stopped services, disk, certificates)
 #
 # Architecture (kept deliberately simple):
 #
@@ -26,7 +27,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.6.0"
+HIDEPLOY_VERSION="1.7.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -94,6 +95,16 @@ MAILWEB_CONTAINER="global-webmail"
 MAILWEB_DIR="$INFRA_DIR/webmail"
 MAILWEB_IMAGE="roundcube/roundcubemail:latest-apache"
 MAILWEB_HTPASSWD="$NGINX_DIR/conf.d/webmail.htpasswd"
+
+# Notifications (email + Telegram, main menu 10)
+NOTIFY_DIR="$INFRA_DIR/notify"             # settings and secrets (root only)
+NOTIFY_CONF="$NOTIFY_DIR/notify.env"
+NOTIFY_STATE="$NOTIFY_DIR/state"
+NOTIFY_LOCK="$NOTIFY_DIR/.lock"
+NOTIFY_SPOOL="/var/spool/hideploy-notify"  # pipelines drop small event files here (no secrets in it)
+NOTIFY_CRON="/etc/cron.d/hideploy-notify"
+NOTIFY_LOG="/var/log/hideploy-notify.log"
+TG_API_BASE="https://api.telegram.org"
 
 # Security (main menu 8)
 SEC_DIR="$INFRA_DIR/security"              # settings and SSH backups (no secrets)
@@ -329,6 +340,7 @@ suggest_next() {
     if [ "$(sec_f2b_state)" != "active" ];  then echo "Choose 8) Security -> fail2ban"; return; fi
     if [ "$(sec_auto_state)" != "on" ];     then echo "Choose 8) Security -> Automatic security updates"; return; fi
     if sec_reboot_needed;                   then echo "The server needs a reboot to finish updates: sudo reboot"; return; fi
+    if ! nf_configured;                     then echo "Choose 10) Notifications -> get alerts by email or Telegram (deployments, backups, stopped services)"; return; fi
     echo "Choose 4) to deploy another project, or 5) to manage existing ones"
 }
 
@@ -358,6 +370,7 @@ show_status() {
     redis_status_row
     mail_status_row
     mailweb_status_row
+    nf_status_row
     bk_status_row
     sec_status_rows
     disk_row
@@ -702,6 +715,10 @@ docker run --rm \
     -v "__NGINX_DIR__/certbot-www:/var/www/certbot" \
     __CERTBOT_IMAGE__ renew --quiet
 rc=$?
+if [ "$rc" -ne 0 ] && [ -d __NOTIFY_SPOOL__ ]; then
+    f="__NOTIFY_SPOOL__/$(date +%s%N)-$$.evt"
+    { echo "EVENT=ssl_fail"; echo "DETAIL=certbot renew ended with exit code $rc (log: __RENEW_LOG__)"; } > "$f.tmp" && mv "$f.tmp" "$f"
+fi
 if docker exec __NGINX_CONTAINER__ nginx -s reload >/dev/null 2>&1; then echo "nginx reloaded"; fi
 if docker inspect __MAIL_CONTAINER__ >/dev/null 2>&1; then
     if docker exec __MAIL_CONTAINER__ sh -c 'postfix reload >/dev/null 2>&1; doveadm reload >/dev/null 2>&1'; then echo "mail server reloaded"; fi
@@ -710,7 +727,8 @@ echo "[$(date -Is)] Finished (certbot exit code: $rc)"
 exit $rc
 EOF
     sed -i -e "s|__NGINX_DIR__|$NGINX_DIR|g" -e "s|__CERTBOT_IMAGE__|$CERTBOT_IMAGE|g" \
-           -e "s|__NGINX_CONTAINER__|$NGINX_CONTAINER|g" -e "s|__MAIL_CONTAINER__|$MAIL_CONTAINER|g" "$RENEW_SCRIPT"
+           -e "s|__NGINX_CONTAINER__|$NGINX_CONTAINER|g" -e "s|__MAIL_CONTAINER__|$MAIL_CONTAINER|g" \
+           -e "s|__NOTIFY_SPOOL__|$NOTIFY_SPOOL|g" -e "s|__RENEW_LOG__|$RENEW_LOG|g" "$RENEW_SCRIPT"
     chmod 755 "$RENEW_SCRIPT"
     printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n17 3 * * * root %s >> %s 2>&1\n' \
         "$RENEW_SCRIPT" "$RENEW_LOG" > "$RENEW_CRON"
@@ -919,10 +937,27 @@ deploy_production:
       dc()      { docker compose -p "$CONTAINER_NAME" --env-file .deploy.env -f docker-compose.prod.yml "$@"; }
       dexec()   { docker exec -u "$APP_UID:$APP_GID" -w "$APP_PATH" "$CONTAINER_NAME" "$@"; }
       artisan() { dexec php artisan "$@"; }
+      T0="$(date +%s)"
+      notify_event() {   # HiDeploy notifications: leaves a small event file, the server sends it within a minute
+        local d="__NOTIFY_SPOOL__" ev f
+        case "$1" in ok) ev=deploy_ok ;; failed) ev=deploy_fail ;; *) return 0 ;; esac
+        [ -d "$d" ] && [ -w "$d" ] || return 0
+        f="$d/$(date +%s%N)-$$.evt"
+        {
+          echo "EVENT=$ev"; echo "MODE=pipeline"; echo "DOMAIN=${DOMAIN:-}"
+          echo "COMMIT=${CI_COMMIT_SHORT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+          echo "MESSAGE=$(printf '%s' "${CI_COMMIT_TITLE:-}" | tr -d '\r\n' | cut -c1-120)"
+          echo "AUTHOR=$(printf '%s' "${GITLAB_USER_NAME:-}" | tr -d '\r\n' | cut -c1-60)"
+          echo "BRANCH=${CI_COMMIT_BRANCH:-}"
+          echo "PIPELINE_URL=${CI_PIPELINE_URL:-}"; echo "JOB_URL=${CI_JOB_URL:-}"
+          echo "SECONDS=$(( $(date +%s) - T0 ))"
+        } > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || true
+      }
       record()  {
         echo "$(date -Is) $(git rev-parse --short HEAD 2>/dev/null || echo unknown) $1 $(git log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-80)" >> .deploy.history
         tail -n 200 .deploy.history > .deploy.history.tmp && mv .deploy.history.tmp .deploy.history
         grep -qxF ".deploy.history" .git/info/exclude 2>/dev/null || echo ".deploy.history" >> .git/info/exclude
+        notify_event "$1" || true
       }
 
       MAINT=no
@@ -983,13 +1018,13 @@ generate_project_files() {
         tpl_next_compose          > "$tmp/docker-compose.prod.yml"
         tpl_next_dockerignore     > "$tmp/.dockerignore"
         tpl_next_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
-                          -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" > "$tmp/.gitlab-ci.yml"
+                          -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" -e "s|__NOTIFY_SPOOL__|$NOTIFY_SPOOL|g" > "$tmp/.gitlab-ci.yml"
     else
         tpl_dockerfile   > "$tmp/Dockerfile"
         tpl_compose      > "$tmp/docker-compose.prod.yml"
         tpl_dockerignore > "$tmp/.dockerignore"
         tpl_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
-                     -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" > "$tmp/.gitlab-ci.yml"
+                     -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" -e "s|__NOTIFY_SPOOL__|$NOTIFY_SPOOL|g" > "$tmp/.gitlab-ci.yml"
     fi
     mkdir -p "$dir"
     for f in Dockerfile docker-compose.prod.yml .dockerignore .gitlab-ci.yml; do
@@ -1650,9 +1685,10 @@ deploy_project_inner() {
 # deploy_project PATH [pull yes|no] [target-commit]
 # Keeps the site in maintenance mode while the code is replaced, records the result in .deploy.history
 deploy_project() {
-    local path="$1" pull="${2:-yes}" target="${3:-}" rc status="ok"
+    local path="$1" pull="${2:-yes}" target="${3:-}" rc status="ok" t0 ev
     load_project "$path" || return 1
     cd "$path" || return 1
+    t0="$(date +%s)"
     deploy_maint_on
     deploy_project_inner "$path" "$pull" "$target"; rc=$?
     [ -z "$target" ] || status="rollback"
@@ -1663,13 +1699,16 @@ deploy_project() {
         docker image prune -f >/dev/null 2>&1 || true
         deploy_record "$path" "$status"
         ok "Deployment finished."
+        ev="deploy_ok"; [ -z "$target" ] || ev="rollback"
     else
+        ev="deploy_fail"
         deploy_record "$path" failed
         if [ "$DEPLOY_MAINT_ON" = "yes" ]; then
             warn "The site was left in maintenance mode on purpose: half-updated code can break pages or data."
             explain "Fix the problem and deploy again, or roll back: Manage Projects -> this project -> Deployments -> Roll back."
         fi
     fi
+    nf_emit_deploy "$ev" "$path" $(( $(date +%s) - t0 ))
     return "$rc"
 }
 
@@ -2258,10 +2297,27 @@ deploy_production:
       set -a; . ./.deploy.env; set +a
 
       dc()     { docker compose -p "$CONTAINER_NAME" --env-file .deploy.env -f docker-compose.prod.yml "$@"; }
+      T0="$(date +%s)"
+      notify_event() {   # HiDeploy notifications: leaves a small event file, the server sends it within a minute
+        local d="__NOTIFY_SPOOL__" ev f
+        case "$1" in ok) ev=deploy_ok ;; failed) ev=deploy_fail ;; *) return 0 ;; esac
+        [ -d "$d" ] && [ -w "$d" ] || return 0
+        f="$d/$(date +%s%N)-$$.evt"
+        {
+          echo "EVENT=$ev"; echo "MODE=pipeline"; echo "DOMAIN=${DOMAIN:-}"
+          echo "COMMIT=${CI_COMMIT_SHORT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+          echo "MESSAGE=$(printf '%s' "${CI_COMMIT_TITLE:-}" | tr -d '\r\n' | cut -c1-120)"
+          echo "AUTHOR=$(printf '%s' "${GITLAB_USER_NAME:-}" | tr -d '\r\n' | cut -c1-60)"
+          echo "BRANCH=${CI_COMMIT_BRANCH:-}"
+          echo "PIPELINE_URL=${CI_PIPELINE_URL:-}"; echo "JOB_URL=${CI_JOB_URL:-}"
+          echo "SECONDS=$(( $(date +%s) - T0 ))"
+        } > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null || true
+      }
       record() {
         echo "$(date -Is) $(git rev-parse --short HEAD 2>/dev/null || echo unknown) $1 $(git log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-80)" >> .deploy.history
         tail -n 200 .deploy.history > .deploy.history.tmp && mv .deploy.history.tmp .deploy.history
         grep -qxF ".deploy.history" .git/info/exclude 2>/dev/null || echo ".deploy.history" >> .git/info/exclude
+        notify_event "$1" || true
       }
       trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo; echo "!! Deployment FAILED. If the build failed, the previous version is still running."; echo "!! Fix the problem and push again, or roll back: sudo hideploy -> 5) Manage Projects -> this project -> Deployments -> Roll back."; record failed || true; fi' EXIT
 
@@ -3603,11 +3659,18 @@ bk_run_inner() {
 
 # Non-interactive entry point (cron calls:  hideploy backup-run)
 backup_run() {
+    local rc
+    backup_run_core; rc=$?
+    nf_emit_backup "$rc"
+    return "$rc"
+}
+
+backup_run_core() {
     [ -s "$BK_PASS" ] || { echo "[backup] No passphrase yet. Open: sudo hideploy -> 6) Backups -> 2"; return 1; }
     has_cmd gpg      || { echo "[backup] gpg is missing: apt-get install -y gnupg"; return 1; }
     docker_ready     || { echo "[backup] Docker is not running."; return 1; }
     mkdir -p "$BK_LOCAL_DIR" "$BK_DIR"; chmod 700 "$BACKUP_DIR" "$BK_LOCAL_DIR" 2>/dev/null
-    ( flock -n 9 || { echo "[backup] Another backup is already running."; exit 1; }; bk_run_inner ) 9>"$BK_DIR/.lock"
+    ( flock -n 9 || { echo "[backup] Another backup is already running."; exit 75; }; bk_run_inner ) 9>"$BK_DIR/.lock"
 }
 
 # ---------- schedule, status, on/off --------------------------------------
@@ -3898,7 +3961,7 @@ hideploy_self() { local s; s="$(command -v hideploy 2>/dev/null || true)"; print
 
 write_logrotate() {
     cat > /etc/logrotate.d/hideploy <<EOF
-$BK_LOG $RENEW_LOG $CLEANUP_LOG {
+$BK_LOG $RENEW_LOG $CLEANUP_LOG $NOTIFY_LOG {
     weekly
     rotate 8
     compress
@@ -5089,7 +5152,7 @@ sec_users_with_keys() {
 sec_file_issues() {
     SEC_BAD_FILES=()
     local f m p
-    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR" "$MAIL_DIR/config/postfix-accounts.cf"; do
+    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR" "$MAIL_DIR/config/postfix-accounts.cf" "$NOTIFY_DIR" "$NOTIFY_CONF"; do
         [ -e "$f" ] || continue
         m="$(stat -c %a "$f" 2>/dev/null)" || continue
         if (( (8#$m & 077) != 0 )); then SEC_BAD_FILES+=("$f|$m|priv"); fi
@@ -5975,20 +6038,21 @@ mail_aliases() {
 }
 
 # mail_pick_domain VAR  -> choose one of the registered mail domains
+# (the local names start with __ on purpose: the caller's variable name must never collide with them)
 mail_pick_domain() {
-    local __var="$1" choice i=1 d
-    local -a list=()
-    mapfile -t list < <(mail_domains)
-    if [ "${#list[@]}" -eq 0 ]; then err "No mail domain yet. Add one first (Email -> Mail domains)."; return 1; fi
-    if [ "${#list[@]}" -eq 1 ]; then printf -v "$__var" '%s' "${list[0]}"; return 0; fi
+    local __var="$1" __c __i=1 __d
+    local -a __list=()
+    mapfile -t __list < <(mail_domains)
+    if [ "${#__list[@]}" -eq 0 ]; then err "No mail domain yet. Add one first (Email -> Mail domains)."; return 1; fi
+    if [ "${#__list[@]}" -eq 1 ]; then printf -v "$__var" '%s' "${__list[0]}"; return 0; fi
     echo ""
-    for d in "${list[@]}"; do printf '   %2d) %s\n' "$i" "$d"; i=$((i+1)); done
+    for __d in "${__list[@]}"; do printf '   %2d) %s\n' "$__i" "$__d"; __i=$((__i+1)); done
     echo "    0) Cancel"
     while true; do
-        read -r -p "${C_YELLOW}Select a domain: ${C_RESET}" choice
-        [ "$choice" = "0" ] && return 1
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ]; then
-            printf -v "$__var" '%s' "${list[$((choice-1))]}"; return 0
+        read -r -p "${C_YELLOW}Select a domain: ${C_RESET}" __c
+        [ "$__c" = "0" ] && return 1
+        if [[ "$__c" =~ ^[0-9]+$ ]] && [ "$__c" -ge 1 ] && [ "$__c" -le "${#__list[@]}" ]; then
+            printf -v "$__var" '%s' "${__list[$((__c-1))]}"; return 0
         fi
         err "Invalid selection."
     done
@@ -5996,18 +6060,18 @@ mail_pick_domain() {
 
 # mail_pick_box VAR [DOMAIN] -> choose one existing mailbox
 mail_pick_box() {
-    local __var="$1" choice i=1 b
-    local -a list=()
-    mapfile -t list < <(mail_boxes "${2:-}")
-    if [ "${#list[@]}" -eq 0 ]; then err "There is no mailbox${2:+ for $2} yet."; return 1; fi
+    local __var="$1" __c __i=1 __b
+    local -a __list=()
+    mapfile -t __list < <(mail_boxes "${2:-}")
+    if [ "${#__list[@]}" -eq 0 ]; then err "There is no mailbox${2:+ for $2} yet."; return 1; fi
     echo ""
-    for b in "${list[@]}"; do printf '   %2d) %s\n' "$i" "$b"; i=$((i+1)); done
+    for __b in "${__list[@]}"; do printf '   %2d) %s\n' "$__i" "$__b"; __i=$((__i+1)); done
     echo "    0) Cancel"
     while true; do
-        read -r -p "${C_YELLOW}Select a mailbox: ${C_RESET}" choice
-        [ "$choice" = "0" ] && return 1
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ]; then
-            printf -v "$__var" '%s' "${list[$((choice-1))]}"; return 0
+        read -r -p "${C_YELLOW}Select a mailbox: ${C_RESET}" __c
+        [ "$__c" = "0" ] && return 1
+        if [[ "$__c" =~ ^[0-9]+$ ]] && [ "$__c" -ge 1 ] && [ "$__c" -le "${#__list[@]}" ]; then
+            printf -v "$__var" '%s' "${__list[$((__c-1))]}"; return 0
         fi
         err "Invalid selection."
     done
@@ -6043,12 +6107,12 @@ mail_account_write() {
     cat "$tmp" > "$f"; rm -f "$tmp"
 }
 
-# mail_smtp_py MODE USER PASS [TO SUBJECT BODY] — talks to the local mail server on port 587 (STARTTLS).
+# mail_smtp_py MODE USER PASS [TO SUBJECT BODY [auto]] — talks to the local mail server on port 587 (STARTTLS).
 #   MODE login: only checks that the login works.   MODE send: sends one message.
 # Values travel in environment variables, never on a command line. Returns 2 when python3 is missing.
 mail_smtp_py() {
     has_cmd python3 || return 2
-    MS_MODE="$1" MS_USER="$2" MS_PASS="$3" MS_TO="${4:-}" MS_SUBJECT="${5:-}" MS_BODY="${6:-}" python3 - <<'PY'
+    MS_MODE="$1" MS_USER="$2" MS_PASS="$3" MS_TO="${4:-}" MS_SUBJECT="${5:-}" MS_BODY="${6:-}" MS_AUTO="${7:-}" python3 - <<'PY'
 import os, smtplib, ssl, sys
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -6067,6 +6131,9 @@ try:
             m["Subject"] = os.environ["MS_SUBJECT"]
             m["Date"] = formatdate(localtime=True)
             m["Message-ID"] = make_msgid(domain=u.split("@")[1])
+            if os.environ.get("MS_AUTO"):
+                m["Auto-Submitted"] = "auto-generated"
+                m["X-Auto-Response-Suppress"] = "All"
             m.set_content(os.environ["MS_BODY"])
             s.send_message(m)
 except Exception as e:
@@ -7180,6 +7247,888 @@ menu_mail() {
 }
 
 # ============================================================================
+# NOTIFICATIONS (main menu 10): alerts by email (your own mail server) and Telegram
+# ============================================================================
+# How it works:
+#   * Things that happen on this server (a deployment, a backup, a stopped container, a full disk ...)
+#     become small "event files" in a spool folder.
+#   * A root cron job (hideploy notify-run, every minute) turns each event into a message and sends it to
+#     every channel that is switched on. Failed deliveries are retried for up to an hour.
+#   * Pipelines run as the unprivileged 'gitlab-runner' user, which must never see your secrets (Telegram token,
+#     mailbox password). So a pipeline only DROPS an event file into the spool; the root job does the sending.
+#   * The same job also watches the server (containers, disk, certificates, reboot) every 5 minutes. A problem is
+#     announced once, repeated as a reminder after a day, and announced again when it is fixed.
+
+NOTIFY_EVENTS=(
+    "deploy_fail|Deployment failed|on"
+    "deploy_ok|Deployment succeeded|on"
+    "rollback|Rollback to an earlier version|on"
+    "backup_fail|Backup failed|on"
+    "backup_ok|Backup finished OK (every night)|off"
+    "ssl_fail|SSL renewal failed|on"
+    "ssl_expiring|A certificate expires soon|on"
+    "container_down|A project or shared service stopped|on"
+    "disk_high|Disk almost full|on"
+    "reboot_needed|Server needs a reboot|off"
+)
+
+declare -A NF_ST=() NF_STT=() NF_BAD=()
+
+nf_get()   { kv_get "$NOTIFY_CONF" "$1"; }
+nf_val()   { local v; v="$(nf_get "$1")"; printf '%s' "${v:-$2}"; }
+nf_set()   { mkdir -p "$NOTIFY_DIR"; chmod 700 "$NOTIFY_DIR"; kv_set "$NOTIFY_CONF" "$1" "$2"; }
+nf_unset() {
+    [ -f "$NOTIFY_CONF" ] || return 0
+    local tmp; tmp="$(mktemp)"
+    grep -v "^$1=" "$NOTIFY_CONF" > "$tmp" || true
+    cat "$tmp" > "$NOTIFY_CONF"; rm -f "$tmp"
+}
+
+nf_event_known() { local e; for e in "${NOTIFY_EVENTS[@]}"; do [ "${e%%|*}" = "$1" ] && return 0; done; return 1; }
+nf_event_label() { local e; for e in "${NOTIFY_EVENTS[@]}"; do if [ "${e%%|*}" = "$1" ]; then e="${e#*|}"; printf '%s' "${e%|*}"; return 0; fi; done; }
+nf_event_default() { local e; for e in "${NOTIFY_EVENTS[@]}"; do [ "${e%%|*}" = "$1" ] && { printf '%s' "${e##*|}"; return 0; }; done; printf 'off'; }
+nf_event_on() { [ "$(nf_val "EV_$1" "$(nf_event_default "$1")")" = "on" ]; }
+
+nf_master_on() { [ "$(nf_val ENABLED no)" = "yes" ]; }
+nf_email_on()  { [ "$(nf_val EMAIL_ENABLED no)" = "yes" ] && [ -n "$(nf_get EMAIL_FROM)" ] && [ -n "$(nf_get EMAIL_PASS)" ] && [ -n "$(nf_get EMAIL_TO)" ]; }
+nf_tg_on()     { [ "$(nf_val TG_ENABLED no)" = "yes" ] && [ -n "$(nf_get TG_TOKEN)" ] && [ -n "$(nf_get TG_CHATS)" ]; }
+nf_has_channel() { nf_email_on || nf_tg_on; }
+nf_configured()  { [ -f "$NOTIFY_CONF" ] && { [ -n "$(nf_get EMAIL_FROM)" ] || [ -n "$(nf_get TG_TOKEN)" ]; }; }
+
+nf_status_row() {
+    local ch="" ts ok_ts msg
+    if ! nf_configured; then status_row "Notifications" dim "NOT SET UP" "optional: main menu 10) Notifications"; return 0; fi
+    nf_email_on && ch+="email "; nf_tg_on && ch+="Telegram "
+    ch="${ch% }"
+    if ! nf_master_on; then status_row "Notifications" warn "PAUSED" "channels: ${ch:-none}. Turn on: main menu 10"; return 0; fi
+    if [ -z "$ch" ]; then status_row "Notifications" warn "NO CHANNEL" "switch a channel on: main menu 10"; return 0; fi
+    ts="$(cut -d'|' -f1 "$NOTIFY_DIR/last_error" 2>/dev/null)"; ok_ts="$(cat "$NOTIFY_DIR/last_ok" 2>/dev/null)"
+    if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$ts" -gt "${ok_ts:-0}" ] && [ $(( $(date +%s) - ts )) -lt 86400 ]; then
+        msg="$(cut -d'|' -f2- "$NOTIFY_DIR/last_error" 2>/dev/null)"
+        status_row "Notifications" warn "DELIVERY ISSUE" "${msg:0:70}"
+    else
+        status_row "Notifications" good "ON" "$ch"
+    fi
+}
+
+# ---------- sending ----------------------------------------------------------------------
+
+nf_log()      { printf '[%s] %s\n' "$(date -Is)" "$*"; }
+nf_note_ok()  { date +%s > "$NOTIFY_DIR/last_ok" 2>/dev/null; }
+nf_note_err() { printf '%s|%s\n' "$(date +%s)" "$1" > "$NOTIFY_DIR/last_error" 2>/dev/null; }
+
+# Telegram: the token is part of the URL, so it is given to curl through a config read from stdin and never shows up in "ps"
+# nf_tg_call METHOD [curl config lines ...] -> the raw answer of the Telegram API
+nf_tg_call() {
+    local method="$1" token proxy; shift
+    token="$(nf_get TG_TOKEN)"; proxy="$(nf_get TG_PROXY)"
+    {
+        printf 'url = "%s/bot%s/%s"\n' "$TG_API_BASE" "$token" "$method"
+        [ -n "$proxy" ] && printf 'proxy = "%s"\n' "$proxy"
+        [ "$#" -gt 0 ] && printf '%s\n' "$@"
+    } | curl -sS --max-time 25 -K - 2>&1
+}
+
+# nf_tg_send CHAT TEXTFILE
+nf_tg_send() {
+    local out
+    out="$(nf_tg_call sendMessage "data-urlencode = \"chat_id=$1\"" "data-urlencode = \"text@$2\"" 'data-urlencode = "disable_web_page_preview=true"')"
+    if grep -q '"ok":true' <<<"$out"; then return 0; fi
+    NF_ERR="$(sed -n 's/.*"description":"\([^"]*\)".*/\1/p' <<<"$out" | head -n1)"
+    [ -n "$NF_ERR" ] || NF_ERR="$(printf '%s' "$out" | head -c 150)"
+    [ -n "$NF_ERR" ] || NF_ERR="no answer from Telegram"
+    return 1
+}
+
+# The places a message goes to: "email" and one "tg:<chat>" per Telegram chat
+nf_targets() {
+    local chat; local -a chats=()
+    nf_email_on && echo "email"
+    if nf_tg_on; then
+        IFS=',' read -ra chats <<< "$(nf_get TG_CHATS)"
+        for chat in "${chats[@]}"; do chat="${chat// /}"; [ -n "$chat" ] && echo "tg:$chat"; done
+    fi
+    return 0
+}
+
+# nf_send_target TARGET — sends NF_SUBJECT / NF_TEXT; on failure sets NF_ERR
+nf_send_target() {
+    local out rc tf
+    NF_ERR=""
+    case "$1" in
+        email)
+            mail_up || { NF_ERR="the mail server is not running"; return 1; }
+            out="$(mail_smtp_py send "$(nf_get EMAIL_FROM)" "$(nf_get EMAIL_PASS)" "$(nf_get EMAIL_TO)" "$NF_SUBJECT" "$NF_TEXT" auto 2>&1)"; rc=$?
+            [ "$rc" -eq 0 ] && return 0
+            [ "$rc" -eq 2 ] && out="python3 is not installed (apt install python3)"
+            NF_ERR="${out:-sending failed}"; return 1 ;;
+        tg:*)
+            tf="$(mktemp)"
+            printf '%s\n' "$NF_TEXT" | head -c 3800 | iconv -c -f UTF-8 -t UTF-8 > "$tf" 2>/dev/null
+            nf_tg_send "${1#tg:}" "$tf"; rc=$?
+            rm -f "$tf"; return "$rc" ;;
+        *) NF_ERR="unknown channel"; return 1 ;;
+    esac
+}
+
+# ---------- events: files, reading, messages --------------------------------------------
+
+# nf_emit EVENT [KEY=VALUE ...] — drops an event file for the sender (does nothing while notifications are off)
+nf_emit() {
+    local ev="$1" f kv; shift
+    [ -d "$NOTIFY_SPOOL" ] || return 0
+    nf_master_on || return 0
+    f="$NOTIFY_SPOOL/$(date +%s%N)-$$-$RANDOM.evt"
+    {
+        printf 'EVENT=%s\n' "$ev"
+        for kv in "$@"; do printf '%s\n' "$(printf '%s' "$kv" | tr -d '\r\n')"; done
+    } > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+}
+
+# Send what is waiting, without blocking the menu
+nf_kick() { nf_master_on || return 0; ( nf_run >> "$NOTIFY_LOG" 2>&1 & ) >/dev/null 2>&1; }
+
+# nf_read_event FILE — event files may come from the pipeline user, so they are never "sourced":
+# only known keys are read, control characters are removed, lengths are limited.
+nf_read_event() {
+    local f="$1" k v
+    [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %s "$f" 2>/dev/null || echo 99999)" -le 4096 ] || return 1
+    NF_EVENT=""; NF_MODE=""; NF_DOMAIN=""; NF_COMMIT=""; NF_MESSAGE=""; NF_AUTHOR=""; NF_BRANCH=""
+    NF_SECONDS=""; NF_DETAIL=""; NF_KIND=""; NF_PIPELINE_URL=""; NF_JOB_URL=""
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+        v="$(printf '%s' "$v" | tr -d '\000-\010\013-\037\177' | cut -c1-300 | iconv -c -f UTF-8 -t UTF-8 2>/dev/null)"
+        case "$k" in
+            EVENT) NF_EVENT="$v" ;;     MODE) NF_MODE="$v" ;;       DOMAIN) NF_DOMAIN="$v" ;;
+            COMMIT) NF_COMMIT="$v" ;;   MESSAGE) NF_MESSAGE="$v" ;; AUTHOR) NF_AUTHOR="$v" ;;
+            BRANCH) NF_BRANCH="$v" ;;   SECONDS) NF_SECONDS="$v" ;; DETAIL) NF_DETAIL="$v" ;;
+            KIND) NF_KIND="$v" ;;
+            PIPELINE_URL) [[ "$v" =~ ^https?://[^[:space:]]+$ ]] && NF_PIPELINE_URL="$v" ;;
+            JOB_URL)      [[ "$v" =~ ^https?://[^[:space:]]+$ ]] && NF_JOB_URL="$v" ;;
+        esac
+    done < <(head -n 40 "$f")
+    nf_event_known "$NF_EVENT" || [ "$NF_EVENT" = "test" ] || return 1
+    [[ "$NF_SECONDS" =~ ^[0-9]{1,6}$ ]] || NF_SECONDS=""
+    [[ "$NF_COMMIT" =~ ^[0-9a-zA-Z]{0,40}$ ]] || NF_COMMIT=""
+    [[ "$NF_KIND" =~ ^(problem|reminder|resolved)$ ]] || NF_KIND=""
+    if [ -n "$NF_DOMAIN" ] && ! valid_domain "$NF_DOMAIN"; then NF_DOMAIN="(invalid name)"; fi
+    return 0
+}
+
+nf_dur() {
+    local s="$1"; [[ "$s" =~ ^[0-9]+$ ]] || return 0
+    if [ "$s" -ge 60 ]; then printf '%dm %ds' $((s / 60)) $((s % 60)); else printf '%ds' "$s"; fi
+}
+
+nf_lines_deploy() {
+    [ -n "$NF_DOMAIN" ]  && NF_LINES+=("Project: $NF_DOMAIN")
+    [ -n "$NF_COMMIT" ]  && NF_LINES+=("Commit: $NF_COMMIT${NF_MESSAGE:+  $NF_MESSAGE}")
+    [ -n "$NF_AUTHOR" ]  && NF_LINES+=("By: $NF_AUTHOR")
+    [ -n "$NF_BRANCH" ]  && NF_LINES+=("Branch: $NF_BRANCH")
+    [ -n "$NF_SECONDS" ] && NF_LINES+=("Took: $(nf_dur "$NF_SECONDS")")
+    if [ "$NF_MODE" = "manual" ]; then NF_LINES+=("Started from: the HiDeploy menu"); else NF_LINES+=("Started from: a GitLab pipeline"); fi
+    [ -n "$NF_PIPELINE_URL" ] && NF_LINES+=("Pipeline: $NF_PIPELINE_URL")
+    [ -n "$NF_JOB_URL" ]      && NF_LINES+=("Job log: $NF_JOB_URL")
+    return 0
+}
+
+# nf_compose — builds NF_SUBJECT and NF_TEXT from the NF_* fields of the event
+nf_compose() {
+    local host when ico tag title pre="" line res="no"
+    host="$(nf_val SERVER_NAME "$(hostname -s)")"; when="$(date '+%F %H:%M %Z')"
+    NF_LINES=()
+    case "$NF_KIND" in reminder) pre="Reminder: " ;; resolved) res="yes" ;; esac
+    case "$NF_EVENT" in
+        deploy_ok)    ico="✅"; tag="OK";     title="Deployment succeeded"; nf_lines_deploy ;;
+        deploy_fail)  ico="❌"; tag="FAILED"; title="Deployment FAILED"; nf_lines_deploy
+                      NF_LINES+=("The previous version may still be running. Fix the problem and push again, or roll back:")
+                      NF_LINES+=("sudo hideploy -> 5) Manage Projects -> this project -> Deployments") ;;
+        rollback)     ico="↩️"; tag="ROLLBACK"; title="Rolled back to an earlier version"; nf_lines_deploy
+                      NF_LINES+=("The rollback is temporary: your next push deploys the newest code again.") ;;
+        backup_ok)    ico="💾"; tag="OK";     title="Backup finished"
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL") ;;
+        backup_fail)  ico="❌"; tag="FAILED"; title="Backup FAILED"
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL"); NF_LINES+=("Log: $BK_LOG") ;;
+        ssl_fail)     ico="🔒"; tag="FAILED"; title="SSL renewal failed"
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL")
+                      NF_LINES+=("Check: sudo hideploy -> 5) Manage Projects -> SSL management") ;;
+        ssl_expiring) ico="🔒"; tag="WARNING"; title="Certificate expires soon"
+                      [ "$res" = yes ] && { ico="🟢"; tag="RESOLVED"; title="Certificate renewed"; }
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL")
+                      [ "$res" = yes ] || NF_LINES+=("Renew now: sudo hideploy -> 5) Manage Projects -> SSL management") ;;
+        container_down) ico="🔴"; tag="PROBLEM"; title="A service stopped"
+                      [ "$res" = yes ] && { ico="🟢"; tag="RESOLVED"; title="Running again"; }
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL")
+                      [ "$res" = yes ] || NF_LINES+=("Look: sudo hideploy -> 5) Manage Projects, or: docker ps -a") ;;
+        disk_high)    ico="💽"; tag="WARNING"; title="Disk almost full"
+                      [ "$res" = yes ] && { ico="🟢"; tag="RESOLVED"; title="Disk space is fine again"; }
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL")
+                      [ "$res" = yes ] || NF_LINES+=("Free space: sudo hideploy -> 5) Manage Projects -> Disk usage and cleanup") ;;
+        reboot_needed) ico="🔄"; tag="INFO"; title="Server needs a reboot"
+                      [ "$res" = yes ] && { ico="🟢"; tag="RESOLVED"; title="Reboot done"; }
+                      [ -n "$NF_DETAIL" ] && NF_LINES+=("$NF_DETAIL")
+                      [ "$res" = yes ] || NF_LINES+=("When convenient: sudo reboot (containers start again by themselves)") ;;
+        test)         ico="🔔"; tag="TEST"; title="Test notification"
+                      NF_LINES+=("If you can read this, this channel works.") ;;
+        *)            ico="ℹ️"; tag="INFO"; title="$NF_EVENT" ;;
+    esac
+    title="${pre}${title}"
+    NF_SUBJECT="$(printf '[%s] %s: %s%s' "$host" "$tag" "$title" "${NF_DOMAIN:+ - $NF_DOMAIN}" | tr -d '\000-\037\177' | cut -c1-150)"
+    NF_TEXT="$ico $title"
+    for line in "${NF_LINES[@]}"; do NF_TEXT+=$'\n'"$line"; done
+    NF_TEXT+=$'\n\n'"Server: $host"$'\n'"Time: $when"
+}
+
+# ---------- the sender job ---------------------------------------------------------------
+
+# Looks at the spool, sends every waiting event to every target that has not received it yet
+nf_process_spool() {
+    [ -d "$NOTIFY_SPOOL" ] || return 0
+    local f t n=0 done_all age muted
+    local -a targets=()
+    muted=",$(nf_val MUTED ''),"
+    find "$NOTIFY_SPOOL" -maxdepth 1 -name '*.tmp' -mmin +60 -delete 2>/dev/null
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n=$((n + 1)); [ "$n" -le 20 ] || break                   # at most 20 messages per minute; the rest waits
+        if ! nf_read_event "$f"; then rm -f "$f" "$f.sent"; nf_log "dropped an invalid event file"; continue; fi
+        if [ "$NF_EVENT" != "test" ] && ! nf_event_on "$NF_EVENT"; then rm -f "$f" "$f.sent"; continue; fi
+        if [ -n "$NF_DOMAIN" ] && [[ "$muted" == *",$NF_DOMAIN,"* ]]; then rm -f "$f" "$f.sent"; continue; fi
+        mapfile -t targets < <(nf_targets)
+        if [ "${#targets[@]}" -eq 0 ]; then rm -f "$f" "$f.sent"; continue; fi
+        nf_compose
+        done_all=1
+        for t in "${targets[@]}"; do
+            if grep -qxF -- "$t" "$f.sent" 2>/dev/null; then continue; fi
+            if nf_send_target "$t"; then
+                echo "$t" >> "$f.sent"; nf_note_ok; nf_log "sent $NF_EVENT -> $t"
+            else
+                done_all=0; nf_note_err "$t: $NF_ERR"; nf_log "FAILED $NF_EVENT -> $t: $NF_ERR"
+            fi
+        done
+        if [ "$done_all" -eq 1 ]; then
+            rm -f "$f" "$f.sent"
+        else
+            age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+            if [ "$age" -gt 3600 ]; then rm -f "$f" "$f.sent"; nf_log "gave up on $NF_EVENT after one hour"; fi
+        fi
+    done < <(find "$NOTIFY_SPOOL" -maxdepth 1 -name '*.evt' -type f 2>/dev/null | sort)
+    return 0
+}
+
+# ---------- watching the server ----------------------------------------------------------
+
+nf_state_load() {
+    local k s t
+    NF_ST=(); NF_STT=()
+    [ -f "$NOTIFY_STATE" ] || return 0
+    while IFS='|' read -r k s t; do
+        [ -n "$k" ] || continue
+        NF_ST[$k]="$s"; NF_STT[$k]="${t:-0}"
+    done < "$NOTIFY_STATE"
+}
+nf_state_save() {
+    local k tmp="$NOTIFY_STATE.tmp"
+    : > "$tmp"
+    for k in "${!NF_ST[@]}"; do printf '%s|%s|%s\n' "$k" "${NF_ST[$k]}" "${NF_STT[$k]:-0}" >> "$tmp"; done
+    mv "$tmp" "$NOTIFY_STATE"; chmod 600 "$NOTIFY_STATE"
+}
+
+# nf_apply CATEGORY EVENT STRIKES REMIND_SECONDS RESOLVE(yes|no)
+# Compares the problems found just now (global NF_BAD[name]=description) with the remembered state:
+#   new problem -> announce (after STRIKES consecutive checks)   still there for a day -> remind   gone -> "resolved"
+nf_apply() {
+    local cat="$1" ev="$2" strikes="$3" remind="$4" resolve="$5" now k name prev t
+    local new="" rem="" res=""
+    now="$(date +%s)"
+    for name in "${!NF_BAD[@]}"; do
+        k="$cat:$name"; prev="${NF_ST[$k]:-ok}"; t="${NF_STT[$k]:-0}"
+        case "$prev" in
+            ok)      if [ "$strikes" -gt 1 ]; then NF_ST[$k]="pending"; NF_STT[$k]="$now"
+                     else NF_ST[$k]="bad"; NF_STT[$k]="$now"; new+="${new:+, }${NF_BAD[$name]}"; fi ;;
+            pending) NF_ST[$k]="bad"; NF_STT[$k]="$now"; new+="${new:+, }${NF_BAD[$name]}" ;;
+            bad)     if [ $((now - t)) -ge "$remind" ]; then NF_STT[$k]="$now"; rem+="${rem:+, }${NF_BAD[$name]}"; fi ;;
+        esac
+    done
+    if [ "$resolve" = "yes" ]; then
+        for k in "${!NF_ST[@]}"; do
+            [[ "$k" == "$cat:"* ]] || continue
+            name="${k#"$cat:"}"
+            [ -n "${NF_BAD[$name]+x}" ] && continue
+            [ "${NF_ST[$k]}" = "bad" ] && res+="${res:+, }$name"
+            unset 'NF_ST[$k]' 'NF_STT[$k]'
+        done
+    fi
+    [ -z "$new" ] || nf_emit "$ev" "KIND=problem" "DETAIL=$new"
+    [ -z "$rem" ] || nf_emit "$ev" "KIND=reminder" "DETAIL=$rem"
+    [ -z "$res" ] || nf_emit "$ev" "KIND=resolved" "DETAIL=$res"
+    return 0
+}
+
+nf_check_containers() {
+    nf_event_on container_down || return 0
+    local c p cn dom h muted; local -a list=() projs=()
+    NF_BAD=()
+    muted=",$(nf_val MUTED ''),"
+    if ! docker_ready; then
+        if has_cmd docker; then NF_BAD[docker]="Docker engine is not running"; nf_apply container container_down 2 86400 no; fi
+        return 0
+    fi
+    list=("$NGINX_CONTAINER" "$DB_CONTAINER")
+    [ -f "$REDIS_DIR/docker-compose.yml" ] && list+=("$REDIS_CONTAINER")
+    mail_installed && list+=("$MAIL_CONTAINER")
+    for c in "${list[@]}"; do
+        docker inspect "$c" >/dev/null 2>&1 || continue
+        container_running "$c" || NF_BAD[$c]="$c (stopped)"
+    done
+    mapfile -t projs < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    for p in "${projs[@]}"; do
+        [ -n "$p" ] || continue
+        dom="$(basename "$p")"
+        [[ "$muted" == *",$dom,"* ]] && continue
+        cn="$(kv_get "$p/.deploy.env" CONTAINER_NAME)"; [ -n "$cn" ] || continue
+        if ! docker inspect "$cn" >/dev/null 2>&1; then NF_BAD[$cn]="$dom (container missing)"
+        elif ! container_running "$cn"; then NF_BAD[$cn]="$dom (stopped)"
+        else
+            h="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cn" 2>/dev/null)"
+            [ "$h" = "unhealthy" ] && NF_BAD[$cn]="$dom (unhealthy)"
+        fi
+    done
+    nf_apply container container_down 2 86400 yes
+}
+
+nf_check_disk() {
+    nf_event_on disk_high || return 0
+    local p lim; p="$(disk_pct)"; lim="$(nf_val DISK_PCT 90)"
+    NF_BAD=()
+    [[ "$p" =~ ^[0-9]+$ ]] || return 0
+    if [ "$p" -ge "$lim" ]; then NF_BAD[root]="${p}% of the disk is used (limit ${lim}%)"; fi
+    nf_apply disk disk_high 1 86400 yes
+}
+
+nf_check_certs() {
+    nf_event_on ssl_expiring || return 0
+    local d name days lim; lim="$(nf_val CERT_DAYS 14)"
+    NF_BAD=()
+    for d in "$NGINX_DIR"/letsencrypt/live/*/; do
+        [ -d "$d" ] || continue
+        name="$(basename "$d")"; days="$(cert_days "$name")"
+        [[ "$days" =~ ^-?[0-9]+$ ]] || continue
+        if [ "$days" -lt "$lim" ]; then NF_BAD[$name]="$name ($days days left)"; fi
+    done
+    nf_apply cert ssl_expiring 1 86400 yes
+}
+
+nf_check_reboot() {
+    nf_event_on reboot_needed || return 0
+    NF_BAD=()
+    if sec_reboot_needed; then NF_BAD[reboot]="updates are waiting for a reboot"; fi
+    nf_apply reboot reboot_needed 1 259200 yes
+}
+
+nf_checks_if_due() {
+    local last now; now="$(date +%s)"
+    last="$(cat "$NOTIFY_DIR/last_check" 2>/dev/null || echo 0)"; [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    [ $((now - last)) -ge 280 ] || return 0
+    echo "$now" > "$NOTIFY_DIR/last_check"
+    nf_state_load
+    nf_check_containers; nf_check_disk; nf_check_certs; nf_check_reboot
+    nf_state_save
+}
+
+# What the cron job (and the background kick) runs. Only one copy at a time.
+nf_run() {
+    nf_master_on || return 0
+    mkdir -p "$NOTIFY_DIR"; chmod 700 "$NOTIFY_DIR" 2>/dev/null
+    ( flock -n 9 || exit 0; nf_checks_if_due; nf_process_spool ) 9>"$NOTIFY_LOCK"
+}
+
+# ---------- hooks used by other parts of HiDeploy -----------------------------------------
+
+# nf_emit_deploy EVENT PATH SECONDS — a deployment started from the menu
+nf_emit_deploy() {
+    local ev="$1" path="$2" secs="$3" sha msg
+    nf_master_on || return 0
+    sha="$(as_runner git -C "$path" rev-parse --short HEAD 2>/dev/null || true)"
+    msg="$(as_runner git -C "$path" log -1 --format=%s 2>/dev/null | tr -d '\r\n' | cut -c1-120)"
+    nf_emit "$ev" "MODE=manual" "DOMAIN=$(basename "$path")" "COMMIT=$sha" "MESSAGE=$msg" "BRANCH=${BRANCH:-}" "SECONDS=$secs"
+    nf_kick
+}
+
+# nf_emit_backup EXIT_CODE
+nf_emit_backup() {
+    local rc="$1" detail=""
+    nf_master_on || return 0
+    [ "$rc" -eq 75 ] && return 0                                 # another backup was already running: not a failure
+    if [ "$rc" -eq 0 ]; then
+        detail="$(kv_get "$BK_DIR/last_run.txt" SIZE) - SSH: $(kv_get "$BK_DIR/last_run.txt" SSH), S3: $(kv_get "$BK_DIR/last_run.txt" S3)"
+        nf_emit backup_ok "DETAIL=$detail"
+    else
+        nf_emit backup_fail "DETAIL=The backup ended with problems (exit code $rc)."
+    fi
+    nf_kick
+}
+
+# ---------- switching on / off -----------------------------------------------------------
+
+nf_spool_prepare() {
+    mkdir -p "$NOTIFY_SPOOL"
+    if getent group "$RUNNER_USER" >/dev/null 2>&1; then
+        chown "root:$RUNNER_USER" "$NOTIFY_SPOOL"; chmod 1770 "$NOTIFY_SPOOL"
+    else
+        chown root:root "$NOTIFY_SPOOL"; chmod 0700 "$NOTIFY_SPOOL"
+    fi
+}
+
+nf_write_cron() {
+    local self; self="$(hideploy_self)"
+    [ -x "$self" ] || { err "hideploy is not installed at $self. Install it first with install.sh."; return 1; }
+    printf 'SHELL=/bin/bash\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n* * * * * root %s notify-run >> %s 2>&1\n' \
+        "$self" "$NOTIFY_LOG" > "$NOTIFY_CRON"
+    chmod 644 "$NOTIFY_CRON"
+    write_logrotate
+}
+
+nf_enable() {
+    nf_has_channel || { err "Set up at least one channel first (email or Telegram)."; return 1; }
+    has_cmd flock && has_cmd curl || { err "flock and curl are required."; return 1; }
+    nf_spool_prepare
+    nf_write_cron || return 1
+    nf_set ENABLED yes
+    if renew_enabled; then step_renew_enable >/dev/null 2>&1; fi          # refreshes the renewal job: it now reports failures
+    ok "Notifications are ON. A background job runs every minute (log: $NOTIFY_LOG)."
+    explain "Deployments started from a GitLab pipeline need the newer .gitlab-ci.yml: Notifications -> Pipeline notifications."
+}
+
+nf_disable() {
+    nf_set ENABLED no
+    rm -f "$NOTIFY_CRON"
+    rm -rf "$NOTIFY_SPOOL"
+    ok "Notifications are OFF: the background job and the spool folder were removed. Your settings are kept."
+}
+
+# ---------- setup: email -----------------------------------------------------------------
+
+nf_valid_email_list() {   # "a@x.com, b@y.org" -> prints the cleaned, comma-separated list; fails when something is wrong
+    local raw="${1// /}" a out=""; local -a arr=()
+    [ -n "$raw" ] || return 1
+    IFS=',' read -ra arr <<< "$raw"
+    for a in "${arr[@]}"; do a="${a,,}"; valid_email "$a" || return 1; out+="${out:+,}$a"; done
+    printf '%s' "$out"
+}
+
+nf_email_setup() {
+    section "Email notifications (through your own mail server)"
+    explain \
+        "Messages are sent by a dedicated mailbox on YOUR mail server (notifications@<your domain>), so no outside service is involved." \
+        "HiDeploy creates that mailbox with a generated password and keeps the password in a file only root can read." \
+        "Tip: use Telegram too. If the mail server itself is down, an email alert about it cannot be delivered."
+    mail_installed && mail_up || { err "The mail server must be installed and running first: main menu 9) Email."; return 1; }
+    if ! has_cmd python3; then
+        confirm "python3 is needed to send mail. Install it now?" y && sec_apt_install python3 >/dev/null 2>&1
+        has_cmd python3 || { err "python3 is missing."; return 1; }
+    fi
+    local d from pass to list rc
+    mail_pick_domain d || return 1
+    from="notifications@$d"
+    if mail_box_exists "$from"; then
+        info "The mailbox $from already exists."
+        ask_secret "Its password (Enter = set a NEW generated password)" pass
+        if [ -z "$pass" ]; then
+            pass="$(gen_password)"
+            mail_account_write "$from" "$pass" || { err "Could not change the password."; return 1; }
+        else
+            mail_smtp_py login "$from" "$pass" >/dev/null 2>&1; rc=$?
+            if [ "$rc" -eq 1 ]; then err "That password does not work for $from."; return 1; fi
+        fi
+    else
+        pass="$(gen_password)"
+        mail_account_write "$from" "$pass" || { err "Could not create the mailbox."; return 1; }
+    fi
+    mail_wait_login "$from" "$pass" || { err "The mailbox does not accept the login yet. Wait a minute and run this again."; return 1; }
+    ok "Sender mailbox ready: $from"
+    while true; do
+        ask "Send alerts to (one or more addresses, comma-separated)" "$(nf_get EMAIL_TO)" to
+        if list="$(nf_valid_email_list "$to")"; then break; fi
+        err "Enter valid email addresses, separated by commas."
+    done
+    nf_set EMAIL_FROM "$from"; nf_set EMAIL_PASS "$pass"; nf_set EMAIL_TO "$list"; nf_set EMAIL_ENABLED yes
+    ok "Email channel saved."
+    explain "" "Messages come from $from. If the first ones land in spam, mark them 'not spam' and add the address to your contacts." \
+               "Check that this domain passes SPF/DKIM: Email -> Mail domains -> Check DNS."
+    nf_after_setup
+}
+
+# ---------- setup: Telegram --------------------------------------------------------------
+
+nf_tg_detect_chats() {   # prints "id name" lines for the chats that wrote to the bot recently
+    nf_tg_call getUpdates | grep -oE '"chat":\{"id":-?[0-9]+,"(first_name|title)":"[^"]*"' \
+        | sed -E 's/^"chat":\{"id":(-?[0-9]+),"(first_name|title)":"([^"]*)"$/\1 \3/' | sort -u
+}
+
+# nf_tg_restore OLD_TOKEN OLD_PROXY — a failed (re-)setup must never destroy a token that was working
+nf_tg_restore() {
+    if [ -n "$1" ]; then nf_set TG_TOKEN "$1"; else nf_unset TG_TOKEN; fi
+    if [ -n "$2" ]; then nf_set TG_PROXY "$2"; else nf_unset TG_PROXY; fi
+}
+
+nf_tg_setup() {
+    section "Telegram notifications"
+    explain \
+        "You need a Telegram bot of your own (free, one minute):" \
+        "  1. In Telegram open @BotFather and send:  /newbot   then choose a name and a username." \
+        "  2. BotFather answers with a TOKEN (looks like 123456789:ABC...). Paste it below." \
+        "  3. Open your new bot and send it any message (for a group: add the bot to the group and write there)." \
+        "  4. HiDeploy then finds the chat by itself."
+    local token proxy out bot line n i choice manual picked="" id name prev_token prev_proxy
+    local -a found=()
+    prev_token="$(nf_get TG_TOKEN)"; prev_proxy="$(nf_get TG_PROXY)"
+    while true; do
+        ask_secret "Bot token" token
+        [ -n "$token" ] || { info "Cancelled."; return 0; }
+        [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,}$ ]] && break
+        err "That does not look like a bot token (123456789:AAE...)."
+    done
+    nf_set TG_TOKEN "$token"
+    out="$(nf_tg_call getMe)"
+    if ! grep -q '"ok":true' <<<"$out"; then
+        warn "Telegram did not answer correctly: $(printf '%s' "$out" | head -c 120)"
+        explain "If Telegram is blocked from this server, use a proxy (for example socks5h://127.0.0.1:1080 or http://host:port)."
+        ask "Proxy (Enter = none)" "" proxy
+        if [ -n "$proxy" ]; then
+            [[ "$proxy" =~ ^(https?|socks5h?)://[A-Za-z0-9._:@-]+$ ]] || { err "Invalid proxy address."; nf_tg_restore "$prev_token" "$prev_proxy"; return 1; }
+            nf_set TG_PROXY "$proxy"; out="$(nf_tg_call getMe)"
+        fi
+    fi
+    if ! grep -q '"ok":true' <<<"$out"; then
+        err "The token was not accepted (or Telegram cannot be reached from this server)."
+        nf_tg_restore "$prev_token" "$prev_proxy"
+        [ -z "$prev_token" ] || info "Your previous bot settings were kept."
+        return 1
+    fi
+    bot="$(sed -n 's/.*"username":"\([^"]*\)".*/\1/p' <<<"$out" | head -n1)"
+    ok "Bot accepted: @${bot:-?}"
+    while true; do
+        read -r -p "${C_YELLOW}Now send a message to @${bot:-your bot} in Telegram, then press [Enter] (or type m to enter a chat ID yourself): ${C_RESET}" manual
+        found=()
+        if [[ "${manual,,}" != "m" ]]; then mapfile -t found < <(nf_tg_detect_chats); fi
+        if [ "${#found[@]}" -gt 0 ]; then
+            echo ""; i=1
+            for line in "${found[@]}"; do printf '   %2d) %s\n' "$i" "${line#* }  (chat id ${line%% *})"; i=$((i + 1)); done
+            echo "    0) Enter a chat ID by hand"
+            read -r -p "${C_YELLOW}Send alerts to which chat (several: 1,2): ${C_RESET}" choice
+            if [ "$choice" != "0" ]; then
+                for n in ${choice//,/ }; do
+                    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#found[@]}" ] || continue
+                    id="${found[$((n-1))]%% *}"; picked+="${picked:+,}$id"
+                done
+                [ -n "$picked" ] && break
+                err "Nothing selected."; continue
+            fi
+        elif [[ "${manual,,}" != "m" ]]; then
+            warn "No message found yet. Telegram only shows messages from the last 24 hours, and the bot must have been written to."
+            confirm "Try again?" y && continue
+        fi
+        ask "Chat ID (a number such as 123456789 or -1001234567890, or @channelname)" "" id
+        if [[ "$id" =~ ^-?[0-9]{5,20}$ || "$id" =~ ^@[A-Za-z][A-Za-z0-9_]{4,31}$ ]]; then picked="$id"; break; fi
+        err "Invalid chat ID."
+    done
+    nf_set TG_CHATS "$picked"; nf_set TG_ENABLED yes
+    ok "Telegram channel saved."
+    nf_after_setup
+}
+
+nf_tg_chat_add() {
+    nf_configured && [ -n "$(nf_get TG_TOKEN)" ] || { err "Set up Telegram first."; return 1; }
+    local id cur; cur="$(nf_get TG_CHATS)"
+    explain "Another person or group can receive the alerts: they (or the group) must write to the bot first." "Detected chats are listed below."
+    nf_tg_detect_chats | sed 's/^/   /'
+    ask "Chat ID to add" "" id
+    [[ "$id" =~ ^-?[0-9]{5,20}$ || "$id" =~ ^@[A-Za-z][A-Za-z0-9_]{4,31}$ ]] || { err "Invalid chat ID."; return 1; }
+    [[ ",$cur," == *",$id,"* ]] && { info "Already in the list."; return 0; }
+    nf_set TG_CHATS "${cur:+$cur,}$id"; ok "Added."
+}
+
+nf_tg_chat_remove() {
+    local cur id out="" c; local -a arr=()
+    cur="$(nf_get TG_CHATS)"; [ -n "$cur" ] || { info "No chats configured."; return 0; }
+    echo "  Chats: $cur"
+    ask "Chat ID to remove" "" id
+    IFS=',' read -ra arr <<< "$cur"
+    for c in "${arr[@]}"; do [ "$c" = "$id" ] || out+="${out:+,}$c"; done
+    if [ -n "$out" ]; then nf_set TG_CHATS "$out"; else nf_unset TG_CHATS; nf_set TG_ENABLED no; warn "No chat left: Telegram is switched off."; fi
+    ok "Removed."
+}
+
+nf_after_setup() {
+    if ! nf_master_on; then
+        confirm "Turn notifications ON now?" y && nf_enable
+    else
+        step_renew_enable >/dev/null 2>&1 || true
+    fi
+    confirm "Send a test notification now?" y && nf_test
+}
+
+# ---------- test, events, settings -------------------------------------------------------
+
+nf_test() {
+    section "Test notification"
+    local -a targets=(); local t any=0
+    mapfile -t targets < <(nf_targets)
+    if [ "${#targets[@]}" -eq 0 ]; then err "No channel is switched on."; return 1; fi
+    NF_EVENT="test"; NF_KIND=""; NF_DOMAIN=""; NF_DETAIL=""
+    nf_compose
+    for t in "${targets[@]}"; do
+        printf '  %-34s ' "$t"
+        if nf_send_target "$t"; then printf '%sdelivered%s\n' "$C_GREEN" "$C_RESET"; nf_note_ok; any=1
+        else printf '%sFAILED%s  %s\n' "$C_RED" "$C_RESET" "$NF_ERR"; nf_note_err "$t: $NF_ERR"; fi
+    done
+    [ "$any" -eq 1 ] || return 1
+}
+
+nf_events_menu() {
+    local c i e key
+    while true; do
+        clear; banner "Which events notify you" "$C_MAGENTA"
+        i=1
+        for e in "${NOTIFY_EVENTS[@]}"; do
+            key="${e%%|*}"
+            printf ' %2d) [%s] %s\n' "$i" "$(nf_event_on "$key" && echo "${C_GREEN}ON ${C_RESET}" || echo "${C_DIM}off${C_RESET}")" "$(nf_event_label "$key")"
+            i=$((i + 1))
+        done
+        echo ""
+        echo "  Type a number to switch it on/off.   A) all on   N) all off   0) back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            0) return ;;
+            [Aa]) for e in "${NOTIFY_EVENTS[@]}"; do nf_set "EV_${e%%|*}" on; done ;;
+            [Nn]) for e in "${NOTIFY_EVENTS[@]}"; do nf_set "EV_${e%%|*}" off; done ;;
+            *) if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "${#NOTIFY_EVENTS[@]}" ]; then
+                   key="${NOTIFY_EVENTS[$((c-1))]%%|*}"
+                   if nf_event_on "$key"; then nf_set "EV_$key" off; else nf_set "EV_$key" on; fi
+               else err "Invalid option."; sleep 1; fi ;;
+        esac
+    done
+}
+
+nf_muted_menu() {
+    local p dom cur c i muted list="" d
+    local -a projs=()
+    mapfile -t projs < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    [ "${#projs[@]}" -gt 0 ] || { info "No projects yet."; return 0; }
+    while true; do
+        cur=",$(nf_val MUTED ''),"; i=1
+        echo ""
+        for p in "${projs[@]}"; do
+            dom="$(basename "$p")"
+            printf '  %2d) %-36s %s\n' "$i" "$dom" "$([[ "$cur" == *",$dom,"* ]] && echo "${C_YELLOW}MUTED${C_RESET}" || echo "notifies")"
+            i=$((i + 1))
+        done
+        explain "" "A muted project sends no deployment or 'stopped' alerts (useful for test sites). Server-wide alerts still arrive."
+        read -r -p "${C_YELLOW}Number to mute / unmute (0 = back): ${C_RESET}" c
+        [[ "$c" =~ ^[0-9]+$ ]] || continue
+        [ "$c" = "0" ] && return 0
+        [ "$c" -le "${#projs[@]}" ] || continue
+        dom="$(basename "${projs[$((c-1))]}")"
+        list=""
+        for d in $(nf_val MUTED '' | tr ',' ' '); do [ "$d" = "$dom" ] || list+="${list:+,}$d"; done
+        if [[ "$cur" != *",$dom,"* ]]; then list+="${list:+,}$dom"; fi
+        if [ -n "$list" ]; then nf_set MUTED "$list"; else nf_unset MUTED; fi
+    done
+}
+
+nf_settings_menu() {
+    local c v
+    while true; do
+        clear; banner "Notification settings" "$C_MAGENTA"
+        printf '  Server name in messages:  %s\n' "$(nf_val SERVER_NAME "$(hostname -s) (default)")"
+        printf '  Disk alert from:          %s%% used\n' "$(nf_val DISK_PCT 90)"
+        printf '  Certificate alert when:   fewer than %s days left\n' "$(nf_val CERT_DAYS 14)"
+        printf '  Muted projects:           %s\n\n' "$(nf_val MUTED none)"
+        echo " 1) Change the server name"
+        echo " 2) Change the disk threshold"
+        echo " 3) Change the certificate threshold"
+        echo " 4) Mute / unmute projects"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) ask "Server name (letters, digits, space . _ -)" "$(nf_val SERVER_NAME "$(hostname -s)")" v
+               if [[ "$v" =~ ^[A-Za-z0-9][A-Za-z0-9._\ -]{0,39}$ ]]; then nf_set SERVER_NAME "$v"; ok "Saved."; else err "Invalid name."; fi; pause ;;
+            2) ask "Alert when the disk is this many percent full (50-99)" "$(nf_val DISK_PCT 90)" v
+               if [[ "$v" =~ ^[0-9]{2}$ ]] && [ "$v" -ge 50 ] && [ "$v" -le 99 ]; then nf_set DISK_PCT "$v"; ok "Saved."; else err "Enter a number from 50 to 99."; fi; pause ;;
+            3) ask "Alert when a certificate has fewer than this many days left (3-60)" "$(nf_val CERT_DAYS 14)" v
+               if [[ "$v" =~ ^[0-9]{1,2}$ ]] && [ "$v" -ge 3 ] && [ "$v" -le 60 ]; then nf_set CERT_DAYS "$v"; ok "Saved."; else err "Enter a number from 3 to 60."; fi; pause ;;
+            4) nf_muted_menu ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ---------- pipelines --------------------------------------------------------------------
+
+nf_ci_status() {
+    section "Pipeline notifications (deployments started by GitLab)"
+    explain \
+        "A pipeline runs as the 'gitlab-runner' user, which must not see your Telegram token or mailbox password." \
+        "So the new .gitlab-ci.yml only drops a small event file in $NOTIFY_SPOOL; the server sends it within a minute." \
+        "Projects whose .gitlab-ci.yml is older do not send deployment alerts from pipelines (menu deployments always do)."
+    local p dom state kind tag pm tmp n_old=0
+    local -a olds=() projs=()
+    mapfile -t projs < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    [ "${#projs[@]}" -gt 0 ] || { info "No projects yet."; return 0; }
+    echo ""
+    for p in "${projs[@]}"; do
+        dom="$(basename "$p")"
+        if   [ ! -f "$p/.gitlab-ci.yml" ];            then state="${C_RED}NO CI FILE${C_RESET}"
+        elif grep -q 'notify_event' "$p/.gitlab-ci.yml"; then state="${C_GREEN}READY${C_RESET}"
+        else state="${C_YELLOW}OLD CI FILE${C_RESET}"; olds+=("$p"); fi
+        printf '  %-36s %s\n' "$dom" "$state"
+    done
+    n_old="${#olds[@]}"
+    [ "$n_old" -gt 0 ] || { echo ""; ok "All projects are ready."; return 0; }
+    echo ""
+    confirm "Generate new .gitlab-ci.yml files for the $n_old project(s) marked OLD / NO CI FILE?" y || return 0
+    tag="$(cfg_get RUNNER_TAG || true)"; tag="${tag:-production}"
+    for p in "${olds[@]}"; do
+        dom="$(basename "$p")"
+        load_project "$p" || continue
+        kind="${PROJECT_TYPE:-laravel}"; pm="pnpm"
+        grep -q 'yarn install' "$p/Dockerfile" 2>/dev/null && pm="yarn"
+        grep -q 'npm ci' "$p/Dockerfile" 2>/dev/null && pm="npm"
+        tmp="$(mktemp -d)"
+        generate_project_files "$tmp" "$dom" "${BRANCH:-main}" "$tag" yes "$kind" "$pm" >/dev/null
+        mkdir -p "$TEMPLATES_DIR/$dom"
+        cp "$tmp/.gitlab-ci.yml" "$TEMPLATES_DIR/$dom/.gitlab-ci.yml"; rm -rf "$tmp"
+        ok "New .gitlab-ci.yml for $dom: $TEMPLATES_DIR/$dom/.gitlab-ci.yml"
+    done
+    next_steps \
+        "For each project: copy the new file into the repository on your computer:   scp root@SERVER_IP:$TEMPLATES_DIR/<domain>/.gitlab-ci.yml ." \
+        "Then:   git add .gitlab-ci.yml && git commit -m 'Deployment notifications' && git push" \
+        "Only .gitlab-ci.yml is replaced; your Dockerfile and compose file are untouched."
+}
+
+nf_log_show() {
+    section "Recent notification log"
+    if [ -s "$NOTIFY_LOG" ]; then tail -n 25 "$NOTIFY_LOG" | cut -c1-200; else info "Nothing logged yet."; fi
+    local n; n="$(find "$NOTIFY_SPOOL" -maxdepth 1 -name '*.evt' 2>/dev/null | wc -l)"
+    echo ""; printf '  Events waiting to be sent: %s\n' "$n"
+}
+
+nf_status_show() {
+    section "Notifications"
+    printf '  Master switch:   %s\n' "$(nf_master_on && echo ON || echo "OFF (paused)")"
+    printf '  Email:           %s\n' "$(nf_email_on && echo "ON  -> $(nf_get EMAIL_TO)  (from $(nf_get EMAIL_FROM))" || echo off)"
+    printf '  Telegram:        %s\n' "$(nf_tg_on && echo "ON  -> chat(s) $(nf_get TG_CHATS)" || echo off)"
+    [ -n "$(nf_get TG_PROXY)" ] && printf '  Telegram proxy:  %s\n' "$(nf_get TG_PROXY)"
+    echo ""; echo "  Events:"
+    local e key
+    for e in "${NOTIFY_EVENTS[@]}"; do
+        key="${e%%|*}"
+        printf '    [%s] %s\n' "$(nf_event_on "$key" && echo "ON " || echo "off")" "$(nf_event_label "$key")"
+    done
+    echo ""
+    printf '  Background job:  %s\n' "$([ -f "$NOTIFY_CRON" ] && echo "installed (every minute)" || echo "not installed")"
+    if [ -s "$NOTIFY_DIR/last_error" ]; then printf '  Last problem:    %s\n' "$(cut -d'|' -f2- "$NOTIFY_DIR/last_error")"; fi
+}
+
+# ---------- menu 10 ----------------------------------------------------------------------
+
+menu_notify() {
+    local c
+    while true; do
+        clear; banner "10) Notifications (email and Telegram)" "$C_MAGENTA"
+        explain \
+            "Get a message when a deployment succeeds or fails, a backup fails, a service stops, the disk fills up or a certificate is about to expire." \
+            "Recommended order: 2 and/or 3 (a channel) -> 6 (test) -> 8 (pipelines). Both channels together is the safest." ""
+        nf_status_row; echo ""
+        echo " 1) Show the current settings"
+        echo " 2) Email channel (sent by your own mail server)"
+        echo " 3) Telegram channel (bot, chats, proxy)"
+        echo " 4) Choose which events notify you"
+        echo " 5) Settings: server name, thresholds, muted projects"
+        echo " 6) Send a test notification"
+        echo " 7) Turn notifications ON / OFF"
+        echo " 8) Pipeline notifications (check projects, new .gitlab-ci.yml)"
+        echo " 9) Recent log and waiting events"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item nf_status_show ;;
+            2) menu_notify_email ;;
+            3) menu_notify_tg ;;
+            4) nf_events_menu ;;
+            5) nf_settings_menu ;;
+            6) run_item nf_test ;;
+            7) if nf_master_on; then confirm "Turn notifications OFF?" n && nf_disable; else nf_enable; fi; pause ;;
+            8) run_item nf_ci_status ;;
+            9) run_item nf_log_show ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+menu_notify_email() {
+    local c to list
+    while true; do
+        clear; banner "Email notifications" "$C_MAGENTA"
+        printf '  Email: %s\n\n' "$(nf_email_on && echo "ON -> $(nf_get EMAIL_TO) (from $(nf_get EMAIL_FROM))" || echo "off")"
+        echo " 1) Set up / re-create the sender mailbox and recipients"
+        echo " 2) Change the recipients"
+        echo " 3) Switch the email channel off / on"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item nf_email_setup ;;
+            2) if [ -n "$(nf_get EMAIL_FROM)" ]; then
+                   while true; do ask "Send alerts to (comma-separated)" "$(nf_get EMAIL_TO)" to; if list="$(nf_valid_email_list "$to")"; then break; fi; err "Invalid address list."; done
+                   nf_set EMAIL_TO "$list"; ok "Saved."
+               else err "Set up the email channel first (option 1)."; fi
+               pause ;;
+            3) if [ -z "$(nf_get EMAIL_FROM)" ]; then err "Set up the email channel first (option 1)."
+               elif [ "$(nf_val EMAIL_ENABLED no)" = "yes" ]; then nf_set EMAIL_ENABLED no; ok "Email channel is OFF."
+               else nf_set EMAIL_ENABLED yes; ok "Email channel is ON."; fi
+               pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+menu_notify_tg() {
+    local c proxy
+    while true; do
+        clear; banner "Telegram notifications" "$C_MAGENTA"
+        printf '  Telegram: %s\n\n' "$(nf_tg_on && echo "ON -> chat(s) $(nf_get TG_CHATS)" || echo "off")"
+        echo " 1) Set up the bot and the first chat"
+        echo " 2) Add another chat (person or group)"
+        echo " 3) Remove a chat"
+        echo " 4) Proxy (when Telegram is blocked from this server)"
+        echo " 5) Switch the Telegram channel off / on"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item nf_tg_setup ;;
+            2) nf_tg_chat_add; pause ;;
+            3) nf_tg_chat_remove; pause ;;
+            4) if [ -n "$(nf_get TG_TOKEN)" ]; then
+                   ask "Proxy, e.g. socks5h://127.0.0.1:1080 or http://host:port (Enter = none)" "$(nf_get TG_PROXY)" proxy
+                   if [ -z "$proxy" ]; then nf_unset TG_PROXY; ok "Proxy removed."
+                   elif [[ "$proxy" =~ ^(https?|socks5h?)://[A-Za-z0-9._:@-]+$ ]]; then nf_set TG_PROXY "$proxy"; ok "Proxy saved."
+                   else err "Invalid proxy address."; fi
+               else err "Set up Telegram first (option 1)."; fi
+               pause ;;
+            5) if [ -z "$(nf_get TG_TOKEN)" ]; then err "Set up Telegram first (option 1)."
+               elif [ "$(nf_val TG_ENABLED no)" = "yes" ]; then nf_set TG_ENABLED no; ok "Telegram channel is OFF."
+               else nf_set TG_ENABLED yes; ok "Telegram channel is ON."; fi
+               pause ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -7251,6 +8200,8 @@ Usage:
   sudo hideploy backup-run run one backup now (this is what the nightly job calls)
   sudo hideploy cleanup-run run the safe disk cleanup now (the weekly job calls this)
   sudo hideploy security-check  print the security report (firewall, fail2ban, updates, SSH, ports, files)
+  sudo hideploy notify-run  send waiting notifications and check the server (the every-minute job calls this)
+  sudo hideploy notify-test send a test notification to every switched-on channel
 EOF
 }
 
@@ -7270,6 +8221,14 @@ main() {
             [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy cleanup-run" >&2; exit 1; }
             cleanup_safe
             exit 0 ;;
+        notify-run)
+            [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy notify-run" >&2; exit 1; }
+            nf_run
+            exit 0 ;;
+        notify-test)
+            [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy notify-test" >&2; exit 1; }
+            nf_test
+            exit $? ;;
         security-check)
             [ "$EUID" -eq 0 ] || { echo "Run as root: sudo hideploy security-check" >&2; exit 1; }
             sec_report
@@ -7295,6 +8254,7 @@ main() {
         echo " 7) Performance tuning          (nginx, MariaDB, PHP-FPM: faster pages, less cold start)"
         echo " 8) Security                    (firewall, fail2ban, automatic security updates, SSH, checks)"
         echo " 9) Email                       (own mail server for all your domains: mailboxes, webmail)"
+        echo "10) Notifications               (alerts by email and Telegram: deployments, backups, stopped services)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -7307,6 +8267,7 @@ main() {
             7) menu_perf ;;
             8) menu_security ;;
             9) menu_mail ;;
+            10) menu_notify ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
