@@ -152,6 +152,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **fail2ban for SSH** with safe defaults (your IP is never banned) | Security → fail2ban |
 | **Automatic security updates** (security patches only; automatic reboot is off by default) | Security → Automatic security updates |
 | **Own mail server, no outside SMTP/API service:** one shared server for all your domains; `info@example.com`, `noreply@example.com`, aliases; DKIM key, SPF/DMARC records generated and checked; a project can send through its own mailbox with one menu step | Email (main menu 9) / Project menu → Email |
+| **MariaDB or PostgreSQL per project** (Laravel and Next.js): own database and user for every project, isolated from each other, restore/backup for both | Shared Services / project wizard |
+| **Brotli compression** with an nginx image built for you (or your own), tested before switching, automatic rollback | Shared Services -> Brotli |
 | **Notifications by email and Telegram:** deployment succeeded / failed (from the menu **and** from GitLab pipelines), rollback, backup result, SSL renewal failed, certificate about to expire, a project or shared service stopped, disk almost full, reboot needed; each event can be switched on or off, projects can be muted | Notifications (main menu 10) |
 | **Webmail (Roundcube)** on its own domain: read and send mail in the browser; HTTPS, optional Basic Auth and IP list; start/stop on demand like phpMyAdmin | Email → Webmail |
 | **Keys-only SSH** (optional), with key check, `sshd -t`, backup and automatic undo | Security → Harden SSH |
@@ -196,6 +198,8 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | SSL renewal | `/usr/local/bin/hideploy-renew-ssl` + `/etc/cron.d/hideploy-ssl-renew` (daily 03:17) |
 | Mail server: config (accounts, aliases, DKIM keys) / messages | `/var/www/infrastructure/mail/config` / `/var/www/infrastructure/mail/data` |
 | Webmail (optional) | `/var/www/infrastructure/webmail` |
+| PostgreSQL (optional) | `/var/www/infrastructure/postgres` (volume `postgres_data`) |
+| Brotli build files / settings | `/var/www/infrastructure/nginx/brotli-build` / `.../nginx/conf.d/01-brotli.conf` |
 | Notifications: settings and secrets / remembered problems | `/var/www/infrastructure/notify/notify.env` / `.../notify/state` (root only) |
 | Notifications: events dropped by pipelines | `/var/spool/hideploy-notify` (no secrets) |
 | Notifications: job / log | `/etc/cron.d/hideploy-notify` (every minute) / `/var/log/hideploy-notify.log` |
@@ -330,6 +334,38 @@ Open **9) Email**. HiDeploy runs **one shared mail server** (Postfix + Dovecot +
 
 ---
 
+## Databases: MariaDB or PostgreSQL (per project)
+
+Each project chooses its database server when you deploy it (main menu 4) or when you use *Manage Projects → project → Add a database*:
+
+| | MariaDB (MySQL-compatible) | PostgreSQL |
+|---|---|---|
+| Install | main menu 2 → option 2 | main menu 2 → option 7 (or automatically, when a project asks for it) |
+| Suggested default | Laravel | Next.js (Prisma, Drizzle, TypeORM ...) |
+| Laravel `.env` | `DB_CONNECTION=mysql`, port 3306 | `DB_CONNECTION=pgsql`, port 5432 |
+| Next.js `.env` | `DATABASE_URL=mysql://...` | `DATABASE_URL=postgresql://...` |
+
+Both can run side by side. The choice is fixed per project (data is not moved between engines). Provisioning, `.env`, import, restore (REPLACE / ADD), backup, removal and the nightly encrypted backup all follow the project's engine. PostgreSQL backups are stored as `db-pg-<name>.sql.gz.gpg`, so a MariaDB and a PostgreSQL database with the same name never collide. Projects created before this version have no engine setting and stay MariaDB projects, unchanged.
+
+- Every project gets its own database, its own user and password; **other projects' users cannot even connect** to it.
+- Restoring a MySQL dump into a PostgreSQL project (or the other way round) is refused with a clear message. A PostgreSQL import is all-or-nothing (one transaction), and ownership is handed to the project's user afterwards.
+- **Laravel** needs the `pdo_pgsql` PHP extension. New Dockerfiles include it. For an older project, regenerate the files (main menu 3), copy the new Dockerfile into the repository and push; HiDeploy warns you when it is missing.
+- The PostgreSQL image is `postgres:17-bookworm` (constant `POSTGRES_IMAGE`). A major upgrade (17 to 18) needs a dump and restore and is not automatic. There is no web admin for PostgreSQL yet (phpMyAdmin stays MariaDB-only).
+
+---
+
+## Brotli compression (faster page loads)
+
+*Main menu 2 → option 8.* Brotli compresses text (HTML, CSS, JavaScript, JSON, SVG, fonts) better than gzip. Expect roughly 8-25% smaller files than gzip, depending on the content (about 8% on a mixed sample of real files we measured; minified JavaScript and CSS usually gain more). It helps most on phones and slow connections and costs a little CPU. Browsers use it over HTTPS only; older ones keep getting gzip.
+
+- **Build it for me:** HiDeploy builds an nginx image on this server: the official nginx image plus the `ngx_brotli` modules compiled from source (newest `ngx_brotli` with the Brotli library it pins), 2-5 minutes, sites keep running meanwhile. The source comes from github.com and nginx.org; you can pin a version with `NGX_BROTLI_REF`.
+- **Or use your own image** (for example `nginx-brotli:latest`): it must load the Brotli modules itself.
+- **Safe by design:** the complete nginx configuration is first tested with the new image in a throw-away container. Then nginx is recreated (1-3 seconds without service). If anything fails (the container does not start, nginx rejects the settings), the previous image and configuration are restored automatically.
+- **Next.js sites:** an app that compresses with gzip itself would prevent Brotli, so HiDeploy tells nginx to fetch uncompressed content from the app and compress it itself (all Next.js vhosts are refreshed when you enable or disable Brotli). Laravel sites are served by nginx directly and need nothing.
+- *Test it on a site* shows the real transfer sizes (plain, gzip, Brotli) and which encoding a browser receives. *Rebuild* updates nginx and Brotli later. *Turn off* removes everything and returns to the standard image.
+
+---
+
 ## Notifications (email and Telegram)
 
 Open **10) Notifications**. HiDeploy tells you what happens on your server, so you do not have to look.
@@ -419,6 +455,8 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] Automatic encrypted backups (SSH + S3)
 - [x] Own mail server and webmail for every project domain
 - [x] Notifications by email (own mail server) and Telegram
+- [x] PostgreSQL next to MariaDB, chosen per project
+- [x] Brotli compression
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
 - [x] Security hardening (firewall with lockout guard, fail2ban, automatic security updates, SSH keys-only, security check)

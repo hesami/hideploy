@@ -11,6 +11,7 @@
 #   8) Security (firewall with lockout guard, fail2ban, automatic security updates, SSH, checks)
 #   9) Email (own mail server for all your domains: mailboxes, DKIM/SPF/DMARC help, optional webmail)
 #  10) Notifications (email + Telegram alerts: deployments, backups, stopped services, disk, certificates)
+#  Databases: MariaDB or PostgreSQL per project (Laravel and Next.js).  nginx: optional Brotli compression (Shared Services).
 #
 # Architecture (kept deliberately simple):
 #
@@ -27,7 +28,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.7.0"
+HIDEPLOY_VERSION="1.8.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -105,6 +106,17 @@ NOTIFY_SPOOL="/var/spool/hideploy-notify"  # pipelines drop small event files he
 NOTIFY_CRON="/etc/cron.d/hideploy-notify"
 NOTIFY_LOG="/var/log/hideploy-notify.log"
 TG_API_BASE="https://api.telegram.org"
+
+# PostgreSQL (optional second database server, chosen per project)
+PG_DIR="$INFRA_DIR/postgres"
+PG_CONTAINER="global-postgres"
+POSTGRES_IMAGE="postgres:17-bookworm"      # major upgrades (17 -> 18) need a dump and restore: not automatic
+
+# Brotli (optional: nginx image with the Brotli modules, built from source on this server)
+NGINX_BROTLI_DIR="$NGINX_DIR/brotli-build"
+NGINX_BROTLI_TAG="hideploy-nginx-brotli"
+NGX_BROTLI_REF="master"                    # a branch or tag of github.com/google/ngx_brotli; "master" = the newest
+BROTLI_CONF="$NGINX_DIR/conf.d/01-brotli.conf"
 
 # Security (main menu 8)
 SEC_DIR="$INFRA_DIR/security"              # settings and SSH backups (no secrets)
@@ -268,6 +280,221 @@ db_sql() {
 }
 
 # ----------------------------------------------------------------------------
+# Database engines: MariaDB (MySQL-compatible) and PostgreSQL
+# ----------------------------------------------------------------------------
+# Each project records its engine in .deploy.env (DB_ENGINE=mariadb|postgres). A project WITHOUT that key is a
+# MariaDB project, so everything created before PostgreSQL support existed keeps working exactly as before.
+# Both servers are shared containers on the internal network and are never exposed to the internet.
+
+db_engine_of()    { local e; e="$(kv_get "$1/.deploy.env" DB_ENGINE)"; if [ "$e" = "postgres" ]; then echo postgres; else echo mariadb; fi; }
+db_engine_label() { if [ "$1" = "postgres" ]; then echo "PostgreSQL"; else echo "MariaDB"; fi; }
+db_container_of() { if [ "$1" = "postgres" ]; then echo "$PG_CONTAINER"; else echo "$DB_CONTAINER"; fi; }
+db_port_of()      { if [ "$1" = "postgres" ]; then echo 5432; else echo 3306; fi; }
+db_running()      { container_running "$(db_container_of "$1")"; }
+
+# PostgreSQL names are always double-quoted below, so letters/digits/_ are safe; these extra rules avoid reserved names
+valid_pg_name() { valid_ident "$1" && [ "${#1}" -le 63 ] && [[ "$1" != pg_* ]]; }
+valid_db_name() { if [ "$1" = "postgres" ]; then valid_pg_name "$2" && [ "$2" != "postgres" ] && [ "$2" != "template0" ] && [ "$2" != "template1" ]; else valid_ident "$2"; fi; }
+valid_db_user() { if [ "$1" = "postgres" ]; then valid_pg_name "$2" && [ "$2" != "postgres" ]; else valid_ident "$2"; fi; }
+
+# PostgreSQL quoting: literal 'it''s' and identifier "name"
+pg_lit()   { local q="'" s="$1"; s="${s//$q/$q$q}"; printf "'%s'" "$s"; }
+pg_ident() { local q='"' s="$1"; s="${s//$q/$q$q}"; printf '"%s"' "$s"; }
+
+# Run SQL (from stdin) as the PostgreSQL superuser inside the shared container (local socket: no password on any command line)
+# usage:  printf '...' | pg_sql [-d DATABASE]
+pg_sql() { docker exec -i "$PG_CONTAINER" psql -U postgres -X -q -At -v ON_ERROR_STOP=1 "$@"; }
+
+dbx_db_exists() {   # ENGINE DB -> prints 0 or 1
+    if [ "$1" = "postgres" ]; then printf 'SELECT count(*) FROM pg_database WHERE datname=%s;\n' "$(pg_lit "$2")" | pg_sql
+    else printf "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='%s';\n" "$2" | db_sql; fi
+}
+
+dbx_user_exists() {   # ENGINE USER -> prints 0 or 1
+    if [ "$1" = "postgres" ]; then printf 'SELECT count(*) FROM pg_roles WHERE rolname=%s;\n' "$(pg_lit "$2")" | pg_sql
+    else printf "SELECT COUNT(*) FROM mysql.user WHERE User='%s';\n" "$2" | db_sql; fi
+}
+
+# dbx_provision ENGINE DB USER PASS — creates (or reuses) the database and the user, and sets the password.
+dbx_provision() {
+    local e="$1" db="$2" user="$3" pass="$4"
+    if [ "$e" = "postgres" ]; then
+        {
+            printf 'DO $do$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = %s) THEN CREATE ROLE %s LOGIN PASSWORD %s; ELSE ALTER ROLE %s WITH LOGIN PASSWORD %s; END IF; END $do$;\n' \
+                "$(pg_lit "$user")" "$(pg_ident "$user")" "$(pg_lit "$pass")" "$(pg_ident "$user")" "$(pg_lit "$pass")"
+            # CREATE DATABASE cannot run inside a function: psql's \gexec runs the generated statement
+            printf "SELECT 'CREATE DATABASE %s OWNER %s ENCODING ''UTF8'' TEMPLATE template0' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = %s)\\\\gexec\n" \
+                "$(pg_ident "$db")" "$(pg_ident "$user")" "$(pg_lit "$db")"
+            printf 'ALTER DATABASE %s OWNER TO %s;\n' "$(pg_ident "$db")" "$(pg_ident "$user")"
+            # other projects' users must not even be able to connect to this database
+            printf 'REVOKE ALL ON DATABASE %s FROM PUBLIC;\nGRANT ALL ON DATABASE %s TO %s;\n' "$(pg_ident "$db")" "$(pg_ident "$db")" "$(pg_ident "$user")"
+        } | pg_sql
+    else
+        printf "CREATE DATABASE IF NOT EXISTS \`%s\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nCREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s';\nALTER USER '%s'@'%%' IDENTIFIED BY '%s';\nGRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'%%';\nFLUSH PRIVILEGES;\n" \
+            "$db" "$user" "$(sql_escape "$pass")" "$user" "$(sql_escape "$pass")" "$db" "$user" | db_sql
+    fi
+}
+
+# dbx_drop ENGINE DB USER — removes the database and its user
+dbx_drop() {
+    local e="$1" db="$2" user="$3"
+    if [ "$e" = "postgres" ]; then
+        printf 'DROP DATABASE IF EXISTS %s WITH (FORCE);\n' "$(pg_ident "$db")" | pg_sql || return 1
+        printf 'DROP ROLE IF EXISTS %s;\n' "$(pg_ident "$user")" | pg_sql
+    else
+        printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'%%';\n" "$db" "$(sql_escape "$user")" | db_sql
+    fi
+}
+
+# dbx_recreate ENGINE DB USER — an empty database with the same name and owner (used before a REPLACE restore)
+dbx_recreate() {
+    local e="$1" db="$2" user="$3"
+    if [ "$e" = "postgres" ]; then
+        {
+            printf 'DROP DATABASE IF EXISTS %s WITH (FORCE);\n' "$(pg_ident "$db")"
+            printf 'CREATE DATABASE %s OWNER %s ENCODING %s TEMPLATE template0;\n' "$(pg_ident "$db")" "$(pg_ident "$user")" "$(pg_lit UTF8)"
+            printf 'REVOKE ALL ON DATABASE %s FROM PUBLIC;\nGRANT ALL ON DATABASE %s TO %s;\n' "$(pg_ident "$db")" "$(pg_ident "$db")" "$(pg_ident "$user")"
+        } | pg_sql
+    else
+        printf "DROP DATABASE IF EXISTS \`%s\`;\nCREATE DATABASE \`%s\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nGRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'%%';\nFLUSH PRIVILEGES;\n" \
+            "$db" "$db" "$db" "$(sql_escape "$user")" | db_sql
+    fi
+}
+
+dbx_table_count() {   # ENGINE DB -> number of tables (0 when the database does not exist)
+    local n
+    if [ "$1" = "postgres" ]; then
+        n="$(printf "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\n" | pg_sql -d "$2" 2>/dev/null)"
+    else
+        n="$(printf "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='%s';\n" "$2" | db_sql 2>/dev/null)"
+    fi
+    printf '%s' "${n:-0}"
+}
+
+# dbx_dump ENGINE DB [extra mariadb-dump options] — plain SQL on stdout
+dbx_dump() {
+    local e="$1" db="$2"; shift 2
+    if [ "$e" = "postgres" ]; then
+        docker exec "$PG_CONTAINER" pg_dump -U postgres --no-owner --no-acl "$db"
+    else
+        docker exec "$DB_CONTAINER" sh -c 'db="$1"; shift; MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb-dump -uroot --single-transaction --routines "$@" --databases "$db"' _ "$db" "$@"
+    fi
+}
+
+# After an import the objects belong to the superuser: hand them to the owner of the database
+pg_fix_owner() {   # DB
+    pg_sql -d "$1" <<'SQL'
+DO $fix$
+DECLARE r record; o text;
+BEGIN
+  SELECT pg_catalog.pg_get_userbyid(datdba) INTO o FROM pg_database WHERE datname = current_database();
+  FOR r IN SELECT schemaname AS s, tablename AS n FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') LOOP
+    EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', r.s, r.n, o);
+  END LOOP;
+  FOR r IN SELECT schemaname AS s, viewname AS n FROM pg_views WHERE schemaname NOT IN ('pg_catalog','information_schema') LOOP
+    EXECUTE format('ALTER VIEW %I.%I OWNER TO %I', r.s, r.n, o);
+  END LOOP;
+  FOR r IN SELECT schemaname AS s, matviewname AS n FROM pg_matviews WHERE schemaname NOT IN ('pg_catalog','information_schema') LOOP
+    EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO %I', r.s, r.n, o);
+  END LOOP;
+  FOR r IN SELECT schemaname AS s, sequencename AS n FROM pg_sequences WHERE schemaname NOT IN ('pg_catalog','information_schema') LOOP
+    BEGIN
+      EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO %I', r.s, r.n, o);
+    EXCEPTION WHEN OTHERS THEN NULL;   -- sequences that belong to a table column follow the table automatically
+    END;
+  END LOOP;
+END $fix$;
+SQL
+}
+
+# pg_import_file DB FILE — .sql or .sql.gz (a pg_dump in plain format) into an EXISTING database
+pg_import_file() {
+    local db="$1" file="$2" rc head_txt
+    local -a reader
+    valid_pg_name "$db" || { err "Invalid database name."; return 1; }
+    [ -f "$file" ] && [ -s "$file" ] || { err "File not found or empty: $file"; return 1; }
+    case "$file" in
+        *.gz) gzip -t "$file" 2>/dev/null || { err "This is not a valid .gz file."; return 1; }
+              reader=(gzip -dc -- "$file") ;;
+        *)    reader=(cat -- "$file") ;;
+    esac
+    head_txt="$("${reader[@]}" 2>/dev/null | head -c 4096)"
+    if grep -qE 'MySQL dump|MariaDB dump|ENGINE=InnoDB' <<<"$head_txt"; then
+        err "This looks like a MySQL/MariaDB dump. A PostgreSQL database needs a PostgreSQL dump (pg_dump, plain SQL format)."
+        return 1
+    fi
+    info "Importing $(du -h "$file" | cut -f1) into '$db' (all or nothing: one transaction) — large files can take several minutes..."
+    # Lines that would create/rename databases, roles, owners or privileges are dropped so the data always lands in THIS
+    # project's database. Rows inside COPY blocks are never touched.
+    "${reader[@]}" | awk '
+        BEGIN { c = 0 }
+        { if (c) { print; if ($0 == "\\.") c = 0; next }
+          if ($0 ~ /^COPY .* FROM stdin;$/) { c = 1; print; next }
+          if ($0 ~ /^(CREATE|DROP|ALTER) DATABASE / || $0 ~ /^\\connect / || $0 ~ /^ALTER .* OWNER TO / || $0 ~ /^(GRANT|REVOKE) / \
+              || $0 ~ /^(CREATE|ALTER|DROP) ROLE / || $0 ~ /^COMMENT ON DATABASE /) next
+          print }' \
+        | docker exec -i "$PG_CONTAINER" psql -U postgres -X -q -d "$db" -v ON_ERROR_STOP=1 --single-transaction >/dev/null
+    rc="${PIPESTATUS[2]}"
+    if [ "$rc" -ne 0 ]; then
+        err "Import failed (see the SQL error above). Nothing was imported: the database is unchanged."
+        return 1
+    fi
+    pg_fix_owner "$db" || warn "Imported, but the ownership of the tables could not be adjusted."
+    ok "Import finished."
+}
+
+# ---------- choosing and preparing an engine for a project --------------------------------
+
+db_engine_state() {   # ENGINE -> short status text
+    local c; c="$(db_container_of "$1")"
+    case "$(container_state "$c")" in
+        running) printf 'running' ;;
+        stopped) printf 'installed, stopped' ;;
+        *)       printf 'not installed yet: it will be installed for you' ;;
+    esac
+}
+
+# db_ensure_engine ENGINE — make sure the database server exists and runs (offers to install it)
+db_ensure_engine() {
+    local e="$1" c; c="$(db_container_of "$e")"
+    db_running "$e" && return 0
+    case "$(container_state "$c")" in
+        stopped) info "Starting $(db_engine_label "$e")..."; docker start "$c" >/dev/null 2>&1; sleep 3
+                 db_running "$e" && return 0
+                 err "$(db_engine_label "$e") would not start. Check: docker logs $c"; return 1 ;;
+        missing) confirm "$(db_engine_label "$e") is not installed on this server yet. Install it now?" y || return 1
+                 if [ "$e" = "postgres" ]; then step_postgres_install; else step_mariadb_install; fi
+                 db_running "$e" ;;
+        *)       err "Docker is not ready."; return 1 ;;
+    esac
+}
+
+# db_choose_engine TYPE(laravel|nextjs) — asks which database server a project uses; sets PROV_ENGINE
+db_choose_engine() {
+    local kind="$1" def=1 choice eng
+    [ "$kind" = "nextjs" ] && def=2
+    echo ""
+    echo " Which database server should this project use?"
+    printf '  1) MariaDB (MySQL-compatible)   %s(%s)%s\n' "$C_DIM" "$(db_engine_state mariadb)" "$C_RESET"
+    printf '  2) PostgreSQL                   %s(%s)%s\n' "$C_DIM" "$(db_engine_state postgres)" "$C_RESET"
+    explain "Both work with Laravel. Next.js tools (Prisma, Drizzle, TypeORM ...) usually feel most at home with PostgreSQL." \
+            "Both servers can run side by side; every project picks one. The choice is fixed per project (data is not moved between engines)."
+    while true; do
+        read -r -p "Select [$def]: " choice; choice="${choice:-$def}"
+        case "$choice" in 1) eng="mariadb"; break ;; 2) eng="postgres"; break ;; *) err "Choose 1 or 2." ;; esac
+    done
+    db_ensure_engine "$eng" || return 1
+    PROV_ENGINE="$eng"
+}
+
+# Laravel needs the pdo_pgsql PHP extension for PostgreSQL; projects created by older HiDeploy versions do not have it
+laravel_pg_ready() {   # PATH -> 0 when the Dockerfile (or the running container) has pdo_pgsql
+    local path="$1"
+    if container_running "${CONTAINER_NAME:-}" && docker exec "$CONTAINER_NAME" php -m 2>/dev/null | grep -qi '^pdo_pgsql$'; then return 0; fi
+    grep -qs 'pdo_pgsql' "$path/Dockerfile"
+}
+
+# ----------------------------------------------------------------------------
 # Status and "recommended next step" engine
 # ----------------------------------------------------------------------------
 project_count() {
@@ -329,10 +556,10 @@ suggest_next() {
         stopped) echo "nginx is stopped: docker start $NGINX_CONTAINER"; return ;;
         missing) echo "Choose 2) Shared Services -> Install nginx"; return ;;
     esac
-    case "$(container_state "$DB_CONTAINER")" in
-        stopped) echo "MariaDB is stopped: docker start $DB_CONTAINER"; return ;;
-        missing) echo "Choose 2) Shared Services -> Install MariaDB"; return ;;
-    esac
+    local mst pst; mst="$(container_state "$DB_CONTAINER")"; pst="$(container_state "$PG_CONTAINER")"
+    if [ "$mst" = "missing" ] && [ "$pst" = "missing" ]; then echo "Choose 2) Shared Services -> Install MariaDB (or PostgreSQL)"; return; fi
+    if [ "$mst" = "stopped" ]; then echo "MariaDB is stopped: docker start $DB_CONTAINER"; return; fi
+    if [ "$pst" = "stopped" ]; then echo "PostgreSQL is stopped: docker start $PG_CONTAINER"; return; fi
     if ! renew_enabled;                  then echo "Choose 2) Shared Services -> Enable SSL auto-renew"; return; fi
     if [ "$(project_count)" -eq 0 ];     then echo "Choose 3) Generate Project Files, then 4) Deploy New Project"; return; fi
     if ! bk_enabled;                     then echo "Choose 6) Backups -> set up automatic, encrypted backups"; return; fi
@@ -365,6 +592,8 @@ show_status() {
     fi
     container_row "nginx container" "$NGINX_CONTAINER"
     container_row "MariaDB container" "$DB_CONTAINER"
+    pg_status_row
+    brotli_status_row
     if renew_enabled; then status_row "SSL auto-renew" good "ENABLED"; else status_row "SSL auto-renew" warn "DISABLED"; fi
     pma_status_row
     redis_status_row
@@ -384,7 +613,7 @@ require_stack() {
     if docker_ready && ! net_exists;           then err "Network '$NETWORK' is missing.  → Main menu 1) Prepare Server"; missing=1; fi
     if ! id "$RUNNER_USER" >/dev/null 2>&1;    then err "GitLab Runner is not installed. → Main menu 1) Prepare Server"; missing=1; fi
     if docker_ready && ! container_running "$NGINX_CONTAINER"; then err "nginx container is not running. → Main menu 2) Shared Services"; missing=1; fi
-    if docker_ready && ! container_running "$DB_CONTAINER";    then err "MariaDB container is not running. → Main menu 2) Shared Services"; missing=1; fi
+    if docker_ready && ! container_running "$DB_CONTAINER" && ! container_running "$PG_CONTAINER"; then err "No database server is running (MariaDB or PostgreSQL). → Main menu 2) Shared Services"; missing=1; fi
     [ "$missing" -eq 0 ]
 }
 
@@ -602,7 +831,7 @@ EOF
     cat > "$NGINX_DIR/docker-compose.yml" <<EOF
 services:
   nginx:
-    image: ${NGINX_IMAGE}
+    image: $(nginx_image_current)
     container_name: ${NGINX_CONTAINER}
     restart: always
     ports:
@@ -743,7 +972,7 @@ step_renew_disable() {
 
 services_status() {
     section "Shared services status"
-    docker ps -a --filter "name=$NGINX_CONTAINER" --filter "name=$DB_CONTAINER" \
+    docker ps -a --filter "name=$NGINX_CONTAINER" --filter "name=$DB_CONTAINER" --filter "name=$PG_CONTAINER" \
         --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
     echo ""
     printf 'Network %s: %s\n' "$NETWORK" "$(net_exists && echo present || echo MISSING)"
@@ -771,9 +1000,9 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 
 RUN apk add --no-cache git curl zip unzip supervisor \
-        libpng-dev libjpeg-turbo-dev freetype-dev libzip-dev oniguruma-dev libxml2-dev icu-dev \
+        libpng-dev libjpeg-turbo-dev freetype-dev libzip-dev oniguruma-dev libxml2-dev icu-dev postgresql-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j"$(nproc)" pdo_mysql mbstring exif pcntl bcmath gd zip intl opcache
+    && docker-php-ext-install -j"$(nproc)" pdo_mysql pdo_pgsql mbstring exif pcntl bcmath gd zip intl opcache
 
 RUN set -eu; \
     u="$(getent passwd "${APP_UID}" | cut -d: -f1 || true)"; [ -z "$u" ] || deluser "$u"; \
@@ -1052,6 +1281,9 @@ validate_project_files() {
         grep -q 'APP_UID' "$dir/docker-compose.prod.yml"           || { err "docker-compose.prod.yml: pass APP_UID/APP_GID as build args."; problems=$((problems+1)); }
     fi
     if [ -f "$dir/Dockerfile" ]; then
+        if [ "$(db_engine_of "$PROJECTS_DIR/$domain")" = "postgres" ] && ! grep -q 'pdo_pgsql' "$dir/Dockerfile"; then
+            err "Dockerfile: no 'pdo_pgsql' (the PHP driver for PostgreSQL). Regenerate the files: main menu 3), then copy the new Dockerfile into your repository."; problems=$((problems+1))
+        fi
         grep -q 'ARG APP_UID' "$dir/Dockerfile"                    || { err "Dockerfile: missing 'ARG APP_UID' / 'ARG APP_GID'."; problems=$((problems+1)); }
         grep -q 'queue:work' "$dir/Dockerfile"                     || warn "Dockerfile: no queue worker found — queued jobs/emails will NOT be processed."
         grep -q 'schedule:work' "$dir/Dockerfile"                  || warn "Dockerfile: no scheduler found — scheduled tasks will NOT run."
@@ -1626,7 +1858,7 @@ load_project() {
     local path="$1"
     [ -f "$path/.deploy.env" ] || { err "No .deploy.env in $path"; return 1; }
     # Defaults for optional settings (older projects do not have them), so values never leak between projects
-    FRONTEND_BUILD="no"; USE_DATABASE="yes"; NODE_IMAGE="$DEFAULT_NODE_IMAGE"; PROJECT_TYPE="laravel"; APP_PORT="3000"
+    FRONTEND_BUILD="no"; USE_DATABASE="yes"; NODE_IMAGE="$DEFAULT_NODE_IMAGE"; PROJECT_TYPE="laravel"; APP_PORT="3000"; DB_ENGINE="mariadb"
     set -a; . "$path/.deploy.env"; set +a
 }
 
@@ -1757,10 +1989,10 @@ mem_to_mb() { local n="${1%[mg]}"; [[ "$1" == *g ]] && n=$((n * 1024)); echo "$n
 
 # write_db_env PATH — writes PROV_DB / PROV_USER / PROV_PASS into the project's .env
 write_db_env() {
-    local path="$1"
-    env_set "$path/.env" DB_CONNECTION mysql
-    env_set "$path/.env" DB_HOST "$DB_CONTAINER"
-    env_set "$path/.env" DB_PORT 3306
+    local path="$1" e="${PROV_ENGINE:-mariadb}"
+    if [ "$e" = "postgres" ]; then env_set "$path/.env" DB_CONNECTION pgsql; else env_set "$path/.env" DB_CONNECTION mysql; fi
+    env_set "$path/.env" DB_HOST "$(db_container_of "$e")"
+    env_set "$path/.env" DB_PORT "$(db_port_of "$e")"
     env_set "$path/.env" DB_DATABASE "$PROV_DB"
     env_set "$path/.env" DB_USERNAME "$PROV_USER"
     env_set "$path/.env" DB_PASSWORD "$(env_quote "$PROV_PASS")"
@@ -1770,13 +2002,22 @@ project_add_database() {
     local path="$1"
     load_project "$path" || return 1
     section "Add a database to $(basename "$path")"
-    container_running "$DB_CONTAINER" || { err "The MariaDB container is not running."; return 1; }
     if [ "$USE_DATABASE" = "yes" ] && [ -n "$(env_get "$path/.env" DB_DATABASE)" ]; then
-        warn "This project already has a database configured ($(env_get "$path/.env" DB_DATABASE))."
+        warn "This project already has a database configured ($(env_get "$path/.env" DB_DATABASE), $(db_engine_label "$(db_engine_of "$path")"))."
         confirm "Configure another one anyway?" n || return 0
+    fi
+    local kind="laravel"; is_next && kind="nextjs"
+    PROV_ENGINE=""
+    db_choose_engine "$kind" || return 1
+    if [ "$PROV_ENGINE" = "postgres" ] && ! is_next && ! laravel_pg_ready "$path"; then
+        warn "This project's PHP image has no PostgreSQL driver (pdo_pgsql): its Dockerfile was made by an older HiDeploy."
+        explain "Fix: main menu 3) Generate Project Files, copy the new Dockerfile into your repository, push, and let the pipeline rebuild."                 "Until then the site cannot connect to PostgreSQL."
+        confirm "Continue anyway (the database and .env are prepared now)?" n || return 0
     fi
     explain "Press Enter to accept a suggestion, or type your own value."
     db_provision "$(basename "$path")" || return 1
+    env_set "$path/.deploy.env" DB_ENGINE "$PROV_ENGINE"
+    DB_ENGINE="$PROV_ENGINE"
     if is_next; then
         write_db_env_next "$path"
         env_set "$path/.deploy.env" USE_DATABASE yes
@@ -1869,8 +2110,9 @@ pick_sql_file() {
 
 # db_import_file DBNAME FILE — import a dump into an existing database
 db_import_file() {
-    local db="$1" file="$2" fix=0 rc
+    local db="$1" file="$2" eng="${3:-mariadb}" fix=0 rc
     local -a reader
+    if [ "$eng" = "postgres" ]; then pg_import_file "$db" "$file"; return; fi
     valid_ident "$db" || { err "Invalid database name."; return 1; }
     [ -f "$file" ] && [ -s "$file" ] || { err "File not found or empty: $file"; return 1; }
     case "$file" in
@@ -1898,18 +2140,21 @@ db_import_file() {
 }
 
 project_restore_db() {
-    local path="$1" preset="${2:-}" db dbuser file mode typed tables maint="no" rc=0
+    local path="$1" preset="${2:-}" db dbuser file mode typed tables maint="no" rc=0 eng
     load_project "$path" || return 1
     section "Restore database — $(basename "$path")"
     [ "$USE_DATABASE" = "yes" ] || { err "This project has no database. Use 'Add a database' first."; return 1; }
-    container_running "$DB_CONTAINER" || { err "The MariaDB container is not running."; return 1; }
+    eng="$(db_engine_of "$path")"
+    db_running "$eng" || { err "The $(db_engine_label "$eng") container is not running."; return 1; }
     db="$(env_get "$path/.env" DB_DATABASE)"; dbuser="$(env_get "$path/.env" DB_USERNAME)"
-    valid_ident "$db" || { err "DB_DATABASE is missing or invalid in $path/.env"; return 1; }
-    explain \
-        "Target database: $db" \
-        "Supports .sql and .sql.gz files. Dumps from MySQL 8 are converted automatically if needed."
+    valid_db_name "$eng" "$db" || { err "DB_DATABASE is missing or invalid in $path/.env"; return 1; }
+    if [ "$eng" = "postgres" ]; then
+        explain "Target database: $db (PostgreSQL)" "Supports .sql and .sql.gz files made by pg_dump (plain SQL format)."
+    else
+        explain "Target database: $db (MariaDB)" "Supports .sql and .sql.gz files. Dumps from MySQL 8 are converted automatically if needed."
+    fi
     if [ -n "$preset" ]; then file="$preset"; else pick_sql_file file || { info "Cancelled."; return 0; }; fi
-    tables="$(printf "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='%s';\n" "$db" | db_sql)"
+    tables="$(dbx_table_count "$eng" "$db")"
     echo ""
     printf 'The database "%s" currently has %s table(s).\n' "$db" "${tables:-0}"
     echo " 1) REPLACE (recommended): automatic backup, then drop + recreate the database, then import"
@@ -1929,10 +2174,9 @@ project_restore_db() {
         artisan down --retry=60 >/dev/null 2>&1 && maint="yes"
     fi
     if [ "$mode" = "1" ]; then
-        printf "DROP DATABASE IF EXISTS \`%s\`;\nCREATE DATABASE \`%s\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nGRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'%%';\nFLUSH PRIVILEGES;\n" \
-            "$db" "$db" "$db" "$(sql_escape "$dbuser")" | db_sql || { err "Could not recreate the database."; rc=1; }
+        dbx_recreate "$eng" "$db" "$dbuser" || { err "Could not recreate the database."; rc=1; }
     fi
-    if [ "$rc" -eq 0 ]; then db_import_file "$db" "$file" || rc=1; fi
+    if [ "$rc" -eq 0 ]; then db_import_file "$db" "$file" "$eng" || rc=1; fi
     [ "$maint" = "yes" ] && artisan up >/dev/null 2>&1
     if [ "$rc" -ne 0 ]; then
         [ "$mode" = "1" ] && warn "The database was replaced before the failure. Your safety backup is in $BACKUP_DIR (restore it with this same menu)."
@@ -2405,10 +2649,11 @@ wait_healthy() {
 
 # write_db_env_next PATH — database settings for a Next.js project (uses PROV_DB / PROV_USER / PROV_PASS)
 write_db_env_next() {
-    local path="$1" pass_enc
+    local path="$1" pass_enc e="${PROV_ENGINE:-mariadb}" scheme=mysql
+    [ "$e" = "postgres" ] && scheme=postgresql
     pass_enc="$(urlencode "$PROV_PASS")"
-    env_set "$path/.env" DB_HOST "$DB_CONTAINER"
-    env_set "$path/.env" DB_PORT 3306
+    env_set "$path/.env" DB_HOST "$(db_container_of "$e")"
+    env_set "$path/.env" DB_PORT "$(db_port_of "$e")"
     env_set "$path/.env" DB_DATABASE "$PROV_DB"
     env_set "$path/.env" DB_USERNAME "$PROV_USER"
     if [[ "$PROV_PASS" == *"'"* ]]; then
@@ -2416,7 +2661,7 @@ write_db_env_next() {
     else
         env_set "$path/.env" DB_PASSWORD "'$PROV_PASS'"
     fi
-    env_set "$path/.env" DATABASE_URL "mysql://$PROV_USER:$pass_enc@$DB_CONTAINER:3306/$PROV_DB"
+    env_set "$path/.env" DATABASE_URL "$scheme://$PROV_USER:$pass_enc@$(db_container_of "$e"):$(db_port_of "$e")/$PROV_DB"
 }
 
 # ---------- nginx vhost for Next.js (reverse proxy over HTTP) ----------------
@@ -2454,6 +2699,7 @@ EOF
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
+        __AE__
         proxy_read_timeout 60s;
     }
 EOF
@@ -2492,7 +2738,7 @@ write_next_vhost() {
             tpl_next_common
             echo "}"
         fi
-    } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__PORT__|$port|g" > "$out"
+    } | sed -e "s|__DOMAIN__|$domain|g" -e "s|__CONTAINER__|$container|g" -e "s|__PORT__|$port|g" -e "s|__AE__|$(brotli_ae_line)|g" > "$out"
     vhost_postprocess "$out" "$domain" "$mode"
 }
 
@@ -2560,7 +2806,7 @@ menu_project_next() {
 deploy_wizard_nextjs() {
     local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 c
     local use_db port heap detected pm ip sqlfile db_line scheme dp_ok ram
-    PROV_DB=""; PROV_USER=""; PROV_PASS=""
+    PROV_DB=""; PROV_USER=""; PROV_PASS=""; PROV_ENGINE=""
     explain \
         "Next.js wizard: DNS check -> clone -> settings -> project files -> database -> .env -> build -> nginx -> SSL -> CI/CD guide" \
         "The site is built into a small Docker image (standalone output). pnpm is recommended and used by default."
@@ -2639,7 +2885,9 @@ deploy_wizard_nextjs() {
     done
     heap=$(( $(mem_to_mb "$mem") * 70 / 100 ))
     while true; do ask "Port the app listens on inside the container" "3000" port; [[ "$port" =~ ^[0-9]{2,5}$ ]] && break; err "Invalid port."; done
-    if confirm "Does this project use a MariaDB database right now? (you can add one later)" n; then use_db="yes"; else use_db="no"; fi
+    if confirm "Does this project use a database right now? (you can add one later)" n; then
+        use_db="yes"; db_choose_engine nextjs || { pause; return; }
+    else use_db="no"; fi
     ask "GitLab runner tag used in .gitlab-ci.yml" "$(cfg_get RUNNER_TAG || true)" tag
     tag="${tag:-production}"; cfg_set RUNNER_TAG "$tag"
     cat > "$path/.deploy.env" <<EOF
@@ -2655,6 +2903,7 @@ APP_PORT=$port
 MEM_LIMIT=$mem
 NODE_HEAP_MB=$heap
 USE_DATABASE=$use_db
+DB_ENGINE=${PROV_ENGINE:-mariadb}
 EOF
     chown "$uid:$gid" "$path/.deploy.env"; chmod 640 "$path/.deploy.env"
     grep -qxF '.deploy.env' "$path/.git/info/exclude" 2>/dev/null || echo '.deploy.env' >> "$path/.git/info/exclude"
@@ -2698,7 +2947,7 @@ EOF
         db_provision "$domain" || { pause; return; }
         if confirm "Restore an existing SQL backup into this database now?" n; then
             if pick_sql_file sqlfile; then
-                db_import_file "$PROV_DB" "$sqlfile" || warn "Import failed. You can retry later: Manage Projects -> your project -> Restore database."
+                db_import_file "$PROV_DB" "$sqlfile" "$PROV_ENGINE" || warn "Import failed. You can retry later: Manage Projects -> your project -> Restore database."
             fi
         fi
     else
@@ -2744,7 +2993,7 @@ EOF
     scheme="http"; [ "$ssl_ok" -eq 1 ] && scheme="https"
     echo ""; banner "Deployment complete" "$C_GREEN"
     db_line="none (add one later: Manage Projects -> your project -> Add a database)"
-    [ "$use_db" = "yes" ] && db_line="$PROV_DB (user $PROV_USER)"
+    [ "$use_db" = "yes" ] && db_line="$PROV_DB (user $PROV_USER, $(db_engine_label "$PROV_ENGINE"))"
     printf '  Site:        %s://%s\n  Code:        %s\n  Container:   %s (port %s, memory %s)\n  Package mgr: %s\n  Database:    %s\n  Config:      %s/.env  and  %s/.deploy.env\n' \
         "$scheme" "$domain" "$path" "$container" "$port" "$mem" "$pm" "$db_line" "$path" "$path"
     echo ""
@@ -2791,15 +3040,18 @@ choose_project() {
 latest_laravel_log() { ls -t "$1"/storage/logs/*.log 2>/dev/null | head -n1; }
 
 project_backup() {
-    local path="$1" db file
+    local path="$1" db file eng
     load_project "$path" || return 1
     if [ "$USE_DATABASE" != "yes" ]; then warn "This project has no database — nothing to back up."; return 0; fi
+    eng="$(db_engine_of "$path")"
     db="$(env_get "$path/.env" DB_DATABASE)"
     [ -n "$db" ] || { err "DB_DATABASE not found in $path/.env"; return 1; }
     mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
     file="$BACKUP_DIR/${db}-$(date +%F_%H%M%S).sql.gz"
+    # never overwrite an existing dump (for example the very file that is about to be restored)
+    [ ! -e "$file" ] || file="$BACKUP_DIR/${db}-$(date +%F_%H%M%S)-$$.sql.gz"
     info "Dumping database '$db'..."
-    docker exec "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb-dump -uroot --single-transaction --routines --databases "$1"' _ "$db" | gzip > "$file"
+    dbx_dump "$eng" "$db" | gzip > "$file"
     if [ "${PIPESTATUS[0]}" -eq 0 ] && [ -s "$file" ]; then
         ok "Backup saved: $file ($(du -h "$file" | cut -f1))"
     else
@@ -2808,9 +3060,10 @@ project_backup() {
 }
 
 project_remove() {
-    local path="$1" domain db dbuser typed
+    local path="$1" domain db dbuser typed eng
     domain="$(basename "$path")"
     load_project "$path" || return 1
+    eng="$(db_engine_of "$path")"
     db="$(env_get "$path/.env" DB_DATABASE)"; dbuser="$(env_get "$path/.env" DB_USERNAME)"
     [ "$USE_DATABASE" = "yes" ] || { db=""; dbuser=""; }
     local mdom; mdom="$(kv_get "$path/.deploy.env" MAIL_DOMAIN)"
@@ -2823,8 +3076,8 @@ project_remove() {
     if [ -d "$NGINX_DIR/letsencrypt/live/$domain" ] && confirm "Delete the SSL certificate for $domain?" y; then
         certbot_run delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 && ok "Certificate deleted."
     fi
-    if [ -n "$db" ] && valid_ident "$db" && confirm "DROP database '$db' and user '$dbuser' permanently?" n; then
-        printf "DROP DATABASE IF EXISTS \`%s\`;\nDROP USER IF EXISTS '%s'@'%%';\n" "$db" "$(sql_escape "$dbuser")" | db_sql && ok "Database and user dropped."
+    if [ -n "$db" ] && valid_db_name "$eng" "$db" && valid_db_user "$eng" "$dbuser" && confirm "DROP database '$db' and user '$dbuser' ($(db_engine_label "$eng")) permanently?" n; then
+        dbx_drop "$eng" "$db" "$dbuser" && ok "Database and user dropped."
     fi
     cd / && rm -rf "$path" && ok "Project folder removed."
     if [ -n "$mdom" ] && mail_installed && mail_domain_registered "$mdom"; then
@@ -2912,7 +3165,9 @@ menu_manage() {
             1) if choose_project; then menu_project "$PROJECT_PATH"; else pause; fi ;;
             2) menu_ssl ;;
             3) services_status
-               echo ""; echo " a) Reload nginx config   b) Restart nginx   c) Restart MariaDB   d) nginx logs   e) MariaDB logs   (Enter = back)"
+               echo ""; echo " a) Reload nginx config   b) Restart nginx   c) Restart MariaDB   d) nginx logs   e) MariaDB logs"
+               pg_installed && echo " f) Restart PostgreSQL   g) PostgreSQL logs"
+               echo " (Enter = back)"
                read -r -p "Select: " c
                case "$c" in
                    a) nginx_test_reload && ok "nginx reloaded." ;;
@@ -2920,6 +3175,8 @@ menu_manage() {
                    c) docker restart "$DB_CONTAINER" ;;
                    d) docker logs --tail 80 "$NGINX_CONTAINER" ;;
                    e) docker logs --tail 80 "$DB_CONTAINER" ;;
+                   f) pg_installed && docker restart "$PG_CONTAINER" ;;
+                   g) pg_installed && docker logs --tail 80 "$PG_CONTAINER" ;;
                esac
                pause ;;
             4) menu_disk ;;
@@ -2936,14 +3193,15 @@ menu_manage() {
 
 # db_provision DOMAIN  -> sets PROV_DB, PROV_USER, PROV_PASS
 db_provision() {
-    local domain="$1" base def_db def_user def_pass pass pass2 exists_db exists_user
+    local domain="$1" base def_db def_user def_pass pass pass2 exists_db exists_user e="${PROV_ENGINE:-mariadb}"
     base="$(printf '%s' "$domain" | tr '.-' '__' | tr -cd 'A-Za-z0-9_')"
-    def_db="${base:0:64}"; def_user="${base:0:32}"; def_pass="$(gen_password)"
+    def_db="${base:0:63}"; def_user="${base:0:32}"; def_pass="$(gen_password)"
+    [ "$e" = "postgres" ] && [[ "$def_db" == pg_* ]] && def_db="db_$def_db"
 
     while true; do
         ask "Database name" "$def_db" PROV_DB
-        valid_ident "$PROV_DB" || { err "Use only letters, digits and underscore (max 64)."; continue; }
-        exists_db="$(printf "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='%s';\n" "$PROV_DB" | db_sql)"
+        valid_db_name "$e" "$PROV_DB" || { err "Use only letters, digits and underscore (max 63; not 'postgres' or starting with 'pg_' on PostgreSQL)."; continue; }
+        exists_db="$(dbx_db_exists "$e" "$PROV_DB")"
         if [ "${exists_db:-0}" != "0" ]; then
             warn "Database '$PROV_DB' already exists."
             confirm "Reuse it (data is kept)?" n && break
@@ -2953,8 +3211,8 @@ db_provision() {
     done
     while true; do
         ask "Database user" "$def_user" PROV_USER
-        valid_ident "$PROV_USER" || { err "Use only letters, digits and underscore."; continue; }
-        exists_user="$(printf "SELECT COUNT(*) FROM mysql.user WHERE User='%s';\n" "$PROV_USER" | db_sql)"
+        valid_db_user "$e" "$PROV_USER" || { err "Use only letters, digits and underscore (not 'postgres' or starting with 'pg_' on PostgreSQL)."; continue; }
+        exists_user="$(dbx_user_exists "$e" "$PROV_USER")"
         if [ "${exists_user:-0}" != "0" ]; then
             warn "User '$PROV_USER' already exists."
             confirm "Reuse it and set a NEW password for it?" n && break
@@ -2970,10 +3228,9 @@ db_provision() {
         err "Passwords do not match."
     done
 
-    printf "CREATE DATABASE IF NOT EXISTS \`%s\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nCREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s';\nALTER USER '%s'@'%%' IDENTIFIED BY '%s';\nGRANT ALL PRIVILEGES ON \`%s\`.* TO '%s'@'%%';\nFLUSH PRIVILEGES;\n" \
-        "$PROV_DB" "$PROV_USER" "$(sql_escape "$PROV_PASS")" "$PROV_USER" "$(sql_escape "$PROV_PASS")" "$PROV_DB" "$PROV_USER" | db_sql \
+    dbx_provision "$e" "$PROV_DB" "$PROV_USER" "$PROV_PASS" \
         || { err "Database provisioning failed."; return 1; }
-    ok "Database '$PROV_DB' and user '$PROV_USER' are ready."
+    ok "Database '$PROV_DB' and user '$PROV_USER' are ready ($(db_engine_label "$e"))."
 }
 
 prepare_storage() {
@@ -3001,7 +3258,7 @@ deploy_wizard() {
     if [ "$ptype_choice" = "2" ]; then deploy_wizard_nextjs; return; fi
 
     local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok sqlfile
-    PROV_DB=""; PROV_USER=""; PROV_PASS=""
+    PROV_DB=""; PROV_USER=""; PROV_PASS=""; PROV_ENGINE=""
 
     # ---- 1. Domain ------------------------------------------------------
     section "Step 1/11 · Domain"
@@ -3080,7 +3337,9 @@ deploy_wizard() {
     if [ -f "$path/package.json" ] && grep -q '"build"' "$path/package.json"; then fe_default="y"; fi
     explain "Frontend: if the project has a package.json with a build script (Vite/Mix), assets are built on the server during deployment."
     if confirm "Does this project build frontend assets (npm/pnpm/yarn run build)?" "$fe_default"; then fe="yes"; else fe="no"; fi
-    if confirm "Does this project use a database right now? (you can add one later)" y; then use_db="yes"; else use_db="no"; fi
+    if confirm "Does this project use a database right now? (you can add one later)" y; then
+        use_db="yes"; db_choose_engine laravel || { pause; return; }
+    else use_db="no"; fi
     ask "GitLab runner tag used in .gitlab-ci.yml" "$(cfg_get RUNNER_TAG || true)" tag
     tag="${tag:-production}"; cfg_set RUNNER_TAG "$tag"
     cat > "$path/.deploy.env" <<EOF
@@ -3095,6 +3354,7 @@ MEM_LIMIT=$mem
 FRONTEND_BUILD=$fe
 NODE_IMAGE=$DEFAULT_NODE_IMAGE
 USE_DATABASE=$use_db
+DB_ENGINE=${PROV_ENGINE:-mariadb}
 EOF
     chown "$uid:$gid" "$path/.deploy.env"; chmod 640 "$path/.deploy.env"
     grep -qxF '.deploy.env' "$path/.git/info/exclude" 2>/dev/null || echo '.deploy.env' >> "$path/.git/info/exclude"
@@ -3125,13 +3385,13 @@ EOF
     done
 
     # ---- 7. Database ----------------------------------------------------
-    section "Step 7/11 · Database in the central MariaDB"
+    section "Step 7/11 · Database"
     if [ "$use_db" = "yes" ]; then
         explain "Press Enter to accept a suggestion, or type your own value."
         db_provision "$domain" || { pause; return; }
         if confirm "Restore an existing SQL backup into this database now?" n; then
             if pick_sql_file sqlfile; then
-                db_import_file "$PROV_DB" "$sqlfile" || warn "Import failed. You can retry later: Manage Projects → your project → Restore database."
+                db_import_file "$PROV_DB" "$sqlfile" "$PROV_ENGINE" || warn "Import failed. You can retry later: Manage Projects → your project → Restore database."
             fi
         fi
     else
@@ -3163,7 +3423,7 @@ EOF
     env_set "$path/.env" QUEUE_CONNECTION "$queue_conn"
     chown "$uid:$gid" "$path/.env"; chmod 640 "$path/.env"
     prepare_storage "$path" "$uid" "$gid"
-    ok ".env updated (DB host is '$DB_CONTAINER'). View it any time: nano $path/.env"
+    ok ".env updated (DB host is '$(db_container_of "$PROV_ENGINE")'). View it any time: nano $path/.env"
     [ "$queue_conn" = "database" ] && explain "Queue 'database' needs the jobs table — it is included in migrations of Laravel 11+ (older: php artisan queue:table)."
 
     # ---- 9. Passport ----------------------------------------------------
@@ -3215,7 +3475,7 @@ EOF
     local scheme="http"; [ "$ssl_ok" -eq 1 ] && scheme="https"
     echo ""; banner "Deployment complete" "$C_GREEN"
     db_line="none (add one later: Manage Projects → your project → Add a database)"
-    [ "$use_db" = "yes" ] && db_line="$PROV_DB (user $PROV_USER)"
+    [ "$use_db" = "yes" ] && db_line="$PROV_DB (user $PROV_USER, $(db_engine_label "$PROV_ENGINE"))"
     printf '  Site:        %s://%s\n  Code:        %s\n  Container:   %s\n  Database:    %s\n  Frontend:    build on deploy = %s\n  Config:      %s/.env  and  %s/.deploy.env\n' \
         "$scheme" "$domain" "$path" "$container" "$db_line" "$fe" "$path" "$path"
     echo ""
@@ -3565,7 +3825,7 @@ bk_prune_local() {
 # ---------- the backup itself --------------------------------------------
 
 bk_run_inner() {
-    local run dir fail=0 p dom db use_db f rh size ssh_state="off" s3_state="off"
+    local run dir fail=0 p dom db use_db f rh size ssh_state="off" s3_state="off" eng dbfile
     local -a items extras
     run="$(date +%F_%H%M%S)"; dir="$BK_LOCAL_DIR/$run"
     mkdir -p "$dir"; chmod 700 "$dir"
@@ -3576,12 +3836,13 @@ bk_run_inner() {
         dom="$(basename "$p")"
         use_db="$( . "$p/.deploy.env" 2>/dev/null; echo "${USE_DATABASE:-yes}" )"
         db="$(env_get "$p/.env" DB_DATABASE)"
-        if [ "$use_db" = "yes" ] && valid_ident "$db"; then
-            if docker exec "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb-dump -uroot --single-transaction --routines --events --databases "$1"' _ "$db" \
-                    | gzip -c | bk_encrypt "$dir/db-$db.sql.gz.gpg"; then
-                echo "  database $db: ok"
+        eng="$(db_engine_of "$p")"
+        dbfile="db-$db.sql.gz.gpg"; [ "$eng" = "postgres" ] && dbfile="db-pg-$db.sql.gz.gpg"
+        if [ "$use_db" = "yes" ] && valid_db_name "$eng" "$db"; then
+            if dbx_dump "$eng" "$db" --events | gzip -c | bk_encrypt "$dir/$dbfile"; then
+                echo "  database $db ($(db_engine_label "$eng")): ok"
             else
-                echo "  database $db: FAILED"; fail=$((fail+1)); rm -f "$dir/db-$db.sql.gz.gpg"
+                echo "  database $db ($(db_engine_label "$eng")): FAILED"; fail=$((fail+1)); rm -f "$dir/$dbfile"
             fi
         fi
         if [ "$(bk_val INCLUDE_FILES yes)" = "yes" ]; then
@@ -3877,6 +4138,7 @@ bk_decrypt_menu() {
                                     "Only on a rebuilt server, to bring everything back:  tar -xzf $out/${f%.gpg} -C /" ;;
             mail-data*) explain "The messages of all mailboxes. To restore them (stop the mail server first: docker stop $MAIL_CONTAINER):" \
                                 "  tar -xzf $out/${f%.gpg} -C $MAIL_DIR/data   then   docker start $MAIL_CONTAINER" ;;
+            db-pg-*) explain "A PostgreSQL database dump: restore it through the project menu (Manage Projects -> project -> Restore database) or option 8." ;;
             db-*) explain "A database dump: restore it through the project menu (Manage Projects -> project -> Restore database) or option 8." ;;
         esac
         warn "Remember to delete $out when you are done."
@@ -4143,6 +4405,7 @@ perf_next_static() {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Connection "";
+        __AE__
         proxy_cache hd_static;
         proxy_cache_valid 200 7d;
         proxy_cache_lock on;
@@ -4469,7 +4732,7 @@ perf_diagnose() {
         pub="$ttfb"
         printf '    public internet:               DNS %.2fs, connect %.2fs, first byte %.2fs, HTTP %s\n' "$dns" "$conn" "$ttfb" "$code"
         if ! is_next && [ "${USE_DATABASE:-yes}" = "yes" ] && container_running "$CONTAINER_NAME"; then
-            dbms="$(docker exec -u "$APP_UID:$APP_GID" -w "$APP_PATH" "$CONTAINER_NAME" php -r '$e=@parse_ini_file(".env"); if(!$e||empty($e["DB_HOST"])){echo "unknown";exit;} $t=microtime(true); try{ new PDO("mysql:host=".$e["DB_HOST"].";port=".($e["DB_PORT"]??3306).";dbname=".$e["DB_DATABASE"],$e["DB_USERNAME"],$e["DB_PASSWORD"],[PDO::ATTR_TIMEOUT=>10]); echo round((microtime(true)-$t)*1000);}catch(Throwable $x){echo "error";}' 2>/dev/null)"
+            dbms="$(docker exec -u "$APP_UID:$APP_GID" -w "$APP_PATH" "$CONTAINER_NAME" php -r '$e=@parse_ini_file(".env"); if(!$e||empty($e["DB_HOST"])){echo "unknown";exit;} $t=microtime(true); try{ new PDO((($e["DB_CONNECTION"]??"mysql")=="pgsql"?"pgsql":"mysql").":host=".$e["DB_HOST"].";port=".($e["DB_PORT"]??3306).";dbname=".$e["DB_DATABASE"],$e["DB_USERNAME"],$e["DB_PASSWORD"],[PDO::ATTR_TIMEOUT=>10]); echo round((microtime(true)-$t)*1000);}catch(Throwable $x){echo "error";}' 2>/dev/null)"
             printf '    database connection from the app: %s\n' "$( [[ "$dbms" =~ ^[0-9]+$ ]] && echo "${dbms} ms" || echo "${dbms:-unknown}" )"
         else
             dbms=""
@@ -4487,7 +4750,8 @@ perf_diagnose() {
             echo "    -> Response times look healthy."
         fi
         if [[ "${dbms:-}" =~ ^[0-9]+$ ]] && [ "$dbms" -gt 1000 ]; then
-            echo "    -> The database connection is slow (${dbms} ms): MariaDB tuning (option 3, skip-name-resolve) usually fixes this."
+            if [ "${DB_ENGINE:-mariadb}" = "postgres" ]; then echo "    -> The database connection is slow (${dbms} ms): check the PostgreSQL container (docker logs $PG_CONTAINER) and the server load."
+            else echo "    -> The database connection is slow (${dbms} ms): MariaDB tuning (option 3, skip-name-resolve) usually fixes this."; fi
         fi
     done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
     [ "$found" -eq 1 ] || info "No projects yet."
@@ -4568,7 +4832,7 @@ project_overview() {
     printf '  %-22s %s (%s)\n' "Container" "$CONTAINER_NAME" "$(container_running "$CONTAINER_NAME" && echo running || echo stopped)"
     printf '  %-22s %s\n' "Memory limit" "${MEM_LIMIT:-512m}"
     printf '  %-22s %s\n' "Upload size limit" "$(kv_get "$env" UPLOAD_MAX | sed 's/^$/50M (default)/')"
-    printf '  %-22s %s\n' "Database" "$([ "${USE_DATABASE:-yes}" = yes ] && echo "${db:-configured}" || echo none)"
+    printf '  %-22s %s\n' "Database" "$([ "${USE_DATABASE:-yes}" = yes ] && echo "${db:-configured} ($(db_engine_label "${DB_ENGINE:-mariadb}"))" || echo none)"
     printf '  %-22s %s\n' "Shared Redis" "$redis"
     printf '  %-22s %s\n' "Mail domain" "$(kv_get "$env" MAIL_DOMAIN | head -n1 | grep . || echo 'not enabled (menu: Email for this project)')"
     if ! is_next; then
@@ -5152,7 +5416,7 @@ sec_users_with_keys() {
 sec_file_issues() {
     SEC_BAD_FILES=()
     local f m p
-    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR" "$MAIL_DIR/config/postfix-accounts.cf" "$NOTIFY_DIR" "$NOTIFY_CONF"; do
+    for f in "$BK_DIR" "$BK_PASS" "$BK_SSH_KEY" "$BK_CONF" "$BK_RCLONE_ENV" "$CONFIG_FILE" "$DB_DIR/.env" "$PG_DIR/.env" "$REDIS_DIR/.env" "$BACKUP_DIR" "$BK_LOCAL_DIR" "$SEC_DIR" "$MAIL_DIR/config/postfix-accounts.cf" "$NOTIFY_DIR" "$NOTIFY_CONF"; do
         [ -e "$f" ] || continue
         m="$(stat -c %a "$f" 2>/dev/null)" || continue
         if (( (8#$m & 077) != 0 )); then SEC_BAD_FILES+=("$f|$m|priv"); fi
@@ -7576,6 +7840,7 @@ nf_check_containers() {
     list=("$NGINX_CONTAINER" "$DB_CONTAINER")
     [ -f "$REDIS_DIR/docker-compose.yml" ] && list+=("$REDIS_CONTAINER")
     mail_installed && list+=("$MAIL_CONTAINER")
+    [ -f "$PG_DIR/docker-compose.yml" ] && list+=("$PG_CONTAINER")
     for c in "${list[@]}"; do
         docker inspect "$c" >/dev/null 2>&1 || continue
         container_running "$c" || NF_BAD[$c]="$c (stopped)"
@@ -8129,6 +8394,396 @@ menu_notify_tg() {
 }
 
 # ============================================================================
+# POSTGRESQL (shared database server, optional next to MariaDB)
+# ============================================================================
+
+pg_installed() { [ -f "$PG_DIR/docker-compose.yml" ] || docker inspect "$PG_CONTAINER" >/dev/null 2>&1; }
+
+pg_status_row() {
+    pg_installed || return 0          # optional service: no noise while it does not exist
+    container_row "PostgreSQL" "$PG_CONTAINER"
+}
+
+step_postgres_install() {
+    section "Install shared PostgreSQL container"
+    explain \
+        "One PostgreSQL container stores the databases of every project that chooses PostgreSQL (saves RAM and disk)." \
+        "It runs next to MariaDB: each project picks one of the two. It is NOT exposed to the internet;" \
+        "only containers on '$NETWORK' can reach it."
+    docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
+    if container_running "$PG_CONTAINER"; then ok "PostgreSQL container is already running."; return 0; fi
+
+    local pass suggested i status
+    suggested="$(gen_password)"
+    explain "Allowed superuser password characters: letters, digits and . _ @ % + = : , -   (min 12 characters)"
+    while true; do
+        ask "PostgreSQL superuser password (Enter = use generated one)" "$suggested" pass
+        [[ "$pass" =~ ^[A-Za-z0-9._@%+=:,-]{12,}$ ]] && break
+        err "Password not allowed. Use at least 12 characters from the allowed set."
+    done
+
+    mkdir -p "$PG_DIR"
+    printf 'POSTGRES_PASSWORD=%s\n' "$pass" > "$PG_DIR/.env"
+    chmod 600 "$PG_DIR/.env"
+
+    cat > "$PG_DIR/docker-compose.yml" <<EOF
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: ${PG_CONTAINER}
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --data-checksums"
+    command:
+      - postgres
+      - -c
+      - max_connections=60
+      - -c
+      - shared_buffers=128MB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ${NETWORK}
+
+networks:
+  ${NETWORK}:
+    external: true
+
+volumes:
+  postgres_data:
+EOF
+    info "Starting PostgreSQL (the first start downloads the image, about 1 minute)..."
+    docker compose -f "$PG_DIR/docker-compose.yml" up -d || { err "PostgreSQL failed to start."; return 1; }
+    info "Waiting for PostgreSQL to become healthy..."
+    for i in $(seq 1 40); do
+        status="$(docker inspect -f '{{.State.Health.Status}}' "$PG_CONTAINER" 2>/dev/null)"
+        [ "$status" = "healthy" ] && break
+        sleep 3
+    done
+    if [ "${status:-}" = "healthy" ]; then
+        ok "PostgreSQL is healthy."
+        warn "Superuser password: $pass"
+        explain "Saved (root-only) in: $PG_DIR/.env  — you normally never need it; this script uses the local socket of the container."
+        next_steps \
+            "Choose PostgreSQL when you deploy a project (main menu 4)." \
+            "Or add it to an existing project: Manage Projects -> your project -> Add a database."
+    else
+        err "PostgreSQL is not healthy yet. Check: docker logs $PG_CONTAINER"
+        return 1
+    fi
+}
+
+# ============================================================================
+# BROTLI (nginx image with the Brotli modules: smaller pages for modern browsers)
+# ============================================================================
+# The official nginx image has no Brotli. HiDeploy builds a small image of its own: the official nginx image plus the
+# two ngx_brotli modules compiled from source against the SAME nginx version (google/ngx_brotli with the Brotli library
+# it pins, normally the newest one). gzip stays active for browsers without Brotli. Everything is reversible.
+
+brotli_on()   { [ "$(cfg_get NGINX_BROTLI || true)" = "yes" ]; }
+brotli_level(){ local v; v="$(cfg_get BROTLI_LEVEL || true)"; printf '%s' "${v:-4}"; }
+
+# The image the nginx container should run (used when nginx is (re)installed)
+nginx_image_current() {
+    local img=""
+    if brotli_on; then img="$(cfg_get NGINX_BROTLI_IMAGE || true)"; fi
+    printf '%s' "${img:-$NGINX_IMAGE}"
+}
+
+brotli_status_row() {
+    if brotli_on; then status_row "Brotli" good "ON" "level $(brotli_level) - $(cfg_get NGINX_BROTLI_INFO || true)"
+    elif container_running "$NGINX_CONTAINER"; then status_row "Brotli" dim "OFF" "optional: Shared Services -> Brotli (smaller pages)"
+    fi
+}
+
+# brotli_write_conf [FILE] — the http-level settings
+brotli_write_conf() {
+    local f="${1:-$BROTLI_CONF}"
+    cat > "$f" <<EOF
+# Managed by HiDeploy (Shared Services -> Brotli). Change it through the menu, not by hand.
+# Used for browsers that announce Brotli support (all modern ones, over HTTPS); gzip stays the fallback.
+brotli on;
+brotli_comp_level $(brotli_level);
+brotli_min_length 1024;
+brotli_types text/plain text/css text/xml text/javascript application/javascript application/json application/xml application/rss+xml application/atom+xml application/manifest+json application/wasm image/svg+xml image/x-icon font/ttf font/otf application/vnd.ms-fontobject;
+EOF
+}
+
+# What the Next.js vhosts need: without this the app compresses with gzip itself and nginx never gets to use Brotli
+brotli_ae_line() {
+    if brotli_on; then printf 'proxy_set_header Accept-Encoding "";'; else printf '# (Brotli is off)'; fi
+}
+
+brotli_write_dockerfile() {
+    mkdir -p "$NGINX_BROTLI_DIR"
+    cat > "$NGINX_BROTLI_DIR/Dockerfile" <<'EOF'
+# Generated by HiDeploy: the official nginx image plus the Brotli modules, compiled from source
+# against the same nginx version as the base image.
+ARG NGINX_IMAGE=nginx:stable-alpine
+FROM ${NGINX_IMAGE} AS build
+ARG NGX_BROTLI_REF=master
+RUN apk add --no-cache build-base git cmake curl pcre2-dev zlib-dev openssl-dev linux-headers
+WORKDIR /build
+RUN set -eux; \
+    NGX_VER="$(nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9.]*\).*|\1|p')"; \
+    test -n "$NGX_VER"; \
+    echo "$NGX_VER" > nginx.version; \
+    curl -fsSL "https://nginx.org/download/nginx-${NGX_VER}.tar.gz" -o nginx.tar.gz; \
+    tar xzf nginx.tar.gz; \
+    git clone --recurse-submodules --depth 1 --branch "${NGX_BROTLI_REF}" https://github.com/google/ngx_brotli.git; \
+    git -C ngx_brotli rev-parse --short HEAD > ngx_brotli.commit; \
+    { git -C ngx_brotli/deps/brotli describe --tags --always 2>/dev/null || git -C ngx_brotli/deps/brotli rev-parse --short HEAD; } > brotli.version
+# the Brotli encoder library, built as a static library with position-independent code
+RUN set -eux; \
+    cd /build/ngx_brotli/deps/brotli; mkdir -p out; cd out; \
+    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_FLAGS="-O3 -fPIC" -DCMAKE_INSTALL_PREFIX=./installed ..; \
+    cmake --build . --config Release -j2 --target brotlienc
+# the two nginx modules
+RUN set -eux; \
+    cd "/build/nginx-$(cat /build/nginx.version)"; \
+    ./configure --with-compat --add-dynamic-module=/build/ngx_brotli; \
+    make -j2 modules
+
+FROM ${NGINX_IMAGE}
+LABEL org.hideploy.brotli="1"
+COPY --from=build /build/nginx-*/objs/ngx_http_brotli_filter_module.so /build/nginx-*/objs/ngx_http_brotli_static_module.so /usr/lib/nginx/modules/
+COPY --from=build /build/nginx.version /build/ngx_brotli.commit /build/brotli.version /etc/nginx/hideploy-brotli/
+RUN set -eux; \
+    { printf '%s\n' 'load_module modules/ngx_http_brotli_filter_module.so;' 'load_module modules/ngx_http_brotli_static_module.so;'; cat /etc/nginx/nginx.conf; } > /tmp/nginx.conf; \
+    mv /tmp/nginx.conf /etc/nginx/nginx.conf; \
+    nginx -t
+EOF
+}
+
+# brotli_build — builds the image; on success sets BROTLI_IMG (tag) and BROTLI_INFO (versions)
+brotli_build() {
+    local ref log pid rc ver ngx brv
+    ref="$(cfg_get NGX_BROTLI_REF || true)"; ref="${ref:-$NGX_BROTLI_REF}"
+    [[ "$ref" =~ ^[A-Za-z0-9._/-]{1,60}$ ]] || { err "Invalid NGX_BROTLI_REF in the settings."; return 1; }
+    brotli_write_dockerfile
+    log="$(mktemp)"
+    info "Building nginx with Brotli (ngx_brotli '$ref'). This takes about 2-5 minutes; the sites keep running meanwhile."
+    docker build --pull --build-arg "NGINX_IMAGE=$NGINX_IMAGE" --build-arg "NGX_BROTLI_REF=$ref" \
+        -t "$NGINX_BROTLI_TAG:build" "$NGINX_BROTLI_DIR" > "$log" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do printf '.'; sleep 5; done; echo ""
+    wait "$pid"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        err "The build failed. Last lines of the build log:"; tail -n 15 "$log" | sed 's/^/    /'
+        explain "Saved in: $log   (a common cause: no internet access to github.com / nginx.org from this server)"
+        return 1
+    fi
+    rm -f "$log"
+    ver="$(docker run --rm --entrypoint cat "$NGINX_BROTLI_TAG:build" /etc/nginx/hideploy-brotli/nginx.version 2>/dev/null)"
+    ngx="$(docker run --rm --entrypoint cat "$NGINX_BROTLI_TAG:build" /etc/nginx/hideploy-brotli/ngx_brotli.commit 2>/dev/null)"
+    brv="$(docker run --rm --entrypoint cat "$NGINX_BROTLI_TAG:build" /etc/nginx/hideploy-brotli/brotli.version 2>/dev/null)"
+    [[ "$ver" =~ ^[0-9][0-9.]*$ ]] || { err "The image was built but its version could not be read."; return 1; }
+    BROTLI_IMG="$NGINX_BROTLI_TAG:$ver"
+    docker tag "$NGINX_BROTLI_TAG:build" "$BROTLI_IMG" && docker rmi "$NGINX_BROTLI_TAG:build" >/dev/null 2>&1
+    BROTLI_INFO="nginx $ver, ngx_brotli ${ngx:-?}, Brotli library ${brv:-?}"
+    ok "Built $BROTLI_IMG ($BROTLI_INFO)"
+}
+
+# brotli_test_image IMAGE — checks the complete current configuration plus the Brotli settings with that image,
+# in a throw-away container, BEFORE the real nginx is touched
+brotli_test_image() {
+    local img="$1" tmp out rc
+    tmp="$(mktemp -d)"; cp -a "$NGINX_DIR/conf.d/." "$tmp/" 2>/dev/null
+    brotli_write_conf "$tmp/01-brotli.conf"
+    out="$(docker run --rm --network "$NETWORK" \
+            -v "$tmp:/etc/nginx/conf.d:ro" -v "$NGINX_DIR/letsencrypt:/etc/letsencrypt:ro" \
+            -v "$NGINX_DIR/certbot-www:/var/www/certbot:ro" -v "$PROJECTS_DIR:$PROJECTS_DIR:ro" \
+            "$img" nginx -t 2>&1)"; rc=$?
+    rm -rf "$tmp"
+    if [ "$rc" -ne 0 ]; then printf '%s\n' "$out" | tail -n 8 | sed 's/^/    /'; return 1; fi
+    return 0
+}
+
+# nginx_switch_image IMAGE — recreate the nginx container with another image (a second or two of downtime);
+# the previous compose file is restored when the new container does not come up healthy
+nginx_switch_image() {
+    local new="$1" f="$NGINX_DIR/docker-compose.yml" bak
+    [ -f "$f" ] || { err "nginx was not installed by HiDeploy (compose file not found)."; return 1; }
+    bak="$f.bak-$(date +%F_%H%M%S)"; cp "$f" "$bak"
+    sed -i "s|^    image: .*|    image: $new|" "$f"
+    docker compose -f "$f" up -d >/dev/null 2>&1
+    sleep 3
+    if container_running "$NGINX_CONTAINER" && docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1; then
+        rm -f "$bak"; return 0
+    fi
+    err "The new nginx container did not come up correctly: restoring the previous one."
+    cp "$bak" "$f"; docker compose -f "$f" up -d >/dev/null 2>&1; rm -f "$bak"
+    return 1
+}
+
+# brotli_activate IMAGE INFO MODE — switch to the image, turn the settings on, refresh the vhosts; undo everything on failure
+brotli_activate() {
+    local img="$1" info_txt="$2" mode="$3" prev
+    prev="$(sed -n 's/^    image: //p' "$NGINX_DIR/docker-compose.yml" | head -n1)"
+    nginx_switch_image "$img" || return 1
+    brotli_write_conf
+    if ! nginx_test_reload; then
+        err "nginx rejected the Brotli settings: going back to the previous image."
+        rm -f "$BROTLI_CONF"; nginx_switch_image "${prev:-$NGINX_IMAGE}" >/dev/null 2>&1
+        return 1
+    fi
+    cfg_set NGINX_BROTLI yes; cfg_set NGINX_BROTLI_IMAGE "$img"; cfg_set NGINX_BROTLI_MODE "$mode"; cfg_set NGINX_BROTLI_INFO "$info_txt"
+    info "Updating every project's nginx configuration (Next.js sites must let nginx do the compression)..."
+    nginx_refresh_all >/dev/null 2>&1
+    nginx_test_reload >/dev/null 2>&1 || true
+    return 0
+}
+
+brotli_enable() {
+    section "Brotli compression for all sites"
+    explain \
+        "Brotli compresses text (HTML, CSS, JavaScript, JSON, SVG, fonts) better than gzip: files are usually 10-25% smaller," \
+        "which shortens the load time most on phones and slow connections. It costs a little CPU on this server." \
+        "All modern browsers use it over HTTPS; older ones automatically keep getting gzip. You can switch it off again any time."
+    docker_ready && container_running "$NGINX_CONTAINER" || { err "The nginx container is not running (main menu 2)."; return 1; }
+    [ -f "$NGINX_DIR/docker-compose.yml" ] || { err "nginx was not installed by HiDeploy (compose file not found)."; return 1; }
+    if brotli_on; then ok "Brotli is already ON ($(cfg_get NGINX_BROTLI_INFO || true))."; return 0; fi
+
+    local choice lvl img custom
+    echo ""
+    echo " 1) Build it for me (recommended): official nginx + the newest ngx_brotli, compiled on this server (2-5 minutes)"
+    echo " 2) Use an nginx image that I already have (for example my own nginx-brotli:latest)"
+    echo " 0) Cancel"
+    read -r -p "Select [1]: " choice; choice="${choice:-1}"
+    case "$choice" in 1|2) ;; *) info "Cancelled."; return 0 ;; esac
+    while true; do
+        ask "Compression level 1-11 (higher = smaller files but more CPU; 4-6 is the sweet spot)" "$(brotli_level)" lvl
+        [[ "$lvl" =~ ^([1-9]|10|11)$ ]] && break; err "Enter a number from 1 to 11."
+    done
+    cfg_set BROTLI_LEVEL "$lvl"
+
+    if [ "$choice" = "1" ]; then
+        explain "Source code is downloaded from github.com (google/ngx_brotli) and nginx.org and compiled in a temporary build stage."
+        confirm "Start the build now?" y || { info "Cancelled."; return 0; }
+        brotli_build || return 1
+        img="$BROTLI_IMG"; custom="build"
+    else
+        ask "Image name (e.g. nginx-brotli:latest)" "" img
+        [[ "$img" =~ ^[A-Za-z0-9._/:@-]{1,120}$ ]] || { err "Invalid image name."; return 1; }
+        docker image inspect "$img" >/dev/null 2>&1 || { err "That image does not exist on this server (docker images)."; return 1; }
+        BROTLI_INFO="your own image $img"; custom="custom"
+    fi
+    info "Testing the complete nginx configuration with the new image (nothing is changed yet)..."
+    if ! brotli_test_image "$img"; then
+        err "The new image does not accept the configuration, so nothing was changed."
+        [ "$custom" = "custom" ] && explain "A custom image must load the Brotli modules itself (a 'load_module' line in its nginx.conf, or Brotli compiled in)."
+        return 1
+    fi
+    ok "The new image accepts the configuration."
+    warn "Now nginx is recreated with the new image: sites are unreachable for about 1-3 seconds."
+    confirm "Switch now?" y || { info "Cancelled. Nothing was changed."; return 0; }
+    brotli_activate "$img" "$BROTLI_INFO" "$custom" || { err "Brotli was not enabled; everything is as before."; return 1; }
+    ok "Brotli is ON."
+    next_steps \
+        "Check a site: Shared Services -> Brotli -> Test it on a site (shows the real sizes: plain, gzip, Brotli)." \
+        "Browsers use Brotli only over HTTPS, so test with the https:// address."
+}
+
+brotli_rebuild() {
+    section "Rebuild Brotli with the newest versions"
+    brotli_on || { err "Brotli is not enabled."; return 1; }
+    [ "$(cfg_get NGINX_BROTLI_MODE || true)" = "build" ] || { err "Brotli runs with your own image: update that image yourself."; return 1; }
+    explain "Pulls the newest official nginx image and the newest ngx_brotli, builds a fresh image, tests it and switches (1-3 seconds without service)."
+    confirm "Rebuild now?" y || return 0
+    local old; old="$(cfg_get NGINX_BROTLI_IMAGE || true)"
+    brotli_build || return 1
+    info "Testing the complete nginx configuration with the new image (nothing is changed yet)..."
+    brotli_test_image "$BROTLI_IMG" || { err "The new image does not accept the configuration; nothing was changed."; return 1; }
+    nginx_switch_image "$BROTLI_IMG" || { err "Could not switch; the previous nginx keeps running."; return 1; }
+    nginx_test_reload >/dev/null 2>&1 || true
+    cfg_set NGINX_BROTLI_IMAGE "$BROTLI_IMG"; cfg_set NGINX_BROTLI_INFO "$BROTLI_INFO"
+    [ -n "$old" ] && [ "$old" != "$BROTLI_IMG" ] && docker rmi "$old" >/dev/null 2>&1
+    ok "nginx now runs: $BROTLI_INFO"
+}
+
+brotli_set_level() {
+    brotli_on || { err "Brotli is not enabled."; return 1; }
+    local lvl old; old="$(brotli_level)"
+    while true; do
+        ask "Compression level 1-11 (4-6 recommended; current $old)" "$old" lvl
+        [[ "$lvl" =~ ^([1-9]|10|11)$ ]] && break; err "Enter a number from 1 to 11."
+    done
+    cfg_set BROTLI_LEVEL "$lvl"; brotli_write_conf
+    if nginx_test_reload; then ok "Level set to $lvl."; else
+        err "nginx rejected it: back to level $old."; cfg_set BROTLI_LEVEL "$old"; brotli_write_conf; nginx_test_reload >/dev/null 2>&1
+    fi
+}
+
+brotli_disable() {
+    section "Turn Brotli off"
+    brotli_on || { info "Brotli is not enabled."; return 0; }
+    confirm "Turn Brotli off? (sites go back to gzip only)" n || return 0
+    rm -f "$BROTLI_CONF"
+    cfg_set NGINX_BROTLI no
+    nginx_test_reload >/dev/null 2>&1 || true
+    nginx_refresh_all >/dev/null 2>&1
+    ok "Brotli settings removed; sites use gzip."
+    if confirm "Also go back to the standard nginx image (recommended)?" y; then
+        nginx_switch_image "$NGINX_IMAGE" && ok "nginx runs the standard image again." || warn "Could not switch the image; Brotli stays loaded but unused."
+    fi
+}
+
+# Shows the real transfer sizes of a site: what a browser downloads with and without compression
+brotli_test_site() {
+    section "Test compression on a site"
+    local d p n=0 hdrs enc plain gz br
+    local -a doms=()
+    while IFS= read -r p; do doms+=("$(basename "$p")"); done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    ask "Domain to test" "${doms[0]:-}" d
+    valid_domain "$d" || { err "Invalid domain."; return 1; }
+    hdrs="$(curl -s -o /dev/null -D - --max-time 25 -H 'Accept-Encoding: br, gzip' "https://$d/" 2>/dev/null)"
+    [ -n "$hdrs" ] || { err "No answer from https://$d/ (DNS, SSL or the site itself)."; return 1; }
+    enc="$(grep -i '^content-encoding:' <<<"$hdrs" | tr -d '\r' | awk '{print tolower($2)}' | head -n1)"
+    plain="$(curl -s --max-time 25 -H 'Accept-Encoding: identity' "https://$d/" 2>/dev/null | wc -c)"
+    gz="$(curl -s --max-time 25 -H 'Accept-Encoding: gzip' "https://$d/" 2>/dev/null | wc -c)"
+    br="$(curl -s --max-time 25 -H 'Accept-Encoding: br' "https://$d/" 2>/dev/null | wc -c)"
+    printf '  Page https://%s/\n' "$d"
+    printf '    without compression: %8s bytes\n    gzip:                %8s bytes\n    Brotli:              %8s bytes\n' "$plain" "$gz" "$br"
+    printf '  A browser that supports Brotli receives: %s\n' "${enc:-no compression}"
+    if [ "$enc" = "br" ]; then ok "Brotli is working for this site."
+    elif brotli_on; then
+        warn "Brotli is ON but this page did not use it."
+        explain "Pages under 1 KB are not compressed, and some responses are skipped (redirects, errors, images). Try a bigger page, or check: docker logs $NGINX_CONTAINER"
+    else info "Brotli is OFF: enable it in this menu."; fi
+}
+
+menu_brotli() {
+    local c
+    while true; do
+        clear; banner "Brotli compression" "$C_BLUE"
+        brotli_status_row; echo ""
+        echo " 1) Enable Brotli (build the nginx image, test it, switch)"
+        echo " 2) Rebuild with the newest nginx and Brotli versions"
+        echo " 3) Change the compression level"
+        echo " 4) Test it on a site (real sizes: plain, gzip, Brotli)"
+        echo " 5) Turn Brotli off"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item brotli_enable ;;
+            2) run_item brotli_rebuild ;;
+            3) run_item brotli_set_level ;;
+            4) run_item brotli_test_site ;;
+            5) run_item brotli_disable ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -8168,11 +8823,13 @@ menu_services() {
         clear; banner "2) Shared Services (run once per server)" "$C_BLUE"
         show_status; echo ""
         echo " 1) Install nginx container (receives all web traffic)"
-        echo " 2) Install MariaDB container (stores all databases)"
+        echo " 2) Install MariaDB container (stores the databases of projects that use MariaDB)"
         echo " 3) Enable SSL auto-renew"
         echo " 4) Show status"
         echo " 5) phpMyAdmin (optional: web UI for your databases, on its own domain)"
         echo " 6) Redis (optional: fast cache, sessions and queues for all projects)"
+        echo " 7) PostgreSQL (optional second database server; each project chooses MariaDB or PostgreSQL)"
+        echo " 8) Brotli compression (optional: smaller pages, faster loading; nginx image built for you)"
         echo " A) Run ALL of the above in order"
         echo " 0) Back"
         read -r -p "Select: " c; echo ""
@@ -8181,6 +8838,8 @@ menu_services() {
             3) run_item step_renew_enable ;;    4) run_item services_status ;;
             5) menu_phpmyadmin ;;
             6) menu_redis ;;
+            7) run_item step_postgres_install ;;
+            8) menu_brotli ;;
             [Aa]) run_item run_all_services ;;
             0) return ;;
             *) err "Invalid option."; sleep 1 ;;
