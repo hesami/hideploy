@@ -57,6 +57,7 @@ sudo hideploy            # interactive menu
 hideploy --version       # show the installed version
 hideploy --help          # show help
 sudo hideploy update     # install the latest version (your projects are not touched)
+# versions of nginx / databases / Redis / mail: main menu 11 (Updates and versions)
 sudo hideploy backup-run # run one backup now (the nightly job calls this)
 sudo hideploy cleanup-run # run the safe disk cleanup now (the weekly job calls this)
 sudo hideploy security-check # print the security report (exit code 1 when it finds a problem)
@@ -153,6 +154,7 @@ The server uses **one SSH key** for all projects. Add it as a read-only *Deploy 
 | **Automatic security updates** (security patches only; automatic reboot is off by default) | Security → Automatic security updates |
 | **Own mail server, no outside SMTP/API service:** one shared server for all your domains; `info@example.com`, `noreply@example.com`, aliases; DKIM key, SPF/DMARC records generated and checked; a project can send through its own mailbox with one menu step | Email (main menu 9) / Project menu → Email |
 | **MariaDB or PostgreSQL per project** (Laravel and Next.js): own database and user for every project, isolated from each other, restore/backup for both | Shared Services / project wizard |
+| **Updates and versions (main menu 11):** every version is suggested (PHP and Node from your `composer.json` / `package.json`) and chosen by you, the tag is checked on the registry first; one-click updates of nginx, MariaDB, PostgreSQL, Redis, phpMyAdmin and the mail server with a safety backup and **automatic roll-back**; guided major upgrades (dump, new data volume, restore, table-count check; the old volume is kept) | Updates and versions |
 | **Brotli compression** with an nginx image built for you (or your own), tested before switching, automatic rollback | Shared Services -> Brotli |
 | **Notifications by email and Telegram:** deployment succeeded / failed (from the menu **and** from GitLab pipelines), rollback, backup result, SSL renewal failed, certificate about to expire, a project or shared service stopped, disk almost full, reboot needed; each event can be switched on or off, projects can be muted | Notifications (main menu 10) |
 | **Webmail (Roundcube)** on its own domain: read and send mail in the browser; HTTPS, optional Basic Auth and IP list; start/stop on demand like phpMyAdmin | Email → Webmail |
@@ -350,7 +352,7 @@ Both can run side by side. The choice is fixed per project (data is not moved be
 - Every project gets its own database, its own user and password; **other projects' users cannot even connect** to it.
 - Restoring a MySQL dump into a PostgreSQL project (or the other way round) is refused with a clear message. A PostgreSQL import is all-or-nothing (one transaction), and ownership is handed to the project's user afterwards.
 - **Laravel** needs the `pdo_pgsql` PHP extension. New Dockerfiles include it. For an older project, regenerate the files (main menu 3), copy the new Dockerfile into the repository and push; HiDeploy warns you when it is missing.
-- The PostgreSQL image is `postgres:17-bookworm` (constant `POSTGRES_IMAGE`). A major upgrade (17 to 18) needs a dump and restore and is not automatic. There is no web admin for PostgreSQL yet (phpMyAdmin stays MariaDB-only).
+- New installs suggest PostgreSQL 18 (`postgres:18-bookworm`); you can pick another version. Servers installed by an older HiDeploy keep their image. A **major upgrade** (for example 17 to 18) is the guided procedure in main menu 11 -> *Upgrade to a NEWER version line*. Note: PostgreSQL 18 images keep data in a per-version folder, so the volume is mounted at `/var/lib/postgresql` (the old `/var/lib/postgresql/data` mount makes 18 fail). HiDeploy handles this for you. There is no web admin for PostgreSQL yet (phpMyAdmin stays MariaDB-only).
 
 ---
 
@@ -432,10 +434,37 @@ Each backup contains, per run: one file per project database, the project files 
 
 ---
 
+## Updates and versions (main menu 11)
+
+**Choosing versions.** Whenever HiDeploy installs something it shows a short list with a suggestion and the reason, and asks you.
+
+| Component | Suggested for new installs | Notes |
+|---|---|---|
+| PHP (Laravel projects) | newest that your `composer.json` allows | Laravel 10 is capped at 8.3 and Laravel 11 at 8.4 (their tested range). From PHP 8.5 OPcache is built in, so the Dockerfile only installs it for older versions. |
+| Node.js (frontend builds, Next.js) | newest LTS that `engines.node` allows | 26, 24, 22 are offered. |
+| MariaDB | 12.3 (LTS) | 11.8 and 10.11 are offered. Rolling lines are not suggested for servers. |
+| PostgreSQL | 18 | 17 and 16 are offered; the Debian base (`bookworm`) is pinned. |
+| Redis | 8 | 7 is offered. |
+| nginx | `stable-alpine` | `mainline-alpine` is offered. |
+
+You can also type any other version. The tag is checked on the registry (`docker manifest inspect`) before it is used. The suggestions and support dates were checked on 2026-11-08 (constant `CATALOG_CHECKED`); the version list is only a suggestion, never a limit.
+
+**The installed compose file is the source of truth.** An existing server keeps exactly the images it runs, and every later rewrite (performance tuning, Brotli) keeps them too. Nothing is upgraded behind your back.
+
+**Updates inside a version line** (for example MariaDB 12.3.2 to 12.3.3): download, safety backup (database dump / mail configuration), recreate, health check, **automatic roll-back** to the previous image when the new one is not healthy. *Check for updates* only downloads; *Update ALL* does them one by one.
+
+**Upgrading to a newer version line** (MariaDB, PostgreSQL, Redis) changes the data format, so it is a separate guided procedure: verified dump, **new data volume**, restore, table-count comparison, and automatic return to the old version on any problem. The old volume stays until you delete it (*Remove old data from a major upgrade*). Sites that use the database are offline while it runs. MariaDB: databases and users of HiDeploy projects are re-created from the projects' `.env`; databases that no project uses keep their data but not their users.
+
+**Projects.** *Projects* shows the PHP / Node version of every project with its support date, and changes it (rebuild + deploy, with automatic return to the old version if the deployment fails). This works for Dockerfiles generated by this version (they have `ARG PHP_VERSION` / `ARG NODE_VERSION`); older generated files have the version written inside, so regenerate them (main menu 3), commit, and from then on the version is a server-side setting.
+
+The main screen shows a reminder when updates were not checked for 90 days.
+
+---
+
 ## Updating and removing
 
 ```bash
-sudo hideploy update          # update HiDeploy itself
+sudo hideploy update          # update HiDeploy itself (or: main menu 11 -> Update HiDeploy itself)
 ```
 
 Updating replaces only the `hideploy` command. Containers, databases, certificates and projects are untouched.
@@ -457,6 +486,7 @@ To remove the command: `sudo rm /usr/local/bin/hideploy`. Running sites keep wor
 - [x] Notifications by email (own mail server) and Telegram
 - [x] PostgreSQL next to MariaDB, chosen per project
 - [x] Brotli compression
+- [x] Choose versions at install time, update center with roll-back, guided major upgrades
 - [x] Rollback to a previous deployment, maintenance mode during deployments
 - [x] Disk usage warning and cleanup helper
 - [x] Security hardening (firewall with lockout guard, fail2ban, automatic security updates, SSH keys-only, security check)

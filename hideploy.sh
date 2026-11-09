@@ -12,6 +12,8 @@
 #   9) Email (own mail server for all your domains: mailboxes, DKIM/SPF/DMARC help, optional webmail)
 #  10) Notifications (email + Telegram alerts: deployments, backups, stopped services, disk, certificates)
 #  Databases: MariaDB or PostgreSQL per project (Laravel and Next.js).  nginx: optional Brotli compression (Shared Services).
+#  11) Updates and versions (every version is suggested and chosen by you; update center with backup + automatic roll-back;
+#      guided major upgrades for MariaDB / PostgreSQL / Redis; PHP and Node version per project)
 #
 # Architecture (kept deliberately simple):
 #
@@ -28,7 +30,7 @@
 
 set -uo pipefail
 
-HIDEPLOY_VERSION="1.8.0"
+HIDEPLOY_VERSION="1.9.0"
 HIDEPLOY_REPO="hesami/hideploy"
 
 # ----------------------------------------------------------------------------
@@ -52,10 +54,11 @@ PMA_HTPASSWD="$NGINX_DIR/conf.d/pma.htpasswd"
 RUNNER_USER="gitlab-runner"
 
 NGINX_IMAGE="nginx:stable-alpine"
-MARIADB_IMAGE="mariadb:10.11"
+MARIADB_IMAGE="mariadb:12.3"           # default for NEW installs only (the installer asks); installed servers keep the image of their compose file
 PMA_IMAGE="phpmyadmin:5-apache"
 CERTBOT_IMAGE="certbot/certbot"
-DEFAULT_NODE_IMAGE="node:22-alpine"   # used only for temporary frontend-build containers
+DEFAULT_NODE_VERSION="26"                # suggestion for Node.js (frontend builds, Next.js); every project can choose its own
+DEFAULT_NODE_IMAGE="node:${DEFAULT_NODE_VERSION}-alpine"   # used for temporary frontend-build containers
 
 RENEW_SCRIPT="/usr/local/bin/hideploy-renew-ssl"
 RENEW_CRON="/etc/cron.d/hideploy-ssl-renew"
@@ -84,7 +87,7 @@ PERF_NGINX_CONF="$NGINX_DIR/conf.d/10-hideploy-performance.conf"
 # Redis (optional shared service)
 REDIS_CONTAINER="global-redis"
 REDIS_DIR="$INFRA_DIR/redis"
-REDIS_IMAGE="redis:7-alpine"
+REDIS_IMAGE="redis:8-alpine"
 
 # Email (optional shared service: own mail server + optional webmail, main menu 9)
 MAIL_CONTAINER="global-mailserver"
@@ -110,7 +113,7 @@ TG_API_BASE="https://api.telegram.org"
 # PostgreSQL (optional second database server, chosen per project)
 PG_DIR="$INFRA_DIR/postgres"
 PG_CONTAINER="global-postgres"
-POSTGRES_IMAGE="postgres:17-bookworm"      # major upgrades (17 -> 18) need a dump and restore: not automatic
+POSTGRES_IMAGE="postgres:18-bookworm"      # default for NEW installs; a major upgrade (17 -> 18) is a guided dump and restore: main menu 11
 
 # Brotli (optional: nginx image with the Brotli modules, built from source on this server)
 NGINX_BROTLI_DIR="$NGINX_DIR/brotli-build"
@@ -603,6 +606,7 @@ show_status() {
     bk_status_row
     sec_status_rows
     disk_row
+    upd_status_row
     printf '  %-20s %s\n' "Deployed projects" "$(project_count)"
     printf '\n%sRecommended next step:%s %s\n' "$C_YELLOW" "$C_RESET" "$(suggest_next)"
 }
@@ -801,6 +805,12 @@ step_nginx_install() {
         "to the right project container through the '$NETWORK' network."
     docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
     if container_running "$NGINX_CONTAINER"; then ok "nginx container is already running."; return 0; fi
+    if [ -f "$NGINX_DIR/docker-compose.yml" ]; then
+        info "nginx is installed but stopped: starting it with its existing settings."
+        docker compose -f "$NGINX_DIR/docker-compose.yml" up -d >/dev/null 2>&1; sleep 2
+        container_running "$NGINX_CONTAINER" && { ok "nginx is running."; return 0; }
+        err "nginx did not start. See: docker logs $NGINX_CONTAINER"; return 1
+    fi
 
     if ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq ':(80|443)$'; then
         err "Port 80 or 443 is already in use on this server:"
@@ -809,6 +819,7 @@ step_nginx_install() {
         return 1
     fi
 
+    pick_nginx_image || { err "Cancelled."; return 1; }
     mkdir -p "$NGINX_DIR/conf.d" "$NGINX_DIR/certbot-www" "$NGINX_DIR/letsencrypt" "$PROJECTS_DIR"
     chmod 755 "$PROJECTS_DIR"
 
@@ -866,7 +877,14 @@ step_mariadb_install() {
         "It is NOT exposed to the internet; only containers on '$NETWORK' can reach it."
     docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
     if container_running "$DB_CONTAINER"; then ok "MariaDB container is already running."; return 0; fi
+    if [ -f "$DB_DIR/docker-compose.yml" ]; then
+        info "MariaDB is installed but stopped: starting it with its existing settings and data."
+        docker compose -f "$DB_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+        perf_wait_db && { ok "MariaDB is healthy."; return 0; }
+        err "MariaDB did not become healthy. Check: docker logs $DB_CONTAINER"; return 1
+    fi
 
+    pick_mariadb_image || { err "Cancelled."; return 1; }
     local pass suggested
     suggested="$(gen_password)"
     explain "Allowed root password characters: letters, digits and . _ @ % + = : , -   (min 12 characters)"
@@ -888,6 +906,7 @@ services:
     restart: always
     environment:
       MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
@@ -993,7 +1012,10 @@ tpl_dockerfile() {
     cat <<'EOF'
 # Generated by HiDeploy — safe to edit, commit it in your repo.
 # The image only contains PHP + tools. Your code stays on the server disk (bind mount).
-FROM php:8.3-fpm-alpine
+# PHP version: change PHP_VERSION in .deploy.env on the server (main menu 11 -> Projects), or the default on the ARG line below.
+# (From PHP 8.5 on, OPcache is part of PHP itself, so it is only installed for older versions.)
+ARG PHP_VERSION=__PHP_VERSION__
+FROM php:${PHP_VERSION}-fpm-alpine
 
 # Same UID/GID as the server's gitlab-runner user => no permission conflicts, no chmod 777
 ARG APP_UID=1000
@@ -1002,7 +1024,9 @@ ARG APP_GID=1000
 RUN apk add --no-cache git curl zip unzip supervisor \
         libpng-dev libjpeg-turbo-dev freetype-dev libzip-dev oniguruma-dev libxml2-dev icu-dev postgresql-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j"$(nproc)" pdo_mysql pdo_pgsql mbstring exif pcntl bcmath gd zip intl opcache
+    && EXTS="pdo_mysql pdo_pgsql mbstring exif pcntl bcmath gd zip intl" \
+    && if php -r 'exit(PHP_VERSION_ID < 80500 ? 0 : 1);'; then EXTS="$EXTS opcache"; fi \
+    && docker-php-ext-install -j"$(nproc)" $EXTS
 
 RUN set -eu; \
     u="$(getent passwd "${APP_UID}" | cut -d: -f1 || true)"; [ -z "$u" ] || deluser "$u"; \
@@ -1089,6 +1113,7 @@ services:
       args:
         APP_UID: ${APP_UID:?APP_UID missing in .deploy.env}
         APP_GID: ${APP_GID:?APP_GID missing in .deploy.env}
+        PHP_VERSION: ${PHP_VERSION:-__PHP_VERSION__}
     container_name: ${CONTAINER_NAME:?CONTAINER_NAME missing in .deploy.env}
     restart: unless-stopped
     init: true
@@ -1133,7 +1158,7 @@ if [ "${FRONTEND_BUILD:-no}" = "yes" ]; then
   docker run --rm --user "$APP_UID:$APP_GID" \
     -e HOME=/tmp -e CI=true -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
     -e NPM_CONFIG_UPDATE_NOTIFIER=false -e npm_config_store_dir=/tmp/.pnpm-store \
-    -v "$APP_PATH:/app" -w /app "${NODE_IMAGE:-node:22-alpine}" \
+    -v "$APP_PATH:/app" -w /app "${NODE_IMAGE:-node:26-alpine}" \
     sh -c "mkdir -p /tmp/bin && (corepack enable --install-directory /tmp/bin 2>/dev/null || true); export PATH=/tmp/bin:\$PATH; $PM_INSTALL && $PM_BUILD && rm -rf node_modules"
   [ -f public/build/manifest.json ] || echo "WARNING: public/build/manifest.json was not created (check your Vite config)."
 fi
@@ -1241,16 +1266,18 @@ EOF
 # generate_project_files DIR DOMAIN BRANCH TAG OVERWRITE(yes|no)
 generate_project_files() {
     local dir="$1" domain="$2" branch="$3" tag="$4" overwrite="$5" type="${6:-laravel}" pm="${7:-pnpm}" tmp f
+    # Versions: GEN_PHP / GEN_NODE (set by the caller after asking the user), else the project's own, else the suggestion
+    local php="${GEN_PHP:-${PHP_VERSION:-$DEFAULT_PHP_VERSION}}" node="${GEN_NODE:-${NODE_VERSION:-$DEFAULT_NODE_VERSION}}"
     tmp="$(mktemp -d)"
     if [ "$type" = "nextjs" ]; then
-        tpl_next_dockerfile "$pm" > "$tmp/Dockerfile"
-        tpl_next_compose          > "$tmp/docker-compose.prod.yml"
+        tpl_next_dockerfile "$pm" | sed "s|__NODE_VERSION__|$node|g" > "$tmp/Dockerfile"
+        tpl_next_compose          | sed "s|__NODE_VERSION__|$node|g" > "$tmp/docker-compose.prod.yml"
         tpl_next_dockerignore     > "$tmp/.dockerignore"
         tpl_next_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
                           -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" -e "s|__NOTIFY_SPOOL__|$NOTIFY_SPOOL|g" > "$tmp/.gitlab-ci.yml"
     else
-        tpl_dockerfile   > "$tmp/Dockerfile"
-        tpl_compose      > "$tmp/docker-compose.prod.yml"
+        tpl_dockerfile   | sed "s|__PHP_VERSION__|$php|g" > "$tmp/Dockerfile"
+        tpl_compose      | sed "s|__PHP_VERSION__|$php|g" > "$tmp/docker-compose.prod.yml"
         tpl_dockerignore > "$tmp/.dockerignore"
         tpl_ci | sed -e "s|__TAG__|$tag|g" -e "s|__BRANCH__|$branch|g" \
                      -e "s|__DEPLOY_PATH__|$PROJECTS_DIR/$domain|g" -e "s|__NOTIFY_SPOOL__|$NOTIFY_SPOOL|g" > "$tmp/.gitlab-ci.yml"
@@ -1285,6 +1312,10 @@ validate_project_files() {
             err "Dockerfile: no 'pdo_pgsql' (the PHP driver for PostgreSQL). Regenerate the files: main menu 3), then copy the new Dockerfile into your repository."; problems=$((problems+1))
         fi
         grep -q 'ARG APP_UID' "$dir/Dockerfile"                    || { err "Dockerfile: missing 'ARG APP_UID' / 'ARG APP_GID'."; problems=$((problems+1)); }
+        check_php_fit "$dir" || true
+        if grep -qE '^FROM php:8\.[5-9]' "$dir/Dockerfile" && grep -qE 'docker-php-ext-install.*[[:space:]]opcache' "$dir/Dockerfile"; then
+            err "Dockerfile: PHP 8.5 and newer already contain OPcache, so 'docker-php-ext-install ... opcache' fails. Regenerate the files: main menu 3."; problems=$((problems+1))
+        fi
         grep -q 'queue:work' "$dir/Dockerfile"                     || warn "Dockerfile: no queue worker found — queued jobs/emails will NOT be processed."
         grep -q 'schedule:work' "$dir/Dockerfile"                  || warn "Dockerfile: no scheduler found — scheduled tasks will NOT run."
         grep -q '9000\|php-fpm' "$dir/Dockerfile"                  || warn "Dockerfile: php-fpm not detected; nginx expects PHP-FPM on port 9000."
@@ -1305,7 +1336,8 @@ menu_generate_files() {
         "  Dockerfile, docker-compose.prod.yml, .dockerignore, .gitlab-ci.yml" \
         "They are generic: the same files work for every project. Server-specific values are kept in" \
         "'.deploy.env' on the server, so they never change the files in your repository."
-    local domain branch tag outdir ptype="laravel" pm="pnpm" tchoice
+    local domain branch tag outdir ptype="laravel" pm="pnpm" tchoice nreq preq lvq
+    local -a nitems pitems
     echo " Project type:"
     echo "  1) Laravel (PHP)"
     echo "  2) Next.js (Node)"
@@ -1320,9 +1352,27 @@ menu_generate_files() {
     ask "GitLab runner tag" "$(cfg_get RUNNER_TAG || true)" tag
     tag="${tag:-production}"
     cfg_set RUNNER_TAG "$tag"
+    GEN_PHP=""; GEN_NODE=""
+    if [ "$ptype" = "nextjs" ]; then
+        explain "The project is on your computer, so HiDeploy cannot read its package.json. If you know it, type the 'engines.node' value (for example >=20); otherwise just press Enter."
+        ask "Node requirement from package.json (Enter = none)" "" nreq
+        suggest_node_from "$nreq"
+        mapfile -t nitems < <(node_menu_items)
+        choose_tag "Node.js" "$SUG_NODE" "$SUG_REASON" '^[0-9]{2}(\.[0-9]+)*$' "${nitems[@]}" || { info "Cancelled."; pause; return; }
+        GEN_NODE="$CHOSEN_TAG"; verify_image "node:${GEN_NODE}-alpine" || { pause; return; }
+    else
+        explain "The project is on your computer, so HiDeploy cannot read its composer.json. If you know them, type the 'php' requirement (for example ^8.2) and the Laravel version (for example 12); otherwise just press Enter."
+        ask "PHP requirement from composer.json (Enter = none)" "" preq
+        ask "Laravel major version (Enter = unknown)" "" lvq
+        suggest_php_from "$preq" "$lvq"
+        mapfile -t pitems < <(php_menu_items)
+        choose_tag "PHP" "$SUG_PHP" "$SUG_REASON" '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "${pitems[@]}" || { info "Cancelled."; pause; return; }
+        GEN_PHP="$CHOSEN_TAG"; verify_image "php:${GEN_PHP}-fpm-alpine" || { pause; return; }
+    fi
     outdir="$TEMPLATES_DIR/$domain"
     echo ""
     generate_project_files "$outdir" "$domain" "$branch" "$tag" yes "$ptype" "$pm"
+    GEN_PHP=""; GEN_NODE=""
     local ip; ip="$(curl -4fsS --max-time 4 https://api.ipify.org 2>/dev/null || echo 'SERVER_IP')"
     echo ""
     ok "Files are in: $outdir"
@@ -2432,7 +2482,9 @@ tpl_next_dockerfile() {
 # Multi-stage build: the final image only holds the compiled app (Next.js "standalone" output).
 # Requires   output: 'standalone'   in next.config.js / next.config.mjs / next.config.ts
 # Package manager: ${pm}
-FROM node:22-alpine AS base
+# Node version: change NODE_VERSION in .deploy.env on the server (main menu 11 -> Projects), or the default on the ARG line below.
+ARG NODE_VERSION=__NODE_VERSION__
+FROM node:\${NODE_VERSION}-alpine AS base
 ENV NEXT_TELEMETRY_DISABLED=1 COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
@@ -2452,7 +2504,7 @@ RUN mkdir -p public
 RUN ${build}
 
 # 3) small runtime image
-FROM node:22-alpine AS runner
+FROM node:\${NODE_VERSION}-alpine AS runner
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0
 RUN apk add --no-cache libc6-compat \\
     && addgroup -S -g 1001 nodejs && adduser -S -u 1001 -G nodejs nextjs
@@ -2475,6 +2527,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NODE_VERSION: ${NODE_VERSION:-__NODE_VERSION__}
     container_name: ${CONTAINER_NAME:?CONTAINER_NAME missing in .deploy.env}
     restart: unless-stopped
     init: true
@@ -2885,6 +2939,13 @@ deploy_wizard_nextjs() {
     done
     heap=$(( $(mem_to_mb "$mem") * 70 / 100 ))
     while true; do ask "Port the app listens on inside the container" "3000" port; [[ "$port" =~ ^[0-9]{2,5}$ ]] && break; err "Invalid port."; done
+    PICK_NODE="$(dockerfile_node_version "$path")"
+    if dockerfile_has_arg "$path" NODE_VERSION; then
+        pick_node "$path" "$PICK_NODE" || { info "Stopped."; pause; return; }
+    else
+        PICK_NODE="${PICK_NODE:-$DEFAULT_NODE_VERSION}"
+        info "Node version: the Dockerfile in your repository builds Node $PICK_NODE (written into the file; to choose another one use main menu 3, then commit)."
+    fi
     if confirm "Does this project use a database right now? (you can add one later)" n; then
         use_db="yes"; db_choose_engine nextjs || { pause; return; }
     else use_db="no"; fi
@@ -2902,6 +2963,7 @@ APP_GID=$gid
 APP_PORT=$port
 MEM_LIMIT=$mem
 NODE_HEAP_MB=$heap
+NODE_VERSION=$PICK_NODE
 USE_DATABASE=$use_db
 DB_ENGINE=${PROV_ENGINE:-mariadb}
 EOF
@@ -3257,7 +3319,7 @@ deploy_wizard() {
     read -r -p "Select [1]: " ptype_choice
     if [ "$ptype_choice" = "2" ]; then deploy_wizard_nextjs; return; fi
 
-    local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok sqlfile
+    local domain repo branch tag path container mem mem_norm uid gid grp ssl_ok=0 skip_ssl=0 queue_conn c fe fe_default use_db qdefault db_line dp_ok sqlfile node_img="$DEFAULT_NODE_IMAGE"
     PROV_DB=""; PROV_USER=""; PROV_PASS=""; PROV_ENGINE=""
 
     # ---- 1. Domain ------------------------------------------------------
@@ -3340,6 +3402,18 @@ deploy_wizard() {
     if confirm "Does this project use a database right now? (you can add one later)" y; then
         use_db="yes"; db_choose_engine laravel || { pause; return; }
     else use_db="no"; fi
+    # Runtime versions: suggested from composer.json / package.json, you decide
+    PICK_PHP="$(dockerfile_php_version "$path")"
+    if dockerfile_has_arg "$path" PHP_VERSION; then
+        pick_php "$path" "$PICK_PHP" || { info "Stopped."; pause; return; }
+    else
+        PICK_PHP="${PICK_PHP:-$DEFAULT_PHP_VERSION}"
+        info "PHP version: the Dockerfile in your repository builds PHP $PICK_PHP (written into the file; to choose another one use main menu 3, then commit)."
+        check_php_fit "$path" || true
+    fi
+    if [ "$fe" = "yes" ]; then
+        if pick_node "$path" ""; then node_img="node:${PICK_NODE}-alpine"; fi
+    fi
     ask "GitLab runner tag used in .gitlab-ci.yml" "$(cfg_get RUNNER_TAG || true)" tag
     tag="${tag:-production}"; cfg_set RUNNER_TAG "$tag"
     cat > "$path/.deploy.env" <<EOF
@@ -3352,7 +3426,8 @@ APP_UID=$uid
 APP_GID=$gid
 MEM_LIMIT=$mem
 FRONTEND_BUILD=$fe
-NODE_IMAGE=$DEFAULT_NODE_IMAGE
+NODE_IMAGE=$node_img
+PHP_VERSION=$PICK_PHP
 USE_DATABASE=$use_db
 DB_ENGINE=${PROV_ENGINE:-mariadb}
 EOF
@@ -4574,9 +4649,12 @@ perf_db_current() {   # bp | mc | skip
     esac
 }
 
-mariadb_write_compose() {   # BUFFER_POOL MAX_CONNECTIONS SKIP_NAME_RESOLVE(yes|no)
-    local bp="$1" mc="$2" skip="$3" skip_line=""
+mariadb_write_compose() {   # BUFFER_POOL MAX_CONNECTIONS SKIP_NAME_RESOLVE(yes|no) [DATA_VOLUME_KEY]
+    local bp="$1" mc="$2" skip="$3" vol="${4:-}" skip_line=""
     [ "$skip" = "yes" ] && skip_line="      - --skip-name-resolve"
+    # keep the data volume the server already uses (a major upgrade gives it a new name)
+    [ -n "$vol" ] || vol="$(sed -n 's#^      - \([A-Za-z0-9_.-]*\):/var/lib/mysql$#\1#p' "$DB_DIR/docker-compose.yml" 2>/dev/null | head -n1)"
+    vol="${vol:-mariadb_data}"
     cat > "$DB_DIR/docker-compose.yml" <<EOF
 services:
   mariadb:
@@ -4585,6 +4663,7 @@ services:
     restart: always
     environment:
       MARIADB_ROOT_PASSWORD: \${MARIADB_ROOT_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1"
     command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
@@ -4592,7 +4671,7 @@ services:
       - --max-connections=${mc}
 ${skip_line}
     volumes:
-      - mariadb_data:/var/lib/mysql
+      - ${vol}:/var/lib/mysql
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -4606,7 +4685,7 @@ networks:
     external: true
 
 volumes:
-  mariadb_data:
+  ${vol}:
 EOF
 }
 
@@ -5006,6 +5085,13 @@ redis_install() {
     explain "One Redis container for ALL projects (cache, sessions, queues). It is password protected, not reachable from the internet, and keeps its data on disk."
     docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
     if container_running "$REDIS_CONTAINER"; then ok "Redis is already running."; return 0; fi
+    if [ -f "$REDIS_DIR/docker-compose.yml" ]; then
+        info "Redis is installed but stopped: starting it with its existing settings and data."
+        docker compose -f "$REDIS_DIR/docker-compose.yml" up -d >/dev/null 2>&1; sleep 3
+        container_running "$REDIS_CONTAINER" && { ok "Redis is running."; return 0; }
+        err "Redis did not start. Check: docker logs $REDIS_CONTAINER"; return 1
+    fi
+    pick_redis_image || { err "Cancelled."; return 1; }
     perf_scan
     local def mb pass i status=""
     if [ "$PS_RAM_MB" -lt 1500 ]; then def=64; elif [ "$PS_RAM_MB" -lt 3500 ]; then def=128; else def=256; fi
@@ -8412,8 +8498,21 @@ step_postgres_install() {
         "only containers on '$NETWORK' can reach it."
     docker_ready && net_exists || { err "Docker/network not ready. Use main menu 1) first."; return 1; }
     if container_running "$PG_CONTAINER"; then ok "PostgreSQL container is already running."; return 0; fi
-
     local pass suggested i status
+    if [ -f "$PG_DIR/docker-compose.yml" ]; then
+        # never rewrite an existing installation: its compose file knows where the data lives
+        info "PostgreSQL is installed but stopped: starting it with its existing settings and data."
+        docker compose -f "$PG_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+        for i in $(seq 1 40); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' "$PG_CONTAINER" 2>/dev/null)"
+            [ "$status" = "healthy" ] && break
+            sleep 3
+        done
+        [ "$status" = "healthy" ] && { ok "PostgreSQL is healthy."; return 0; }
+        err "PostgreSQL is not healthy. Check: docker logs $PG_CONTAINER"; return 1
+    fi
+
+    pick_postgres_image || { err "Cancelled."; return 1; }
     suggested="$(gen_password)"
     explain "Allowed superuser password characters: letters, digits and . _ @ % + = : , -   (min 12 characters)"
     while true; do
@@ -8425,40 +8524,9 @@ step_postgres_install() {
     mkdir -p "$PG_DIR"
     printf 'POSTGRES_PASSWORD=%s\n' "$pass" > "$PG_DIR/.env"
     chmod 600 "$PG_DIR/.env"
-
-    cat > "$PG_DIR/docker-compose.yml" <<EOF
-services:
-  postgres:
-    image: ${POSTGRES_IMAGE}
-    container_name: ${PG_CONTAINER}
-    restart: always
-    shm_size: 128mb
-    environment:
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --data-checksums"
-    command:
-      - postgres
-      - -c
-      - max_connections=60
-      - -c
-      - shared_buffers=128MB
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - ${NETWORK}
-
-networks:
-  ${NETWORK}:
-    external: true
-
-volumes:
-  postgres_data:
-EOF
+    # PostgreSQL 18+ keeps its data in a per-version folder under /var/lib/postgresql: the volume is mounted there
+    # (mounting /var/lib/postgresql/data, the old way, makes version 18 fail; mounting the new way on 17 without PGDATA loses data).
+    pg_write_compose "$POSTGRES_IMAGE" "postgres_data" || { err "Could not write the compose file (unknown version in '$POSTGRES_IMAGE')."; return 1; }
     info "Starting PostgreSQL (the first start downloads the image, about 1 minute)..."
     docker compose -f "$PG_DIR/docker-compose.yml" up -d || { err "PostgreSQL failed to start."; return 1; }
     info "Waiting for PostgreSQL to become healthy..."
@@ -8468,7 +8536,7 @@ EOF
         sleep 3
     done
     if [ "${status:-}" = "healthy" ]; then
-        ok "PostgreSQL is healthy."
+        ok "PostgreSQL $(upd_running_version postgres) is healthy ($POSTGRES_IMAGE)."
         warn "Superuser password: $pass"
         explain "Saved (root-only) in: $PG_DIR/.env  — you normally never need it; this script uses the local socket of the container."
         next_steps \
@@ -8784,6 +8852,907 @@ menu_brotli() {
 }
 
 # ============================================================================
+# VERSIONS AND UPDATE CENTER (main menu 11)
+# ============================================================================
+# Two ideas:
+#  1) Versions are never hidden: whenever HiDeploy installs something it suggests a version (with the reason), the user
+#     accepts it or picks another one, and the image tag is checked on the registry before it is used.
+#  2) The compose file that is installed on the server is the single source of truth. Nothing is "upgraded behind your
+#     back": a newer image is only started after a safety backup, and a failed start is rolled back automatically.
+#     A change of MAJOR version (MariaDB, PostgreSQL, Redis) is a separate, guided procedure (dump -> new data volume ->
+#     restore -> verify) that keeps the old data volume until you delete it yourself.
+
+# Release facts below were checked on this date against the official pages (postgresql.org, mariadb.org, php.net,
+# nodejs.org, laravel.com). They only drive suggestions and warnings: every tag is verified on the registry before use.
+CATALOG_CHECKED="2026-11-08"
+DEFAULT_PHP_VERSION="8.5"
+PHP_CANDIDATES=(8.5 8.4 8.3 8.2)
+NODE_CANDIDATES=(26 24 22)
+
+# End of security support (YYYY-MM-DD) per version line
+catalog_eol() {   # KIND VERSION
+    case "$1:$2" in
+        php:8.2) echo 2026-12-31 ;;  php:8.3) echo 2027-12-31 ;;  php:8.4) echo 2028-12-31 ;;  php:8.5) echo 2029-12-31 ;;
+        node:20) echo 2026-04-30 ;;  node:22) echo 2027-04-30 ;;  node:24) echo 2028-04-30 ;;  node:26) echo 2029-04-30 ;;
+        mariadb:10.6) echo 2026-07-06 ;;   mariadb:10.11) echo 2028-02-16 ;;  mariadb:11.4) echo 2029-05-29 ;;
+        mariadb:11.8) echo 2028-06-04 ;;   mariadb:12.3) echo 2029-06-12 ;;
+        postgres:14) echo 2026-11-12 ;;  postgres:15) echo 2027-11-11 ;;  postgres:16) echo 2028-11-09 ;;
+        postgres:17) echo 2029-11-08 ;;  postgres:18) echo 2030-11-14 ;;
+    esac
+    return 0
+}
+
+eol_plain() {   # KIND VERSION -> plain text
+    local d s left
+    d="$(catalog_eol "$1" "$2")"; [ -n "$d" ] || { printf 'support dates: see the vendor website'; return 0; }
+    s="$(date -d "$d" +%s 2>/dev/null)" || return 0
+    left=$(( (s - $(date +%s)) / 86400 ))
+    if [ "$left" -lt 0 ]; then printf 'ENDED %s, no more security fixes' "$d"
+    elif [ "$left" -lt 180 ]; then printf 'support ends %s (in %d days)' "$d" "$left"
+    else printf 'supported until %s' "$d"; fi
+}
+
+eol_text() {    # KIND VERSION -> coloured
+    local t; t="$(eol_plain "$1" "$2")"
+    case "$t" in
+        ENDED*)        printf '%s%s%s' "$C_RED" "$t" "$C_RESET" ;;
+        "support ends"*) printf '%s%s%s' "$C_YELLOW" "$t" "$C_RESET" ;;
+        *)             printf '%s%s%s' "$C_DIM" "$t" "$C_RESET" ;;
+    esac
+}
+
+# ---------- what is installed ---------------------------------------------------------------
+compose_image_of() { [ -f "$1" ] || return 0; sed -n 's/^    image: *//p' "$1" | head -n1 | tr -d '"'; }
+
+# The installed compose file wins over the defaults at the top of this script, so an existing server keeps exactly
+# the images it runs, and every later rewrite of a compose file (tuning, Brotli ...) keeps them too.
+load_installed_images() {
+    local i
+    i="$(compose_image_of "$DB_DIR/docker-compose.yml")";      [ -n "$i" ] && MARIADB_IMAGE="$i"
+    i="$(compose_image_of "$PG_DIR/docker-compose.yml")";      [ -n "$i" ] && POSTGRES_IMAGE="$i"
+    i="$(compose_image_of "$REDIS_DIR/docker-compose.yml")";   [ -n "$i" ] && REDIS_IMAGE="$i"
+    i="$(compose_image_of "$PMA_DIR/docker-compose.yml")";     [ -n "$i" ] && PMA_IMAGE="$i"
+    i="$(compose_image_of "$MAIL_DIR/docker-compose.yml")";    [ -n "$i" ] && MAIL_IMAGE="$i"
+    i="$(compose_image_of "$MAILWEB_DIR/docker-compose.yml")"; [ -n "$i" ] && MAILWEB_IMAGE="$i"
+    i="$(cfg_get NGINX_BASE_IMAGE || true)";                    [ -n "$i" ] && NGINX_IMAGE="$i"
+    return 0
+}
+
+image_tag() { local t="${1#*:}"; [ "$t" = "$1" ] && t=latest; printf '%s' "$t"; }
+
+image_series() {   # KIND IMAGE -> 12.3 (mariadb) | 18 (postgres, redis, node)
+    local t; t="$(image_tag "$2")"
+    case "$1" in
+        mariadb) [[ "$t" =~ ^([0-9]+\.[0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}" ;;
+        postgres|redis|node) [[ "$t" =~ ^([0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}" ;;
+    esac
+    return 0
+}
+
+series_key() { local a="${1%%.*}" b="${1#*.}"; [ "$b" = "$1" ] && b=0; echo $(( 10#$a * 1000 + 10#$b )); }
+
+# ---------- choosing a version -----------------------------------------------------------------
+image_exists() {
+    docker image inspect "$1" >/dev/null 2>&1 && return 0
+    timeout 40 docker manifest inspect "$1" >/dev/null 2>&1
+}
+
+verify_image() {   # IMAGE -> 0 when it may be used
+    info "Checking on the registry that $1 exists..."
+    if image_exists "$1"; then ok "$1 is available."; return 0; fi
+    warn "Could not confirm that '$1' exists (wrong tag, or this server cannot reach the registry)."
+    confirm "Use it anyway?" n
+}
+
+# choose_tag LABEL SUGGESTED_TAG REASON REGEX "tag|note" ...   -> CHOSEN_TAG   (returns 1 on cancel)
+choose_tag() {
+    local label="$1" sug="$2" reason="$3" re="$4"; shift 4
+    local -a tags=() notes=()
+    local item i def=0 choice n mark
+    for item in "$@"; do tags+=("${item%%|*}"); notes+=("${item#*|}"); done
+    for i in "${!tags[@]}"; do [ "${tags[$i]}" = "$sug" ] && def=$((i+1)); done
+    [ "$def" -gt 0 ] || def=1
+    echo ""
+    printf ' %sWhich %s version?%s\n' "$C_BOLD" "$label" "$C_RESET"
+    [ -z "$reason" ] || explain "$reason"
+    for i in "${!tags[@]}"; do
+        mark=""; [ $((i+1)) -eq "$def" ] && mark="   <- suggested"
+        printf '  %d) %-14s %s%s%s%s%s%s\n' $((i+1)) "${tags[$i]}" "$C_DIM" "${notes[$i]}" "$C_RESET" "$C_GREEN" "$mark" "$C_RESET"
+    done
+    n=$(( ${#tags[@]} + 1 ))
+    printf '  %d) Type another version\n  0) Cancel\n' "$n"
+    while true; do
+        read -r -p "${C_YELLOW}Select [$def]: ${C_RESET}" choice; choice="${choice:-$def}"
+        if [ "$choice" = "0" ]; then return 1; fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$n" ]; then CHOSEN_TAG="${tags[$((choice-1))]}"; return 0; fi
+        if [ "$choice" = "$n" ]; then
+            read -r -p "${C_YELLOW}Version / tag: ${C_RESET}" choice
+            if [[ "$choice" =~ $re ]]; then CHOSEN_TAG="$choice"; return 0; fi
+            err "That does not look right for $label (expected something like ${tags[0]})."; continue
+        fi
+        err "Choose a number from the list."
+    done
+}
+
+# Service pickers: each sets the matching *_IMAGE variable (used by the install step that called it)
+pick_mariadb_image() {
+    choose_tag "MariaDB" "12.3" "12.3 is the newest long-term-support (LTS) line. 11.8 is the more settled one; 10.11 is the oldest still supported." \
+        '^[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+        "12.3|newest LTS - $(eol_plain mariadb 12.3)" "11.8|LTS - $(eol_plain mariadb 11.8)" "10.11|older LTS - $(eol_plain mariadb 10.11)" || return 1
+    MARIADB_IMAGE="mariadb:$CHOSEN_TAG"; verify_image "$MARIADB_IMAGE"
+}
+
+pick_postgres_image() {
+    choose_tag "PostgreSQL" "18-bookworm" "The number before the dash is the major version. 'bookworm' pins the Debian base: it never changes underneath your data." \
+        '^[0-9]+(\.[0-9]+)?(-[a-z0-9.]+)?$' \
+        "18-bookworm|newest - $(eol_plain postgres 18)" "17-bookworm|previous - $(eol_plain postgres 17)" "16-bookworm|older - $(eol_plain postgres 16)" || return 1
+    [ -n "$(image_series postgres "postgres:$CHOSEN_TAG")" ] || { err "The tag must start with the major version number (for example 18-bookworm)."; return 1; }
+    POSTGRES_IMAGE="postgres:$CHOSEN_TAG"; verify_image "$POSTGRES_IMAGE"
+}
+
+pick_redis_image() {
+    choose_tag "Redis" "8-alpine" "Redis 8 is the current line (AGPLv3 licence: fine for running your own projects). 7 is the previous line." \
+        '^[0-9]+(\.[0-9]+)*(-[a-z0-9.]+)?$' \
+        "8-alpine|current" "7-alpine|previous line" || return 1
+    REDIS_IMAGE="redis:$CHOSEN_TAG"; verify_image "$REDIS_IMAGE"
+}
+
+pick_nginx_image() {
+    choose_tag "nginx" "stable-alpine" "'stable' only receives fixes (calm, recommended for servers). 'mainline' also gets new features sooner." \
+        '^[A-Za-z0-9][A-Za-z0-9._-]{0,60}$' \
+        "stable-alpine|recommended" "mainline-alpine|newer features" || return 1
+    NGINX_IMAGE="nginx:$CHOSEN_TAG"; verify_image "$NGINX_IMAGE" && cfg_set NGINX_BASE_IMAGE "$NGINX_IMAGE"
+}
+
+# ---------- project-aware suggestions (PHP and Node) ------------------------------------------------
+# constraint_ok CONSTRAINT MAJOR MINOR -> 0 when that version satisfies a composer/npm style constraint
+# (^8.2  ~8.3.0  >=8.2 <8.5  8.3.*  ^8.2 || ^8.3). Syntax that is not understood counts as satisfied.
+constraint_ok() {
+    local c="$1" tmaj="$2" tmin="$3" part tok op cmaj cmin cpat t k allok hasmin haspat
+    local -a parts toks
+    c="$(printf '%s' "$c" | tr 'A-Z' 'a-z' | sed -E 's/\|\|/|/g; s/([<>=!~^]+)[[:space:]]+/\1/g; s/,/ /g')"
+    [ -n "${c// /}" ] || return 0
+    IFS='|' read -r -a parts <<<"$c"
+    for part in "${parts[@]}"; do
+        read -r -a toks <<<"$part"
+        allok=1
+        for tok in "${toks[@]}"; do
+            [[ "$tok" =~ ^(\^|~|>=|<=|>|<|=|!=)?v?([0-9]+)(\.([0-9]+|\*|x))?(\.([0-9]+|\*|x))?.*$ ]] || continue
+            op="${BASH_REMATCH[1]}"; cmaj="${BASH_REMATCH[2]}"; cmin="${BASH_REMATCH[4]}"; cpat="${BASH_REMATCH[6]}"
+            hasmin=1; haspat=1
+            if [ -z "$cmin" ] || [ "$cmin" = "*" ] || [ "$cmin" = "x" ]; then hasmin=0; cmin=0; fi
+            if [ -z "$cpat" ] || [ "$cpat" = "*" ] || [ "$cpat" = "x" ]; then haspat=0; cpat=0; fi
+            t=$(( 10#$tmaj * 1000 + 10#$tmin )); k=$(( 10#$cmaj * 1000 + 10#$cmin ))
+            case "$op" in
+                ""|"=")  if [ "$hasmin" -eq 0 ]; then [ "$tmaj" -eq "$cmaj" ] || allok=0; else [ "$t" -eq "$k" ] || allok=0; fi ;;
+                "^")     [ "$tmaj" -eq "$cmaj" ] && [ "$t" -ge "$k" ] || allok=0 ;;
+                "~")     if [ "$haspat" -eq 1 ]; then [ "$t" -eq "$k" ] || allok=0
+                         elif [ "$hasmin" -eq 1 ]; then [ "$tmaj" -eq "$cmaj" ] && [ "$t" -ge "$k" ] || allok=0
+                         else [ "$tmaj" -eq "$cmaj" ] || allok=0; fi ;;
+                ">=")    [ "$t" -ge "$k" ] || allok=0 ;;
+                ">")     if [ "$haspat" -eq 1 ]; then [ "$t" -ge "$k" ] || allok=0; else [ "$t" -gt "$k" ] || allok=0; fi ;;
+                "<")     if [ "$t" -lt "$k" ]; then :; elif [ "$t" -eq "$k" ] && [ "$cpat" -gt 0 ]; then :; else allok=0; fi ;;
+                "<=")    if [ "$hasmin" -eq 0 ]; then [ "$tmaj" -le "$cmaj" ] || allok=0; else [ "$t" -le "$k" ] || allok=0; fi ;;
+            esac
+        done
+        [ "$allok" -eq 1 ] && return 0
+    done
+    return 1
+}
+
+composer_php_constraint() { [ -f "$1/composer.json" ] || return 0; sed -n 's/.*"php"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/composer.json" | head -n1; }
+composer_laravel_major()  {
+    local c; [ -f "$1/composer.json" ] || return 0
+    c="$(sed -n 's#.*"laravel/framework"[[:space:]]*:[[:space:]]*"\([^"]*\)".*#\1#p' "$1/composer.json" | head -n1)"
+    [[ "$c" =~ ([0-9]+) ]] && printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+}
+pkg_node_constraint() { [ -f "$1/package.json" ] || return 0; sed -n 's/.*"node"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/package.json" | head -n1; }
+
+# The newest PHP in the list that the project allows. Laravel 10 is tested up to PHP 8.3 and Laravel 11 up to 8.4.
+suggest_php_from() {   # CONSTRAINT LARAVEL_MAJOR -> SUG_PHP, SUG_REASON
+    local con="$1" lv="$2" cap="8.5" v maj min why=""
+    if [[ "$lv" =~ ^[0-9]+$ ]]; then
+        if [ "$lv" -le 10 ]; then cap="8.3"; elif [ "$lv" -eq 11 ]; then cap="8.4"; fi
+        [ "$cap" = "8.5" ] || why="Laravel $lv is tested up to PHP $cap. "
+    fi
+    [ -z "$con" ] || why="${why}composer.json asks for php \"$con\". "
+    for v in "${PHP_CANDIDATES[@]}"; do
+        maj="${v%%.*}"; min="${v#*.}"
+        [ "$(series_key "$v")" -le "$(series_key "$cap")" ] || continue
+        if [ -z "$con" ] || constraint_ok "$con" "$maj" "$min"; then
+            SUG_PHP="$v"; SUG_REASON="${why}Suggested: the newest version that fits. $(eol_plain php "$v")."; return 0
+        fi
+    done
+    SUG_PHP="$DEFAULT_PHP_VERSION"; SUG_REASON="${why}No PHP version in the list fits exactly; check your composer.json."
+    return 1
+}
+
+suggest_node_from() {   # CONSTRAINT -> SUG_NODE, SUG_REASON
+    local con="$1" v why=""
+    [ -z "$con" ] || why="package.json (engines) asks for node \"$con\". "
+    for v in "${NODE_CANDIDATES[@]}"; do
+        if [ -z "$con" ] || constraint_ok "$con" "$v" 99; then
+            SUG_NODE="$v"; SUG_REASON="${why}Suggested: the newest LTS that fits. $(eol_plain node "$v")."; return 0
+        fi
+    done
+    SUG_NODE="${NODE_CANDIDATES[0]}"; SUG_REASON="${why}No Node version in the list fits exactly."; return 1
+}
+
+php_menu_items() {
+    local v n
+    for v in "${PHP_CANDIDATES[@]}"; do
+        case "$v" in 8.5) n="newest" ;; 8.4) n="widely used" ;; 8.3) n="security fixes only" ;; *) n="old" ;; esac
+        printf '%s|%s - %s\n' "$v" "$n" "$(eol_plain php "$v")"
+    done
+}
+node_menu_items() {
+    local v n
+    for v in "${NODE_CANDIDATES[@]}"; do
+        case "$v" in 26) n="newest LTS" ;; 24) n="LTS, more conservative" ;; *) n="LTS, in maintenance" ;; esac
+        printf '%s|%s - %s\n' "$v" "$n" "$(eol_plain node "$v")"
+    done
+}
+
+# pick_php [PATH] [CURRENT] -> PICK_PHP ; PATH is a project folder (composer.json is read when present)
+pick_php() {
+    local path="${1:-}" cur="${2:-}" con="" lv="" sug why
+    local -a items
+    [ -z "$path" ] || { con="$(composer_php_constraint "$path")"; lv="$(composer_laravel_major "$path")"; }
+    suggest_php_from "$con" "$lv"; sug="$SUG_PHP"; why="$SUG_REASON"
+    # keep the version that is already in use when it still fits the project: no surprise changes
+    if [ -n "$cur" ] && { [ -z "$con" ] || constraint_ok "$con" "${cur%%.*}" "$(cut -d. -f2 <<<"$cur")"; }; then sug="$cur"; why="${why} Keeping the version already in use ($cur)."; fi
+    mapfile -t items < <(php_menu_items)
+    choose_tag "PHP" "$sug" "$why" '^[0-9]+\.[0-9]+(\.[0-9]+)?$' "${items[@]}" || return 1
+    PICK_PHP="$CHOSEN_TAG"
+    verify_image "php:${PICK_PHP}-fpm-alpine" || return 1
+}
+
+pick_node() {   # [PATH] [CURRENT] -> PICK_NODE (major version number)
+    local path="${1:-}" cur="${2:-}" con="" sug why
+    local -a items
+    [ -z "$path" ] || con="$(pkg_node_constraint "$path")"
+    suggest_node_from "$con"; sug="$SUG_NODE"; why="$SUG_REASON"
+    if [ -n "$cur" ] && { [ -z "$con" ] || constraint_ok "$con" "$cur" 99; }; then sug="$cur"; why="${why} Keeping the version already in use ($cur)."; fi
+    mapfile -t items < <(node_menu_items)
+    choose_tag "Node.js" "$sug" "$why" '^[0-9]{2}(\.[0-9]+)*$' "${items[@]}" || return 1
+    PICK_NODE="$CHOSEN_TAG"
+    verify_image "node:${PICK_NODE}-alpine" || return 1
+}
+
+# ---------- reading versions from project files ---------------------------------------------------
+dockerfile_php_version() {
+    local f="$1/Dockerfile" v; [ -f "$f" ] || return 0
+    v="$(sed -n 's/^ARG PHP_VERSION=\([0-9][0-9.]*\).*/\1/p' "$f" | head -n1)"
+    [ -n "$v" ] || v="$(sed -n 's/^FROM php:\([0-9][0-9.]*\)-.*/\1/p' "$f" | head -n1)"
+    printf '%s' "$v"
+}
+dockerfile_node_version() {
+    local f="$1/Dockerfile" v; [ -f "$f" ] || return 0
+    v="$(sed -n 's/^ARG NODE_VERSION=\([0-9][0-9.]*\).*/\1/p' "$f" | head -n1)"
+    [ -n "$v" ] || v="$(sed -n 's/^FROM node:\([0-9][0-9.]*\)-.*/\1/p' "$f" | head -n1)"
+    printf '%s' "$v"
+}
+dockerfile_has_arg() { grep -qs "^ARG $2=" "$1/Dockerfile"; }
+
+# Warn when the Dockerfile builds a PHP that composer.json does not allow (composer install would fail later)
+check_php_fit() {   # PATH
+    local path="$1" v con
+    v="$(dockerfile_php_version "$path")"; con="$(composer_php_constraint "$path")"
+    [ -n "$v" ] && [ -n "$con" ] || return 0
+    constraint_ok "$con" "${v%%.*}" "$(cut -d. -f2 <<<"$v")" && return 0
+    warn "composer.json asks for php \"$con\" but the Dockerfile builds PHP $v: 'composer install' will probably fail."
+    return 1
+}
+
+# ---------- components -----------------------------------------------------------------------------
+upd_ids() { echo "nginx mariadb postgres redis phpmyadmin mail webmail"; }
+upd_label() { case "$1" in nginx) echo "nginx";; mariadb) echo "MariaDB";; postgres) echo "PostgreSQL";; redis) echo "Redis";; phpmyadmin) echo "phpMyAdmin";; mail) echo "Mail server";; webmail) echo "Webmail (Roundcube)";; esac; }
+upd_dir() { case "$1" in nginx) echo "$NGINX_DIR";; mariadb) echo "$DB_DIR";; postgres) echo "$PG_DIR";; redis) echo "$REDIS_DIR";; phpmyadmin) echo "$PMA_DIR";; mail) echo "$MAIL_DIR";; webmail) echo "$MAILWEB_DIR";; esac; }
+upd_container() { case "$1" in nginx) echo "$NGINX_CONTAINER";; mariadb) echo "$DB_CONTAINER";; postgres) echo "$PG_CONTAINER";; redis) echo "$REDIS_CONTAINER";; phpmyadmin) echo "$PMA_CONTAINER";; mail) echo "$MAIL_CONTAINER";; webmail) echo "$MAILWEB_CONTAINER";; esac; }
+upd_compose() { printf '%s/docker-compose.yml' "$(upd_dir "$1")"; }
+upd_installed() { [ -f "$(upd_compose "$1")" ]; }
+upd_image() { compose_image_of "$(upd_compose "$1")"; }
+upd_kind() { case "$1" in mariadb|postgres|redis) echo "$1";; *) echo "";; esac; }
+
+upd_running_version() {
+    local c; c="$(upd_container "$1")"
+    container_running "$c" || { printf 'not running'; return 0; }
+    case "$1" in
+        mariadb)  docker exec "$c" sh -c 'mariadbd --version 2>/dev/null || mysqld --version 2>/dev/null' | sed -n 's/.*Ver \([0-9][0-9.]*\).*/\1/p' | head -n1 ;;
+        postgres) docker exec "$c" postgres --version 2>/dev/null | sed -n 's/.*) \([0-9][0-9.]*\).*/\1/p' | head -n1 ;;
+        redis)    docker exec "$c" redis-server --version 2>/dev/null | sed -n 's/.*v=\([0-9][0-9.]*\).*/\1/p' | head -n1 ;;
+        nginx)    docker exec "$c" nginx -v 2>&1 | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p' | head -n1 ;;
+        *)        docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$c" 2>/dev/null ;;
+    esac
+    return 0
+}
+
+upd_pending() {   # ID -> 0 when a newer build of the image is on this server but the container still runs the old one
+    local c img new cur
+    c="$(upd_container "$1")"; img="$(upd_image "$1")"
+    new="$(docker image inspect -f '{{.Id}}' "$img" 2>/dev/null)"; cur="$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)"
+    [ -n "$new" ] && [ -n "$cur" ] && [ "$new" != "$cur" ]
+}
+
+# the data volume a container really uses (by mount point)
+upd_volume_of() { docker inspect -f "{{range .Mounts}}{{if eq .Destination \"$2\"}}{{.Name}}{{end}}{{end}}" "$1" 2>/dev/null; }
+
+upd_nginx_built() { brotli_on && [ "$(cfg_get NGINX_BROTLI_MODE || true)" = "build" ]; }
+
+# ---------- overview and check ------------------------------------------------------------------------
+upd_overview() {
+    local id img run kind ser eol pend
+    printf '  %-20s %-14s %s\n' "COMPONENT" "RUNNING" "IMAGE / SUPPORT"
+    for id in $(upd_ids); do
+        upd_installed "$id" || continue
+        img="$(upd_image "$id")"; run="$(upd_running_version "$id")"; kind="$(upd_kind "$id")"; eol=""
+        if [ -n "$kind" ]; then ser="$(image_series "$kind" "$img")"; [ -z "$ser" ] || eol="  $(eol_text "$kind" "$ser")"; fi
+        pend=""
+        if docker_ready && container_running "$(upd_container "$id")" && upd_pending "$id"; then pend="  ${C_GREEN}update ready${C_RESET}"; fi
+        printf '  %-20s %-14s %s%s%s%s%s\n' "$(upd_label "$id")" "${run:-?}" "$C_DIM" "$img" "$C_RESET" "$eol" "$pend"
+    done
+}
+
+upd_check_all() {
+    section "Checking for updates"
+    docker_ready || { err "Docker is not ready."; return 1; }
+    explain "Downloads the newest build of every installed image (same version line). Nothing is started or changed yet."
+    local id img n=0 note
+    for id in $(upd_ids); do
+        upd_installed "$id" || continue
+        img="$(upd_image "$id")"
+        if [ "$id" = "nginx" ] && upd_nginx_built; then
+            note="built on this server: use Shared Services -> Brotli -> Rebuild (or option 2 here)"
+            printf '  %-20s %s\n' "$(upd_label "$id")" "$note"; continue
+        fi
+        printf '  %-20s ' "$(upd_label "$id")"
+        if ! docker pull -q "$img" >/dev/null 2>&1; then printf '%scould not download %s%s\n' "$C_YELLOW" "$img" "$C_RESET"; continue; fi
+        if container_state "$(upd_container "$id")" | grep -q missing; then printf 'installed, container missing\n'
+        elif upd_pending "$id"; then printf '%supdate ready%s (%s)\n' "$C_GREEN" "$C_RESET" "$img"; n=$((n+1))
+        else printf 'up to date (%s)\n' "$img"; fi
+    done
+    cfg_set UPD_LAST_CHECK "$(date +%s)"
+    echo ""
+    if [ "$n" -gt 0 ]; then ok "$n update(s) ready. Install them with option 2 or 3."; else ok "Everything is on the newest build of its version line."; fi
+    local id2 ser latest
+    for id2 in mariadb postgres redis; do
+        upd_installed "$id2" || continue
+        ser="$(image_series "$id2" "$(upd_image "$id2")")"; [ -n "$ser" ] || continue
+        case "$id2" in mariadb) latest="12.3" ;; postgres) latest="18" ;; redis) latest="8" ;; esac
+        if [ "$(series_key "$ser")" -lt "$(series_key "$latest")" ]; then
+            info "$(upd_label "$id2") $ser is not the newest line ($latest). Upgrade (guided, option 4): $(eol_plain "$id2" "$ser")."
+        fi
+    done
+}
+
+upd_status_row() {
+    local any=0 id last days
+    for id in $(upd_ids); do upd_installed "$id" && any=1; done
+    [ "$any" -eq 1 ] || return 0
+    last="$(cfg_get UPD_LAST_CHECK || true)"
+    if [ -z "$last" ]; then status_row "Updates" warn "NEVER CHECKED" "main menu 11 -> Check for updates"; return 0; fi
+    days=$(( ( $(date +%s) - last ) / 86400 ))
+    if [ "$days" -ge 90 ]; then status_row "Updates" warn "CHECK DUE" "last check $days days ago: main menu 11"
+    else status_row "Updates" good "CHECKED" "$days days ago"; fi
+}
+
+# ---------- safety backup before touching a component ------------------------------------------------
+upd_env_secret() {   # FILE KEY -> the value, without quotes or escapes
+    local raw; raw="$(grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+    case "$raw" in
+        \"*\") raw="${raw#\"}"; raw="${raw%\"}"; printf '%s' "$raw" | sed 's/\\\(.\)/\1/g' ;;
+        \'*\') raw="${raw#\'}"; raw="${raw%\'}"; printf '%s' "$raw" ;;
+        *) printf '%s' "$raw" ;;
+    esac
+}
+
+# upd_managed_dbs ENGINE -> lines "DB|USER|PASS" of the projects that use that engine
+upd_managed_dbs() {
+    local p db user pass
+    while IFS= read -r p; do
+        [ "$(db_engine_of "$p")" = "$1" ] || continue
+        [ "$( . "$p/.deploy.env" 2>/dev/null; echo "${USE_DATABASE:-yes}" )" = "yes" ] || continue
+        db="$(env_get "$p/.env" DB_DATABASE)"; user="$(env_get "$p/.env" DB_USERNAME)"; pass="$(upd_env_secret "$p/.env" DB_PASSWORD)"
+        [ -n "$db" ] && [ -n "$user" ] && [ -n "$pass" ] && printf '%s|%s|%s\n' "$db" "$user" "$pass"
+    done < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+}
+
+upd_list_dbs() {   # ENGINE -> every user database on the server
+    if [ "$1" = "postgres" ]; then
+        printf "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1;\n" | pg_sql
+    else
+        printf "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','mysql','performance_schema','sys') ORDER BY 1;\n" | db_sql
+    fi
+}
+
+dump_ok() {   # FILE -> 0 when a gz dump is complete
+    [ -s "$1" ] && gzip -t "$1" 2>/dev/null || return 1
+    case "$2" in
+        postgres) gzip -dc "$1" | tail -n 5 | grep -q 'PostgreSQL database cluster dump complete' ;;
+        *)        gzip -dc "$1" | tail -n 5 | grep -q 'Dump completed' ;;
+    esac
+}
+
+# upd_dump_all ENGINE DIR -> one verified dump per database (MariaDB) or one cluster dump (PostgreSQL) + counts.txt
+upd_dump_all() {
+    local e="$1" dir="$2" db n
+    mkdir -p "$dir"; chmod 700 "$dir"; : > "$dir/counts.txt"
+    if [ "$e" = "postgres" ]; then
+        info "Dumping the whole PostgreSQL cluster (all databases and roles)..."
+        docker exec "$PG_CONTAINER" pg_dumpall -U postgres | gzip > "$dir/cluster.sql.gz"
+        [ "${PIPESTATUS[0]}" -eq 0 ] && dump_ok "$dir/cluster.sql.gz" postgres || { err "The cluster dump is incomplete."; return 1; }
+    fi
+    while IFS= read -r db; do
+        [ -n "$db" ] || continue
+        n="$(dbx_table_count "$e" "$db")"; printf '%s|%s\n' "$db" "$n" >> "$dir/counts.txt"
+        if [ "$e" = "mariadb" ]; then
+            info "Dumping database '$db' ($n tables)..."
+            dbx_dump mariadb "$db" --events | gzip > "$dir/db-$db.sql.gz"
+            [ "${PIPESTATUS[0]}" -eq 0 ] && dump_ok "$dir/db-$db.sql.gz" mariadb || { err "The dump of '$db' is incomplete."; return 1; }
+        fi
+    done < <(upd_list_dbs "$e")
+    ok "Safety dump complete: $dir"
+}
+
+upd_safety_backup() {   # ID
+    local ts dir; ts="$(date +%F_%H%M%S)"; dir="$BACKUP_DIR/pre-update-$1-$ts"
+    case "$1" in
+        mariadb|postgres) container_running "$(upd_container "$1")" || return 0; upd_dump_all "$1" "$dir" ;;
+        mail) mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+              tar -C "$MAIL_DIR" -czf "$BACKUP_DIR/pre-update-mail-$ts.tgz" config 2>/dev/null && ok "Mail configuration saved: $BACKUP_DIR/pre-update-mail-$ts.tgz (messages stay in $MAIL_DIR/data)" ;;
+        *) return 0 ;;
+    esac
+}
+
+upd_confirm() { [ "${UPD_ASSUME_YES:-no}" = "yes" ] || confirm "$@"; }
+
+upd_wait_ok() {   # CONTAINER -> 0 when healthy (or, without a healthcheck, running steadily)
+    local c="$1" i st
+    for i in $(seq 1 40); do
+        st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c" 2>/dev/null)"
+        case "$st" in
+            healthy) return 0 ;;
+            none) if container_running "$c" && [ "$i" -ge 5 ]; then return 0; fi ;;
+        esac
+        sleep 3
+    done
+    return 1
+}
+
+upd_post_check() {
+    case "$1" in
+        nginx)    docker exec "$NGINX_CONTAINER" nginx -t >/dev/null 2>&1 ;;
+        mariadb)  echo 'SELECT 1;' | db_sql >/dev/null 2>&1 ;;
+        postgres) echo 'SELECT 1;' | pg_sql >/dev/null 2>&1 ;;
+        *)        return 0 ;;
+    esac
+}
+
+# ---------- update within the same version line ---------------------------------------------------------
+upd_apply() {   # ID
+    local id="$1" c dir img old_id keep f
+    upd_installed "$id" || { err "$(upd_label "$id") is not installed."; return 1; }
+    docker_ready || { err "Docker is not ready."; return 1; }
+    c="$(upd_container "$id")"; img="$(upd_image "$id")"; f="$(upd_compose "$id")"
+    section "Update $(upd_label "$id")"
+    if [ "$id" = "nginx" ] && upd_nginx_built; then
+        explain "This nginx contains Brotli modules built on this server, so it is rebuilt instead of pulled."
+        brotli_rebuild; return $?
+    fi
+    info "Downloading the newest build of $img ..."
+    docker pull -q "$img" >/dev/null 2>&1 || { err "Could not download $img (no internet, or the registry is unreachable). Nothing was changed."; return 1; }
+    if ! upd_pending "$id"; then
+        ok "$(upd_label "$id") already runs the newest build of $img."
+        container_running "$c" || warn "It is stopped: docker start $c"
+        return 0
+    fi
+    case "$id" in
+        mariadb|postgres) warn "The database restarts (about 10-30 seconds): sites that use it show errors meanwhile." ;;
+        nginx)            warn "nginx is recreated: sites are unreachable for 1-3 seconds." ;;
+        mail)             warn "The mail server restarts (about 1 minute). Incoming mail is retried by other servers, nothing is lost." ;;
+        *)                info "The container restarts (a few seconds)." ;;
+    esac
+    explain "Before anything changes HiDeploy keeps the old image; if the new one does not start healthy it goes back to it automatically."
+    upd_confirm "Update $(upd_label "$id") now?" y || { info "Cancelled."; return 0; }
+    upd_safety_backup "$id" || { confirm "The safety backup failed. Continue without it?" n || return 1; }
+    old_id="$(docker inspect -f '{{.Image}}' "$c" 2>/dev/null)"
+    keep="hideploy-rollback/${id}:before-update"
+    [ -z "$old_id" ] || docker tag "$old_id" "$keep" >/dev/null 2>&1
+    info "Starting the new version..."
+    docker compose -f "$f" up -d >/dev/null 2>&1
+    if upd_wait_ok "$c" && upd_post_check "$id"; then
+        ok "$(upd_label "$id") now runs $(upd_running_version "$id") ($img)."
+        return 0
+    fi
+    err "The new version did not come up correctly. Going back to the previous one..."
+    if [ -n "$old_id" ] && docker tag "$keep" "$img" >/dev/null 2>&1; then
+        docker compose -f "$f" up -d --force-recreate >/dev/null 2>&1
+        if upd_wait_ok "$c"; then ok "Rolled back: $(upd_label "$id") runs $(upd_running_version "$id") again."; else err "Roll-back did not become healthy either. Check: docker logs $c"; fi
+    else
+        err "No previous image was kept. Check: docker logs $c"
+    fi
+    return 1
+}
+
+upd_pick_component() {   # -> UPD_PICK
+    local id n=0 choice
+    local -a list=()
+    for id in $(upd_ids); do upd_installed "$id" && list+=("$id"); done
+    [ "${#list[@]}" -gt 0 ] || { err "No shared service installed yet."; return 1; }
+    echo ""
+    for id in "${list[@]}"; do n=$((n+1)); printf '  %d) %-20s %s%s%s\n' "$n" "$(upd_label "$id")" "$C_DIM" "$(upd_image "$id")" "$C_RESET"; done
+    read -r -p "${C_YELLOW}Select (0 = back): ${C_RESET}" choice
+    [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#list[@]}" ] || return 1
+    UPD_PICK="${list[$((choice-1))]}"
+}
+
+upd_apply_menu() { upd_pick_component || return 0; upd_apply "$UPD_PICK"; }
+
+upd_apply_all() {
+    section "Update everything that has an update ready"
+    docker_ready || { err "Docker is not ready."; return 1; }
+    local id img
+    local -a todo=()
+    for id in $(upd_ids); do
+        upd_installed "$id" || continue
+        if [ "$id" = "nginx" ] && upd_nginx_built; then continue; fi
+        img="$(upd_image "$id")"; docker pull -q "$img" >/dev/null 2>&1 || continue
+        container_running "$(upd_container "$id")" && upd_pending "$id" && todo+=("$id")
+    done
+    [ "${#todo[@]}" -gt 0 ] || { ok "Nothing to update."; cfg_set UPD_LAST_CHECK "$(date +%s)"; return 0; }
+    echo "  Ready: ${todo[*]}"
+    warn "One by one, each with its own safety backup and automatic roll-back. Each restart is short, but sites may show errors for a moment."
+    confirm "Update all of them now?" y || return 0
+    UPD_ASSUME_YES=yes
+    for id in "${todo[@]}"; do upd_apply "$id" || warn "$(upd_label "$id") was not updated."; done
+    UPD_ASSUME_YES=no
+    cfg_set UPD_LAST_CHECK "$(date +%s)"
+}
+
+# ---------- upgrade to a newer MAJOR line (guided) ---------------------------------------------------------
+# New data volume + dump/restore: the old volume is never modified, so going back is always possible.
+
+upd_rollback_major() {   # COMPOSE BACKUP CONTAINER NEWVOLUME
+    warn "Going back to the previous version (its data was not touched)..."
+    docker compose -f "$1" down >/dev/null 2>&1
+    cp "$2" "$1"
+    [ -z "$4" ] || docker volume rm "$4" >/dev/null 2>&1
+    docker compose -f "$1" up -d >/dev/null 2>&1
+    if upd_wait_ok "$3"; then ok "The previous version runs again; nothing was lost."; else err "The previous version did not start: docker logs $3"; fi
+}
+
+upd_type_to_confirm() {   # WORD
+    local a; read -r -p "${C_YELLOW}Type $1 to continue (anything else cancels): ${C_RESET}" a
+    [ "$a" = "$1" ]
+}
+
+pg_write_compose() {   # IMAGE VOLUME_KEY  -> the layout of PostgreSQL 17+: PGDATA is a per-version folder under /var/lib/postgresql
+    local img="$1" vol="$2" major
+    major="$(image_series postgres "$img")"; [ -n "$major" ] || return 1
+    mkdir -p "$PG_DIR"
+    cat > "$PG_DIR/docker-compose.yml" <<EOF
+services:
+  postgres:
+    image: ${img}
+    container_name: ${PG_CONTAINER}
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --data-checksums"
+      PGDATA: /var/lib/postgresql/${major}/docker
+    command:
+      - postgres
+      - -c
+      - max_connections=60
+      - -c
+      - shared_buffers=128MB
+    volumes:
+      - ${vol}:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ${NETWORK}
+
+networks:
+  ${NETWORK}:
+    external: true
+
+volumes:
+  ${vol}:
+EOF
+}
+
+upd_major_gate() {   # ENGINE -> sets UPD_CUR_SERIES ; common checks
+    local e="$1" c; c="$(upd_container "$e")"
+    upd_installed "$e" || { err "$(upd_label "$e") is not installed."; return 1; }
+    container_running "$c" || { err "$(upd_label "$e") must be running."; return 1; }
+    UPD_CUR_IMAGE="$(upd_image "$e")"; UPD_CUR_SERIES="$(image_series "$e" "$UPD_CUR_IMAGE")"
+    [ -n "$UPD_CUR_SERIES" ] || { err "Cannot tell the version line from '$UPD_CUR_IMAGE'."; return 1; }
+}
+
+upd_counts_match() {   # ENGINE DIR -> 0 when every database has the same number of tables as before
+    local e="$1" dir="$2" db n now bad=0
+    while IFS='|' read -r db n; do
+        [ -n "$db" ] || continue
+        now="$(dbx_table_count "$e" "$db")"
+        if [ "$now" = "$n" ]; then echo "  $db: $now tables (same as before)"; else echo "  $db: $now tables, expected $n"; bad=1; fi
+    done < "$dir/counts.txt"
+    return "$bad"
+}
+
+upd_postgres_major() {
+    section "Upgrade PostgreSQL to a newer major version"
+    upd_major_gate postgres || return 1
+    local cur="$UPD_CUR_SERIES" ts dir newimg newmajor bak oldvol newvol variant log errs
+    explain "Current: PostgreSQL $cur ($UPD_CUR_IMAGE). A major upgrade changes the data format, so HiDeploy does it by dump and restore:" \
+            "  1. a complete dump of all databases and roles   2. a NEW empty data volume with the new version" \
+            "  3. restore + check that every table count matches   4. the OLD volume stays untouched until you delete it." \
+            "If anything fails, the old version is started again automatically."
+    variant="$(image_tag "$UPD_CUR_IMAGE")"; variant="${variant#*-}"; [ "$variant" != "$(image_tag "$UPD_CUR_IMAGE")" ] || variant="bookworm"
+    choose_tag "PostgreSQL" "18-$variant" "Pick the new major version. Keeping the same Debian base ('$variant') avoids sorting-order changes in your indexes." \
+        '^[0-9]+(\.[0-9]+)?(-[a-z0-9.]+)?$' \
+        "18-$variant|newest - $(eol_plain postgres 18)" "17-$variant|$(eol_plain postgres 17)" "16-$variant|$(eol_plain postgres 16)" || return 0
+    newimg="postgres:$CHOSEN_TAG"; newmajor="$(image_series postgres "$newimg")"
+    [ -n "$newmajor" ] || { err "The tag must start with the major version."; return 1; }
+    [ "$newmajor" -gt "$cur" ] || { err "PostgreSQL cannot be downgraded: the new version must be higher than $cur."; return 1; }
+    verify_image "$newimg" || return 1
+    warn "All sites that use PostgreSQL will be offline while this runs (minutes; longer for big databases)."
+    explain "Free disk space needed: roughly 3x the size of your data (volume + dump + new volume)."
+    upd_type_to_confirm UPGRADE || { info "Cancelled."; return 0; }
+    ts="$(date +%F_%H%M%S)"; dir="$BACKUP_DIR/upgrade-postgres-$cur-to-$newmajor-$ts"
+    upd_dump_all postgres "$dir" || { err "No dump, no upgrade. Nothing was changed."; return 1; }
+    docker pull -q "$newimg" >/dev/null 2>&1 || docker image inspect "$newimg" >/dev/null 2>&1 || { err "Could not download $newimg. Nothing was changed."; return 1; }
+    bak="$PG_DIR/docker-compose.yml.bak-$ts"; cp "$PG_DIR/docker-compose.yml" "$bak"
+    oldvol="$(upd_volume_of "$PG_CONTAINER" /var/lib/postgresql/data)"; [ -n "$oldvol" ] || oldvol="$(upd_volume_of "$PG_CONTAINER" /var/lib/postgresql)"
+    info "Stopping the old PostgreSQL (its data stays in volume '$oldvol')..."
+    docker compose -f "$PG_DIR/docker-compose.yml" down >/dev/null 2>&1
+    pg_write_compose "$newimg" "postgres_data_v${newmajor}" || { err "Could not write the new compose file."; cp "$bak" "$PG_DIR/docker-compose.yml"; docker compose -f "$PG_DIR/docker-compose.yml" up -d >/dev/null 2>&1; return 1; }
+    info "Starting PostgreSQL $newmajor on a new data volume..."
+    docker compose -f "$PG_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+    newvol="$(upd_volume_of "$PG_CONTAINER" /var/lib/postgresql)"
+    if ! upd_wait_ok "$PG_CONTAINER"; then err "PostgreSQL $newmajor did not start."; upd_rollback_major "$PG_DIR/docker-compose.yml" "$bak" "$PG_CONTAINER" "$newvol"; return 1; fi
+    info "Restoring everything (this is the long step)..."
+    log="$dir/restore.log"
+    gzip -dc "$dir/cluster.sql.gz" | docker exec -i "$PG_CONTAINER" psql -U postgres -X -q -v ON_ERROR_STOP=0 -d postgres >/dev/null 2>"$log"
+    errs="$(grep 'ERROR:' "$log" 2>/dev/null | grep -vc 'role "postgres" already exists')"; errs="${errs:-0}"
+    [ "$errs" -eq 0 ] || warn "$errs message(s) in $log (the table check below decides whether they matter)."
+    info "Checking every database..."
+    if upd_counts_match postgres "$dir"; then
+        docker exec "$PG_CONTAINER" vacuumdb -U postgres --all --analyze-only >/dev/null 2>&1 || true
+        cfg_set OLD_VOLUME_POSTGRES "$oldvol"
+        ok "PostgreSQL now runs $(upd_running_version postgres)."
+        explain "The old data is still in volume '$oldvol' and the dump in $dir." \
+                "When you have seen your sites work for a few days: main menu 11 -> Remove old data from a major upgrade."
+        return 0
+    fi
+    err "The table counts do not match: the upgrade is cancelled."
+    upd_rollback_major "$PG_DIR/docker-compose.yml" "$bak" "$PG_CONTAINER" "$newvol"
+    return 1
+}
+
+upd_mariadb_major() {
+    section "Upgrade MariaDB to a newer version line"
+    upd_major_gate mariadb || return 1
+    local cur="$UPD_CUR_SERIES" ts dir newimg newser bak oldvol newvol bp mc skip row db user pass f unmanaged="" managed_names=""
+    explain "Current: MariaDB $cur ($UPD_CUR_IMAGE). HiDeploy upgrades by dump and restore into a NEW data volume:" \
+            "  1. a verified dump of every database   2. a new empty server of the new version   3. databases and users are" \
+            "  re-created from each project's .env, the dumps are loaded and every table count is compared." \
+            "The old volume stays untouched until you delete it. If anything fails, the old version is started again."
+    choose_tag "MariaDB" "12.3" "Pick the new line. LTS lines are supported for years; do not pick a rolling line (for example 13.0) for servers." \
+        '^[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+        "12.3|newest LTS - $(eol_plain mariadb 12.3)" "11.8|LTS - $(eol_plain mariadb 11.8)" "10.11|LTS - $(eol_plain mariadb 10.11)" || return 0
+    newimg="mariadb:$CHOSEN_TAG"; newser="$(image_series mariadb "$newimg")"
+    [ "$(series_key "$newser")" -gt "$(series_key "$cur")" ] || { err "MariaDB cannot be downgraded: the new line must be newer than $cur."; return 1; }
+    verify_image "$newimg" || return 1
+    while IFS='|' read -r db user pass; do managed_names="$managed_names $db "; done < <(upd_managed_dbs mariadb)
+    while IFS= read -r db; do [ -z "$db" ] || [[ "$managed_names" == *" $db "* ]] || unmanaged="$unmanaged $db"; done < <(upd_list_dbs mariadb)
+    if [ -n "$unmanaged" ]; then
+        warn "Databases that no HiDeploy project uses:$unmanaged"
+        explain "Their DATA is carried over, but their database users and privileges are not (HiDeploy only knows its own projects' users)."
+        confirm "Continue anyway?" n || { info "Cancelled."; return 0; }
+    fi
+    warn "All sites that use MariaDB will be offline while this runs (minutes; longer for big databases)."
+    explain "Free disk space needed: roughly 3x the size of your data."
+    upd_type_to_confirm UPGRADE || { info "Cancelled."; return 0; }
+    ts="$(date +%F_%H%M%S)"; dir="$BACKUP_DIR/upgrade-mariadb-$cur-to-$newser-$ts"
+    upd_dump_all mariadb "$dir" || { err "No dump, no upgrade. Nothing was changed."; return 1; }
+    docker pull -q "$newimg" >/dev/null 2>&1 || docker image inspect "$newimg" >/dev/null 2>&1 || { err "Could not download $newimg. Nothing was changed."; return 1; }
+    bp="$(perf_db_current bp)"; mc="$(perf_db_current mc)"; skip="$(perf_db_current skip)"
+    bak="$DB_DIR/docker-compose.yml.bak-$ts"; cp "$DB_DIR/docker-compose.yml" "$bak"
+    oldvol="$(upd_volume_of "$DB_CONTAINER" /var/lib/mysql)"
+    info "Stopping the old MariaDB (its data stays in volume '$oldvol')..."
+    docker compose -f "$DB_DIR/docker-compose.yml" down >/dev/null 2>&1
+    MARIADB_IMAGE="$newimg"
+    mariadb_write_compose "${bp:-128M}" "${mc:-60}" "${skip:-no}" "mariadb_data_v${newser//./_}"
+    info "Starting MariaDB $newser on a new data volume..."
+    docker compose -f "$DB_DIR/docker-compose.yml" up -d >/dev/null 2>&1
+    newvol="$(upd_volume_of "$DB_CONTAINER" /var/lib/mysql)"
+    if ! perf_wait_db; then err "MariaDB $newser did not start."; MARIADB_IMAGE="$UPD_CUR_IMAGE"; upd_rollback_major "$DB_DIR/docker-compose.yml" "$bak" "$DB_CONTAINER" "$newvol"; return 1; fi
+    info "Re-creating users and loading the databases..."
+    while IFS='|' read -r db user pass; do
+        dbx_provision mariadb "$db" "$user" "$pass" || { err "Could not create '$db'."; MARIADB_IMAGE="$UPD_CUR_IMAGE"; upd_rollback_major "$DB_DIR/docker-compose.yml" "$bak" "$DB_CONTAINER" "$newvol"; return 1; }
+    done < <(upd_managed_dbs mariadb)
+    for f in "$dir"/db-*.sql.gz; do
+        [ -e "$f" ] || continue
+        echo "  loading $(basename "$f")"
+        if ! gzip -dc "$f" | docker exec -i "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot'; then
+            err "Loading $(basename "$f") failed."; MARIADB_IMAGE="$UPD_CUR_IMAGE"
+            upd_rollback_major "$DB_DIR/docker-compose.yml" "$bak" "$DB_CONTAINER" "$newvol"; return 1
+        fi
+    done
+    info "Checking every database..."
+    if upd_counts_match mariadb "$dir"; then
+        cfg_set OLD_VOLUME_MARIADB "$oldvol"
+        ok "MariaDB now runs $(upd_running_version mariadb)."
+        explain "The old data is still in volume '$oldvol' and the dumps in $dir." \
+                "When you have seen your sites work for a few days: main menu 11 -> Remove old data from a major upgrade."
+        return 0
+    fi
+    err "The table counts do not match: the upgrade is cancelled."
+    MARIADB_IMAGE="$UPD_CUR_IMAGE"
+    upd_rollback_major "$DB_DIR/docker-compose.yml" "$bak" "$DB_CONTAINER" "$newvol"
+    return 1
+}
+
+upd_redis_major() {
+    section "Upgrade Redis to a newer major version"
+    upd_major_gate redis || return 1
+    local cur="$UPD_CUR_SERIES" ts dir newimg newmajor bak before after pass f="$REDIS_DIR/docker-compose.yml"
+    explain "Current: Redis $cur ($UPD_CUR_IMAGE). Redis keeps cache, sessions and queued jobs; the new version reads the same files." \
+            "HiDeploy saves a copy of the data first and goes back automatically if the new version does not start."
+    choose_tag "Redis" "8-alpine" "Redis 8 is the current line." '^[0-9]+(\.[0-9]+)*(-[a-z0-9.]+)?$' "8-alpine|current" "7-alpine|previous line" || return 0
+    newimg="redis:$CHOSEN_TAG"; newmajor="$(image_series redis "$newimg")"
+    [ "$newmajor" -gt "$cur" ] || { err "The new version must be higher than $cur."; return 1; }
+    verify_image "$newimg" || return 1
+    warn "Redis restarts (a few seconds): queue workers and sessions reconnect on their own."
+    upd_type_to_confirm UPGRADE || { info "Cancelled."; return 0; }
+    ts="$(date +%F_%H%M%S)"; dir="$BACKUP_DIR/upgrade-redis-$cur-to-$newmajor-$ts"; mkdir -p "$dir"; chmod 700 "$dir"
+    pass="$(redis_pass)"
+    before="$(docker exec -e "REDISCLI_AUTH=$pass" "$REDIS_CONTAINER" redis-cli DBSIZE 2>/dev/null | tr -dc '0-9')"
+    docker exec -e "REDISCLI_AUTH=$pass" "$REDIS_CONTAINER" redis-cli SAVE >/dev/null 2>&1 || true
+    docker run --rm --entrypoint tar -v "$(upd_volume_of "$REDIS_CONTAINER" /data):/data:ro" -v "$dir:/out" "$UPD_CUR_IMAGE" czf /out/redis-data.tgz -C /data . 2>/dev/null \
+        && ok "Data copy saved: $dir/redis-data.tgz" || warn "Could not copy the data (continuing: Redis only holds cache and queues)."
+    docker pull -q "$newimg" >/dev/null 2>&1 || docker image inspect "$newimg" >/dev/null 2>&1 || { err "Could not download $newimg. Nothing was changed."; return 1; }
+    bak="$f.bak-$ts"; cp "$f" "$bak"
+    sed -i "s|^    image: .*|    image: $newimg|" "$f"
+    docker compose -f "$f" up -d >/dev/null 2>&1
+    after="$(docker exec -e "REDISCLI_AUTH=$pass" "$REDIS_CONTAINER" redis-cli DBSIZE 2>/dev/null | tr -dc '0-9')"
+    if upd_wait_ok "$REDIS_CONTAINER" && [ "${after:-x}" = "${before:-y}" ]; then
+        ok "Redis now runs $(upd_running_version redis) (keys before: $before, after: $after)."
+        return 0
+    fi
+    err "Redis $newmajor did not start with the same data (keys before: ${before:-?}, after: ${after:-?}). Going back."
+    docker compose -f "$f" down >/dev/null 2>&1; cp "$bak" "$f"; docker compose -f "$f" up -d >/dev/null 2>&1
+    upd_wait_ok "$REDIS_CONTAINER" && ok "The previous Redis runs again." || err "Check: docker logs $REDIS_CONTAINER"
+    return 1
+}
+
+upd_major_menu() {
+    local c
+    echo ""
+    explain "A newer VERSION LINE changes the data format, so it is a guided procedure with its own safety dump." \
+            "Sites that use the database are offline while it runs. Do it at a quiet time, and ideally after a full backup (main menu 6)."
+    echo " 1) PostgreSQL   (now: $(image_series postgres "$(upd_image postgres)" | sed 's/^$/not installed/'))"
+    echo " 2) MariaDB      (now: $(image_series mariadb "$(upd_image mariadb)" | sed 's/^$/not installed/'))"
+    echo " 3) Redis        (now: $(image_series redis "$(upd_image redis)" | sed 's/^$/not installed/'))"
+    echo " 0) Back"
+    read -r -p "Select: " c
+    case "$c" in 1) upd_postgres_major ;; 2) upd_mariadb_major ;; 3) upd_redis_major ;; *) return 0 ;; esac
+}
+
+# ---------- old data left behind by a major upgrade -----------------------------------------------------------
+upd_cleanup_old() {
+    section "Remove old data from a major upgrade"
+    local e vol found=0 name
+    explain "After a major upgrade the previous data volume is kept as a safety net. Delete it only when your sites have worked well for a while." \
+            "Dumps in $BACKUP_DIR are separate files: delete them yourself when you do not need them any more."
+    for e in postgres mariadb; do
+        name="$(cfg_get "OLD_VOLUME_$(tr a-z A-Z <<<"$e")" || true)"
+        [ -n "$name" ] || continue
+        docker volume inspect "$name" >/dev/null 2>&1 || { cfg_unset "OLD_VOLUME_$(tr a-z A-Z <<<"$e")"; continue; }
+        found=1
+        printf '  %s: old data volume %s\n' "$(upd_label "$e")" "$name"
+        if upd_type_to_confirm DELETE; then
+            docker volume rm "$name" >/dev/null 2>&1 && { ok "Removed $name."; cfg_unset "OLD_VOLUME_$(tr a-z A-Z <<<"$e")"; } || err "Could not remove it (is a container still using it?)."
+        else info "Kept."; fi
+    done
+    [ "$found" -eq 1 ] || ok "No old data volumes are recorded."
+}
+
+# ---------- project runtimes (PHP, Node) -----------------------------------------------------------------------
+upd_projects_list() {   # -> fills UPD_PROJ (array of paths) and prints the table
+    UPD_PROJ=()
+    mapfile -t UPD_PROJ < <(find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name .deploy.env -printf '%h\n' 2>/dev/null | sort)
+    [ "${#UPD_PROJ[@]}" -gt 0 ] || { err "No projects deployed yet."; return 1; }
+    local i=0 p typ v src run
+    printf '\n  %-4s %-32s %-8s %-10s %s\n' "#" "DOMAIN" "TYPE" "VERSION" "SUPPORT"
+    for p in "${UPD_PROJ[@]}"; do
+        i=$((i+1))
+        typ="$( . "$p/.deploy.env" 2>/dev/null; echo "${PROJECT_TYPE:-laravel}" )"
+        if [ "$typ" = "nextjs" ]; then
+            v="$( . "$p/.deploy.env" 2>/dev/null; echo "${NODE_VERSION:-}" )"; [ -n "$v" ] || v="$(dockerfile_node_version "$p")"
+            printf '  %-4s %-32s %-8s %-10s %s\n' "$i" "$(basename "$p")" "$typ" "node ${v:-?}" "$(eol_text node "${v%%.*}")"
+        else
+            v="$( . "$p/.deploy.env" 2>/dev/null; echo "${PHP_VERSION:-}" )"; [ -n "$v" ] || v="$(dockerfile_php_version "$p")"
+            printf '  %-4s %-32s %-8s %-10s %s\n' "$i" "$(basename "$p")" "$typ" "php ${v:-?}" "$(eol_text php "$(cut -d. -f1,2 <<<"$v")")"
+        fi
+    done
+}
+
+upd_project_change() {   # PATH
+    local path="$1" typ old new key conf
+    typ="$( . "$path/.deploy.env" 2>/dev/null; echo "${PROJECT_TYPE:-laravel}" )"
+    if [ "$typ" = "nextjs" ]; then key="NODE_VERSION"; else key="PHP_VERSION"; fi
+    if ! dockerfile_has_arg "$path" "$key"; then
+        warn "This project's Dockerfile has the version written into it (generated by an older HiDeploy), so it cannot be changed from the server."
+        explain "Fix: main menu 3 -> Generate Project Files (choose the version there), copy the new files into your repository, commit and push." \
+                "From then on the version can be changed here without touching git."
+        return 0
+    fi
+    old="$( . "$path/.deploy.env" 2>/dev/null; eval "echo \"\${$key:-}\"" )"
+    if [ "$typ" = "nextjs" ]; then [ -n "$old" ] || old="$(dockerfile_node_version "$path")"; pick_node "$path" "$old" || return 0; new="$PICK_NODE"
+    else [ -n "$old" ] || old="$(dockerfile_php_version "$path")"; pick_php "$path" "$old" || return 0; new="$PICK_PHP"; fi
+    [ "$new" != "$old" ] || { ok "That is the version already in use."; return 0; }
+    warn "Changing the runtime rebuilds the container. Test big jumps (for example PHP 8.3 -> 8.5) on a copy of the project first."
+    confirm "Rebuild and deploy $(basename "$path") with $new now?" y || { info "Cancelled."; return 0; }
+    conf="$path/.deploy.env.bak-$(date +%s)"; cp "$path/.deploy.env" "$conf"
+    env_set "$path/.deploy.env" "$key" "$new"
+    if deploy_project "$path" no; then rm -f "$conf"; ok "Now built with $new."; return 0; fi
+    err "The deployment with $new failed: going back to ${old:-the previous version}."
+    cp "$conf" "$path/.deploy.env"; rm -f "$conf"
+    deploy_project "$path" no || err "The old version did not deploy either: Manage Projects -> this project -> Deployments."
+    return 1
+}
+
+upd_projects_menu() {
+    upd_projects_list || return 0
+    local n; read -r -p "${C_YELLOW}Change the version of project number (0 = back): ${C_RESET}" n
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#UPD_PROJ[@]}" ] || return 0
+    upd_project_change "${UPD_PROJ[$((n-1))]}"
+}
+
+upd_self_update() {
+    section "Update HiDeploy itself"
+    explain "Installs the newest HiDeploy from GitHub ($HIDEPLOY_REPO). Your settings and projects are not touched."
+    confirm "Update HiDeploy now?" y || return 0
+    curl -fsSL "https://raw.githubusercontent.com/${HIDEPLOY_REPO}/main/install.sh" | bash
+}
+
+menu_updates() {
+    local c
+    while true; do
+        clear; banner "11) Updates and versions" "$C_CYAN"
+        explain "Versions checked by this script: $CATALOG_CHECKED (every tag is verified on the registry before it is used)."
+        echo ""; upd_overview; echo ""
+        echo " 1) Check for updates now (downloads the newest builds, installs nothing)"
+        echo " 2) Update one component (same version line: safe, with backup and automatic roll-back)"
+        echo " 3) Update ALL components that have an update ready"
+        echo " 4) Upgrade to a NEWER version line (PostgreSQL / MariaDB / Redis: guided, with dump and roll-back)"
+        echo " 5) Projects: see and change the PHP / Node version of each project"
+        echo " 6) Remove old data left by a major upgrade"
+        echo " 7) Update HiDeploy itself"
+        echo " 0) Back"
+        read -r -p "Select: " c; echo ""
+        case "$c" in
+            1) run_item upd_check_all ;;
+            2) upd_apply_menu; pause ;;
+            3) run_item upd_apply_all ;;
+            4) upd_major_menu; pause ;;
+            5) upd_projects_menu; pause ;;
+            6) run_item upd_cleanup_old ;;
+            7) run_item upd_self_update ;;
+            0) return ;;
+            *) err "Invalid option."; sleep 1 ;;
+        esac
+    done
+}
+
+# ============================================================================
 # MAIN MENUS
 # ============================================================================
 
@@ -8865,6 +9834,7 @@ EOF
 }
 
 main() {
+    load_installed_images
     case "${1:-}" in
         -v|--version|version) echo "HiDeploy $HIDEPLOY_VERSION"; exit 0 ;;
         -h|--help|help)       usage; exit 0 ;;
@@ -8914,6 +9884,7 @@ main() {
         echo " 8) Security                    (firewall, fail2ban, automatic security updates, SSH, checks)"
         echo " 9) Email                       (own mail server for all your domains: mailboxes, webmail)"
         echo "10) Notifications               (alerts by email and Telegram: deployments, backups, stopped services)"
+        echo "11) Updates and versions        (check updates, upgrade PostgreSQL/MariaDB/Redis, PHP and Node per project)"
         echo " 0) Exit"
         read -r -p "Select: " c; echo ""
         case "$c" in
@@ -8927,6 +9898,7 @@ main() {
             8) menu_security ;;
             9) menu_mail ;;
             10) menu_notify ;;
+            11) menu_updates ;;
             0) ok "Bye."; exit 0 ;;
             *) err "Invalid option."; sleep 1 ;;
         esac
